@@ -11,6 +11,8 @@ import type {
   EquityPoint,
   FollowedTrader,
   LivePositionReconciliation,
+  RedeemBook,
+  RedeemedEntry,
   SeenTradeBook,
 } from "./types";
 
@@ -24,6 +26,7 @@ const EQUITY_FILE = path.join(DATA_DIR, "equity-curve.json");
 const ERRORS_FILE = path.join(DATA_DIR, "errors.log");
 const STATE_FILE = path.join(DATA_DIR, "bot-state.json");
 const LIVE_POSITIONS_FILE = path.join(DATA_DIR, "live-positions.json");
+const REDEEMED_FILE = path.join(DATA_DIR, "redeemed.json");
 
 const MAX_TRADES = 1000;
 const MAX_LOGS = 500;
@@ -178,6 +181,27 @@ export async function loadLivePositions(): Promise<LivePositionReconciliation | 
 
 export async function saveLivePositions(snapshot: LivePositionReconciliation | null): Promise<void> {
   await enqueueWrite(() => writeJson(LIVE_POSITIONS_FILE, snapshot));
+}
+
+/**
+ * Persisted ledger of positions already redeemed on-chain — the double-redeem
+ * guard. Survives trade-list truncation, so a redeemed condition is never
+ * redeemed twice even after its copy record ages out of trades.json.
+ */
+export async function loadRedeemBook(): Promise<RedeemBook> {
+  const book = await readJson<RedeemBook>(REDEEMED_FILE, { entries: [] });
+  return { entries: Array.isArray(book.entries) ? book.entries : [] };
+}
+
+export async function saveRedeemBook(book: RedeemBook): Promise<void> {
+  await enqueueWrite(() => writeJson(REDEEMED_FILE, { entries: book.entries.slice(-5000) }));
+}
+
+/** Append a redeemed entry, de-duplicating by tokenId (idempotent). */
+export async function recordRedeemed(entry: RedeemedEntry): Promise<void> {
+  const book = await loadRedeemBook();
+  if (book.entries.some((e) => e.tokenId === entry.tokenId)) return;
+  await saveRedeemBook({ entries: [...book.entries, entry] });
 }
 
 export async function ensureErrorLog(): Promise<void> {

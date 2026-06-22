@@ -3,7 +3,7 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import useSWR from "swr";
-import { Activity, AlertTriangle, Bot, DollarSign, Hand, OctagonX, Pause, Play, Plus, RefreshCcw, RotateCcw, ShieldCheck, Square, Timer, Trash2, Wallet } from "lucide-react";
+import { Activity, AlertTriangle, Bot, Coins, DollarSign, Hand, OctagonX, Pause, Play, Plus, RefreshCcw, RotateCcw, ShieldCheck, Square, Timer, Trash2, Wallet } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -16,7 +16,7 @@ import { RISK_PRESETS, type RiskPreset } from "@/lib/copybot/riskPresets";
 import { DashboardVisuals } from "./DashboardVisuals";
 import { cn } from "@/lib/utils";
 import { fromNow } from "@/lib/time";
-import type { BotLogEntry, BotPosition, BotSettings, BotStatus, CopyTradeRecord, FollowedTrader, RiskPresetId, SessionScoreboard, WalletCopyStat } from "@/lib/copybot/types";
+import type { BotLogEntry, BotPosition, BotSettings, BotStatus, CopyTradeRecord, FollowedTrader, RedeemRunResult, RedeemablePlan, RiskPresetId, SessionScoreboard, WalletCopyStat } from "@/lib/copybot/types";
 
 type ApiEnvelope<T> = { ok: true; data: T; fetchedAt: number } | { ok: false; error: string };
 
@@ -455,6 +455,10 @@ function SettingsPanel({ status, onSave }: { status: BotStatus; onSave: (setting
             minTimeToResolutionMinutes: preset.minTimeToResolutionMinutes,
             minBuyTokenPrice: preset.minBuyTokenPrice,
             maxBuyTokenPrice: preset.maxBuyTokenPrice,
+            // Presets may pin extra fields (e.g. Action Mode's discovery breadth
+            // and conviction thresholds). Mirror them so the form matches what the
+            // server will pin on save.
+            ...preset.extraSettings,
           },
     );
   };
@@ -493,6 +497,11 @@ function SettingsPanel({ status, onSave }: { status: BotStatus; onSave: (setting
                 <option key={preset.id} value={preset.id}>{preset.label}</option>
               ))}
             </Select>
+            {RISK_PRESETS[draft.riskPreset]?.description && (
+              <span className="block text-[11px] leading-snug text-muted-foreground/80">
+                {RISK_PRESETS[draft.riskPreset].description}
+              </span>
+            )}
           </label>
           <label className="space-y-1 text-xs text-muted-foreground">
             <span>Mode</span>
@@ -605,7 +614,14 @@ function TraderTable({ traders, onToggle, onRemove }: { traders: FollowedTrader[
               </div>
               <div className="mt-2 md:mt-0">
                 <span className={cellLabel}>Source</span>
-                <Badge variant={trader.source === "manual" ? "default" : "muted"}>{trader.source}</Badge>
+                <Badge variant={trader.source === "manual" ? "default" : "muted"}>
+                  {trader.discoverySource ?? trader.source}
+                </Badge>
+                {trader.discoveryScore != null && (
+                  <span className="ml-1 text-[11px] text-muted-foreground" title="Discovery v2 composite rank score (0–100)">
+                    {trader.discoveryScore.toFixed(0)}
+                  </span>
+                )}
               </div>
               <div className={cn("mt-2 flex justify-between gap-2 tabular-nums md:mt-0 md:block md:text-right", trader.weeklyPnlUsd >= 0 ? "text-success" : "text-destructive")}>
                 <span className={cellLabel}>Weekly P&amp;L</span>
@@ -1019,6 +1035,142 @@ function BotStatusCard({ status }: { status: BotStatus }) {
   );
 }
 
+/**
+ * Resolved-winnings redemption (real mode). Shows positions the account can
+ * redeem for USDC, the expected payout, and which need manual action (proxy/safe/
+ * neg-risk). Redeeming requires typing the confirmation text — the bot never
+ * redeems from this panel without it. Fully-automatic redemption is a separate,
+ * server-side opt-in (ENABLE_AUTO_REDEEM).
+ */
+function RedeemablesPanel({
+  plan,
+  busy,
+  onRedeem,
+}: {
+  plan: RedeemablePlan;
+  busy: string | null;
+  onRedeem: (confirm: string, includeUnknown: boolean) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [includeUnknown, setIncludeUnknown] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setConfirmText("");
+      setIncludeUnknown(false);
+    }
+  }, [open]);
+
+  if (plan.items.length === 0 && !plan.error) return null;
+
+  const working = busy !== null;
+  const hasUnknown = plan.items.some((i) => i.blockedReason == null && !i.attributionKnown);
+  const autoRedeemable = plan.items.filter((i) => i.blockedReason == null && (i.attributionKnown || includeUnknown)).length;
+
+  return (
+    <Card className="border-primary/40">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Coins className="size-4 text-primary" /> Redeemable Winnings
+        </CardTitle>
+        <CardDescription>
+          {plan.error
+            ? plan.error
+            : `${money(plan.totalExpectedPayoutUsd)} expected · ${plan.redeemableCount} redeemable by bot, ${plan.manualCount} need manual action.`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {plan.items.length > 0 && (
+          <div className="overflow-auto scrollbar-thin">
+            <table className="w-full min-w-[640px] text-sm">
+              <thead className="text-xs text-muted-foreground">
+                <tr className="border-b border-border text-left">
+                  <th className="py-2 pr-3">Market</th>
+                  <th className="py-2 pr-3">Outcome</th>
+                  <th className="py-2 pr-3 text-right">Shares</th>
+                  <th className="py-2 pr-3 text-right">Payout</th>
+                  <th className="py-2 text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {plan.items.map((item) => (
+                  <tr key={item.tokenId} className="border-b border-border/70">
+                    <td className="max-w-[300px] truncate py-2 pr-3" title={item.marketTitle}>{item.marketTitle}</td>
+                    <td className="py-2 pr-3">{item.outcome}</td>
+                    <td className="py-2 pr-3 text-right tabular-nums">{item.shares.toFixed(2)}</td>
+                    <td className="py-2 pr-3 text-right tabular-nums">{money(item.expectedPayoutUsd)}</td>
+                    <td className="py-2 text-right">
+                      {item.blockedReason ? (
+                        <Badge variant="warning" title={item.blockedReason}>manual</Badge>
+                      ) : item.attributionKnown ? (
+                        <Badge variant="success">bot</Badge>
+                      ) : (
+                        <Badge variant="muted" title="Unknown/manual position — only redeemed if you opt in.">unknown</Badge>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {plan.redeemableCount > 0 && (
+          <div className="flex justify-end">
+            <Button size="sm" disabled={working} onClick={() => setOpen(true)}>
+              <Coins className="size-3" /> Redeem winnings
+            </Button>
+          </div>
+        )}
+      </CardContent>
+
+      <Dialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Redeem resolved winnings?"
+        description="This submits on-chain redemption transactions for resolved (won) positions and claims their USDC. It moves real funds and cannot be undone. Positions needing manual action (proxy/safe wallets, neg-risk markets) are skipped."
+      >
+        <div className="space-y-3">
+          {hasUnknown && (
+            <label className="flex items-center justify-between rounded-md border border-border p-3 text-xs">
+              <span className="text-muted-foreground">
+                Also redeem unknown / manual positions (not attributed to a copied wallet).
+              </span>
+              <Switch checked={includeUnknown} onCheckedChange={setIncludeUnknown} aria-label="Include unknown positions" />
+            </label>
+          )}
+          <label className="space-y-1 text-xs text-muted-foreground">
+            <span>Type REDEEM to confirm</span>
+            <Input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder="REDEEM" />
+          </label>
+          <p className="text-[11px] text-muted-foreground">
+            {autoRedeemable} position{autoRedeemable === 1 ? "" : "s"} will be redeemed for ~
+            {money(
+              plan.items
+                .filter((i) => i.blockedReason == null && (i.attributionKnown || includeUnknown))
+                .reduce((s, i) => s + i.expectedPayoutUsd, 0),
+            )}
+            .
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <Button size="sm" variant="ghost" onClick={() => setOpen(false)} disabled={working}>Cancel</Button>
+            <Button
+              size="sm"
+              disabled={working || confirmText !== "REDEEM"}
+              onClick={async () => {
+                setOpen(false);
+                await onRedeem("REDEEM", includeUnknown);
+              }}
+            >
+              <Coins className="size-3" /> {busy === "redeem" ? "Redeeming..." : "Confirm redeem"}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+    </Card>
+  );
+}
+
 export function Dashboard() {
   const { data: status, error, isLoading, mutate } = useSWR<BotStatus>("/api/bot/status", jsonFetcher, {
     refreshInterval: 2000,
@@ -1037,6 +1189,24 @@ export function Dashboard() {
       await mutate();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Action failed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Redemption returns a run summary (not a BotStatus); surface partial failures
+  // and refresh status afterward so the ledger/balance reflect the redeemed cash.
+  const runRedeem = async (confirm: string, includeUnknown: boolean) => {
+    setBusy("redeem");
+    setActionError(null);
+    try {
+      const result = await postJson<RedeemRunResult>("/api/bot/redeem", { confirm, includeUnknown });
+      if (result.failed > 0) {
+        setActionError(`Redeemed ${result.redeemed} position(s); ${result.failed} failed. See the debug log for details.`);
+      }
+      await mutate();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Redeem failed");
     } finally {
       setBusy(null);
     }
@@ -1295,6 +1465,9 @@ export function Dashboard() {
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
         <div className="space-y-4 xl:col-span-2">
+          {status.settings.mode === "real" && (
+            <RedeemablesPanel plan={status.redeemables} busy={busy} onRedeem={runRedeem} />
+          )}
           <PositionTable positions={status.positions} equity={status.metrics.equityUsd} />
           <TraderTable
             traders={status.traders}

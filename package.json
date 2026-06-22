@@ -16,7 +16,6 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "ethers": "^5.8.0",
-    "lucide-animated": "^1.0.4",
     "lucide-react": "^1.21.0",
     "motion": "^12.40.0",
     "next": "^15.5.19",

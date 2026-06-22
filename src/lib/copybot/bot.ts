@@ -19,13 +19,16 @@ import { inspectBullpenCli } from "./bullpen";
 import {
   applyRiskPreset,
   isRiskPresetId,
-  PRESET_CONTROLLED_KEYS,
+  presetControlledKeys,
   presetControlledValues,
   RISK_PRESETS,
 } from "./riskPresets";
 import { assertLiveTradingAllowed, placeLiveMarketOrder, type LiveUsdcBalance } from "@/lib/execution/liveClob";
 import { clearLiveBalanceCache, getLiveUsdcBalance } from "@/lib/execution/liveBalance";
 import { createInitialBotState } from "./defaults";
+import { recordId } from "./ids";
+import { buildRedeemablePlan, makeRedeemRecord } from "./redeemables";
+import { assertLiveRedeemAllowed, redeemConditionOnChain } from "@/lib/execution/liveRedeem";
 import { buildScoreboard, normalizeSkipReason } from "./scoreboard";
 import { reconcileLiveTrades } from "./reconciliation";
 import { emptyLiveReconciliation, reconcileLivePositions } from "./livePositions";
@@ -40,11 +43,13 @@ import {
   loadLogs,
   loadLivePositions,
   loadPositions,
+  loadRedeemBook,
   loadSeenTrades,
   loadSettings,
   loadTraders,
   loadTrades,
   prependTrade,
+  recordRedeemed,
   saveBotState,
   saveLivePositions,
   savePositions,
@@ -65,11 +70,51 @@ import type {
   FollowedTrader,
   LivePositionReconciliation,
   LogLevel,
+  RedeemablePlan,
+  RedeemAttemptResult,
+  RedeemRunResult,
   SeenTradeBook,
 } from "./types";
 
 const MAX_TRADERS_TO_FOLLOW = 100;
 const MAX_WALLETS_PER_POLL = 100;
+/**
+ * Hard ceiling on how old a source trade may be and still be copied. The spec is
+ * explicit — "only copy trades less than 5 minutes old" — so this is enforced in
+ * code regardless of what a preset or custom setting requests. A higher
+ * `maxTradeAgeSec` only ever tightens this, never loosens it.
+ */
+const MAX_COPY_TRADE_AGE_SEC = 300;
+
+/**
+ * A market we positively know is resolved/closed (or no longer accepting orders)
+ * must never be copied into — the leader's trade is on a market that's already
+ * settling. Unknown (null) markets are NOT treated as resolved here; other gates
+ * (liquidity/spread/time-to-resolution) handle the can't-verify case.
+ */
+function isMarketResolved(market: Market | null): boolean {
+  if (!market) return false;
+  return market.closed === true || market.active === false || market.acceptingOrders === false;
+}
+
+/**
+ * Settlement payout per share (1 = won, 0 = lost) for the outcome `tokenId` in a
+ * market that has DEFINITIVELY resolved, or null if it cannot be determined yet.
+ *
+ * Deliberately stricter than {@link isMarketResolved}: it requires `closed` (a
+ * paused or not-accepting market is not necessarily resolved) AND an unambiguous
+ * near-binary outcome price. This avoids ever crystallizing a loss against a
+ * position whose market is merely halted — when in doubt we return null and the
+ * position is retried on a later poll.
+ */
+export function marketSettlementValue(market: Market | null, tokenId: string): number | null {
+  if (!market || market.closed !== true) return null;
+  const outcome = market.outcomes.find((o) => o.tokenId === tokenId);
+  if (!outcome || outcome.price == null || !Number.isFinite(outcome.price)) return null;
+  if (outcome.price >= 0.9) return 1;
+  if (outcome.price <= 0.1) return 0;
+  return null;
+}
 
 function sourceTradeId(trade: TraderTrade): string {
   return [
@@ -81,10 +126,6 @@ function sourceTradeId(trade: TraderTrade): string {
     trade.price,
     trade.size,
   ].join(":");
-}
-
-function recordId(now = Date.now()): string {
-  return `copy_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function normalizeWallet(wallet: string): string {
@@ -125,10 +166,11 @@ function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): Bo
   }
 
   // Risk presets are server-authoritative. Selecting a non-custom preset applies
-  // that preset's numeric values; manually editing any preset-controlled numeric
-  // field (without re-selecting a preset) drops the preset to "custom".
+  // that preset's pinned values; manually editing any field that preset pins
+  // (without re-selecting a preset) drops the preset to "custom".
   const selectsPreset = isRiskPresetId(patch.riskPreset) && patch.riskPreset !== "custom";
-  const editsPresetField = PRESET_CONTROLLED_KEYS.some(
+  const currentPreset = isRiskPresetId(current.riskPreset) ? RISK_PRESETS[current.riskPreset] : RISK_PRESETS.custom;
+  const editsPresetField = presetControlledKeys(currentPreset).some(
     (key) => patch[key] !== undefined && patch[key] !== current[key],
   );
 
@@ -379,6 +421,49 @@ function makeExitRecord(
   };
 }
 
+/**
+ * Build a simulated SELL record that realizes a position at market resolution —
+ * the winning outcome pays $1/share and the loser $0. Unlike a mark-priced exit
+ * the settlement price is exact (not clamped to the 0.01–0.99 trading band), so
+ * cash credited and realized P&L reflect the true payout.
+ */
+function makeSettlementRecord(
+  position: BotPosition,
+  settlementValue: number,
+  realizedPnlUsd: number,
+  now: number,
+): CopyTradeRecord {
+  const proceedsUsd = position.shares * settlementValue;
+  const won = settlementValue >= 0.5;
+  return {
+    id: recordId(now),
+    sourceTradeId: `resolution-settlement:${position.tokenId}:${now}`,
+    status: "simulated",
+    mode: "simulation",
+    traderWallet: position.sourceWallets[0] ?? "",
+    traderName: "settlement",
+    side: "SELL",
+    tokenId: position.tokenId,
+    conditionId: position.conditionId,
+    marketSlug: position.marketSlug,
+    marketTitle: position.marketTitle,
+    outcome: position.outcome,
+    price: settlementValue,
+    sourceSize: position.shares,
+    sourceAmountUsd: proceedsUsd,
+    copyAmountUsd: proceedsUsd,
+    copiedShares: position.shares,
+    realizedPnlUsd,
+    reason:
+      `Market resolved ${won ? "in favor of" : "against"} ${position.outcome}: settled ` +
+      `${position.shares.toFixed(2)} share(s) @ $${settlementValue.toFixed(2)} ` +
+      `(realized ${realizedPnlUsd >= 0 ? "+" : ""}${realizedPnlUsd.toFixed(2)}).`,
+    txOrOrderId: "",
+    sourceTimestamp: now,
+    processedAt: now,
+  };
+}
+
 /** Add `shares` at effective `avgPrice` (fee-folded), marking at the current mid. */
 function applyBuy(
   positions: BotPosition[],
@@ -472,7 +557,7 @@ export class CopyBotEngine {
   async status(): Promise<BotStatus> {
     await ensureDataFiles();
     const settings = await loadSettings();
-    const [state, traders, positions, trades, equityCurve, logs, bullpen, livePositions] = await Promise.all([
+    const [state, traders, positions, trades, equityCurve, logs, bullpen, livePositions, redeemBook] = await Promise.all([
       loadBotState(settings),
       loadTraders(),
       loadPositions(),
@@ -481,6 +566,7 @@ export class CopyBotEngine {
       loadLogs(),
       inspectBullpenCli(),
       loadLivePositions(),
+      loadRedeemBook(),
     ]);
     const built = buildMetrics(settings, state, positions, trades);
     const statusMetrics = await buildStatusMetrics(settings, built.metrics);
@@ -528,6 +614,7 @@ export class CopyBotEngine {
       equityCurve,
       logs,
       livePositions: settings.mode === "real" ? livePositions : null,
+      redeemables: buildRedeemablePlan(settings.mode === "real" ? livePositions : null, redeemBook, settings.mode),
     };
   }
 
@@ -670,9 +757,13 @@ export class CopyBotEngine {
   async refreshMarks(): Promise<BotStatus> {
     let positions = await loadPositions();
     if (positions.length > 0) {
-      positions = await this.refreshMarkPrices(positions);
-      await savePositions(positions);
       const settings = await loadSettings();
+      positions = await this.refreshMarkPrices(positions);
+      // Settle any market that resolved since the last refresh (simulation only).
+      if (settings.mode === "simulation") {
+        positions = (await this.settleResolvedPositions(positions)).positions;
+      }
+      await savePositions(positions);
       const state = await loadBotState(settings);
       const trades = await loadTrades();
       const metrics = buildMetrics(settings, state, positions, trades);
@@ -842,6 +933,49 @@ export class CopyBotEngine {
     );
   }
 
+  /**
+   * Simulation settlement: realize any open position whose market has resolved.
+   * The winning outcome pays $1/share and the loser $0 — we book a settlement
+   * SELL (crediting cash with the payout and realizing P&L against cost basis)
+   * and drop the position from the book. Positions whose markets are not yet
+   * resolved, or whose payout can't be determined this poll, are left untouched
+   * and retried next poll. Returns the surviving positions.
+   *
+   * Real mode is intentionally excluded: a resolved live position must be
+   * redeemed on-chain (which moves funds), so the live-position reconciler
+   * surfaces it as "redeemable" for manual action rather than settling it here.
+   */
+  private async settleResolvedPositions(positions: BotPosition[]): Promise<{ positions: BotPosition[]; settled: number }> {
+    if (positions.length === 0) return { positions, settled: 0 };
+    const now = Date.now();
+    const remaining: BotPosition[] = [];
+    let settled = 0;
+    for (const position of positions) {
+      if (position.shares <= 0) continue;
+      let settlementValue: number | null = null;
+      try {
+        const market = await fetchMarketById(position.tokenId);
+        settlementValue = marketSettlementValue(market, position.tokenId);
+      } catch {
+        settlementValue = null;
+      }
+      if (settlementValue == null) {
+        remaining.push(position);
+        continue;
+      }
+      const realizedPnlUsd = (settlementValue - position.avgPrice) * position.shares;
+      await prependTrade(makeSettlementRecord(position, settlementValue, realizedPnlUsd, now));
+      settled += 1;
+      await appendLog(
+        "info",
+        `Settled resolved position ${position.outcome} (${position.marketTitle}): ` +
+          `${settlementValue >= 0.5 ? "WON" : "LOST"} ${position.shares.toFixed(2)} share(s), ` +
+          `realized ${realizedPnlUsd >= 0 ? "+" : ""}${realizedPnlUsd.toFixed(2)} USD.`,
+      );
+    }
+    return { positions: remaining, settled };
+  }
+
   async updateSettings(patch: Partial<BotSettings>): Promise<BotStatus> {
     const current = await loadSettings();
     const next = sanitizeSettings(current, patch);
@@ -970,7 +1104,19 @@ export class CopyBotEngine {
     }
 
     await saveBotState({ ...state, lastDiscoveryAt: now });
-    await appendLog("info", `Trader discovery refreshed ${discovered.length} tracked wallets.`);
+
+    // Summarize which Discovery v2 pools the tracked roster came from.
+    const poolCounts = new Map<string, number>();
+    for (const trader of discovered) {
+      if (!trader.enabled) continue;
+      const key = trader.discoverySource ?? (trader.source === "manual" ? "manual" : "auto");
+      poolCounts.set(key, (poolCounts.get(key) ?? 0) + 1);
+    }
+    const poolSummary = [...poolCounts.entries()].map(([pool, count]) => `${pool}:${count}`).join(", ");
+    await appendLog(
+      "info",
+      `Discovery v2 refreshed ${discovered.length} tracked wallets${poolSummary ? ` (${poolSummary})` : ""}.`,
+    );
     await this.refreshCopyScores();
   }
 
@@ -1062,6 +1208,170 @@ export class CopyBotEngine {
       );
       return snapshot;
     }
+  }
+
+  /**
+   * Read-only redeemable plan for the dashboard/API. Uses the last persisted live
+   * snapshot (reconciled on poll/startup) — never trades and never hits the chain.
+   * Empty (no error) in simulation, where resolved positions settle automatically.
+   */
+  async redeemablePlan(): Promise<RedeemablePlan> {
+    const settings = await loadSettings();
+    const [snapshot, redeemed] = await Promise.all([loadLivePositions(), loadRedeemBook()]);
+    return buildRedeemablePlan(settings.mode === "real" ? snapshot : null, redeemed, settings.mode);
+  }
+
+  /**
+   * Redeem resolved (won) positions on-chain. Real-mode only. Two ways in:
+   *   - manual (default): requires confirm === "REDEEM"; this is the safe path and
+   *     the only one that may include unknown/manual positions (via includeUnknown);
+   *   - automatic: opts.auto, gated behind config.enableAutoRedeem; only ever
+   *     redeems attribution-known positions and never unknown/manual ones.
+   *
+   * Invariants: never redeems unresolved/not-redeemable positions; never redeems
+   * the same position twice (persisted redeem book); skips positions the bot can't
+   * redeem itself (proxy/safe/neg-risk) leaving them for manual action; logs every
+   * attempt; keeps looping past individual failures; updates cash/equity after.
+   */
+  async redeemResolved(
+    opts: { confirm?: string; auto?: boolean; includeUnknown?: boolean } = {},
+  ): Promise<RedeemRunResult> {
+    const empty: RedeemRunResult = {
+      ran: false,
+      attempted: 0,
+      redeemed: 0,
+      failed: 0,
+      skipped: 0,
+      totalPayoutUsd: 0,
+      attempts: [],
+      error: null,
+    };
+
+    const settings = await loadSettings();
+    if (settings.mode !== "real") {
+      return { ...empty, error: "Redemption only applies in real mode; simulation settles resolved markets automatically." };
+    }
+
+    // Gates. Automatic redemption requires its own explicit opt-in; manual
+    // redemption requires the confirmation text and dashboard auth (route-level).
+    if (opts.auto) {
+      if (!config.enableAutoRedeem) return empty; // detection-only by default
+    } else if (opts.confirm !== "REDEEM") {
+      return { ...empty, error: 'Redemption requires the confirmation text "REDEEM".' };
+    }
+
+    try {
+      assertLiveRedeemAllowed();
+    } catch (err) {
+      return { ...empty, error: messageFromUnknown(err) };
+    }
+
+    // Refresh authoritative positions so we redeem against on-chain truth, then
+    // build the plan from the fresh snapshot + persisted redeem book.
+    await this.reconcileLivePositionsState("redeem");
+    const [snapshot, redeemed, positions] = await Promise.all([
+      loadLivePositions(),
+      loadRedeemBook(),
+      loadPositions(),
+    ]);
+    const plan = buildRedeemablePlan(snapshot, redeemed, "real");
+    if (plan.error) return { ...empty, error: plan.error };
+
+    const includeUnknown = !opts.auto && opts.includeUnknown === true && opts.confirm === "REDEEM";
+    const costBasisOf = new Map(positions.map((p) => [p.tokenId, p.avgPrice * p.shares]));
+
+    let redeemedCount = 0;
+    let failed = 0;
+    let skipped = 0;
+    let totalPayoutUsd = 0;
+    const attempts: RedeemAttemptResult[] = [];
+    const redeemedTokens: string[] = [];
+
+    for (const item of plan.items) {
+      // Skip positions the bot can't redeem itself (proxy/safe/neg-risk) — they
+      // stay surfaced for manual redemption on Polymarket.
+      if (item.blockedReason) {
+        skipped += 1;
+        continue;
+      }
+      // Never auto/blind-redeem an unknown or manual position; only an explicit,
+      // confirmed manual run with includeUnknown may touch them.
+      if (!item.attributionKnown && !includeUnknown) {
+        skipped += 1;
+        continue;
+      }
+
+      const result = await redeemConditionOnChain(item.conditionId);
+      const payoutUsd = result.success ? item.expectedPayoutUsd : 0;
+      attempts.push({
+        tokenId: item.tokenId,
+        conditionId: item.conditionId,
+        success: result.success,
+        txHash: result.txHash,
+        payoutUsd,
+        error: result.error,
+      });
+
+      if (!result.success) {
+        failed += 1;
+        await appendLog("error", `Redeem failed for ${item.outcome} (${item.marketTitle}): ${result.error ?? "unknown error"}.`);
+        continue; // keep looping past a single failure
+      }
+
+      // Record the on-chain redemption: ledger event + double-redeem guard.
+      const costBasisUsd = costBasisOf.get(item.tokenId) ?? 0;
+      await prependTrade(makeRedeemRecord(item, payoutUsd, costBasisUsd, result.txHash));
+      await recordRedeemed({
+        tokenId: item.tokenId,
+        conditionId: item.conditionId,
+        txHash: result.txHash,
+        payoutUsd,
+        redeemedAt: Date.now(),
+        mode: "real",
+      });
+      redeemedTokens.push(item.tokenId);
+      redeemedCount += 1;
+      totalPayoutUsd += payoutUsd;
+      await appendLog(
+        "info",
+        `Redeemed ${item.outcome} (${item.marketTitle}): ${item.shares.toFixed(2)} share(s) → $${payoutUsd.toFixed(2)}${result.txHash ? ` [tx ${result.txHash.slice(0, 10)}…]` : ""}.`,
+      );
+    }
+
+    // Drop redeemed tokens from local positions and recompute cash/equity/P&L now
+    // (the next reconcile would also remove them, but reflect it immediately).
+    if (redeemedTokens.length > 0) {
+      const remaining = positions.filter((p) => !redeemedTokens.includes(p.tokenId));
+      await savePositions(remaining);
+      const state = await loadBotState(settings);
+      const trades = await loadTrades();
+      const metrics = buildMetrics(settings, state, remaining, trades);
+      await saveBotState({ ...metrics.state, lastError: null });
+      await appendEquityPoint({
+        ts: Date.now(),
+        equityUsd: metrics.metrics.equityUsd,
+        cashUsd: metrics.metrics.cashUsd,
+        exposureUsd: metrics.metrics.totalExposureUsd,
+      });
+    }
+
+    if (redeemedCount > 0 || failed > 0) {
+      await appendLog(
+        failed > 0 ? "warning" : "info",
+        `Redeem pass complete: ${redeemedCount} redeemed ($${totalPayoutUsd.toFixed(2)}), ${failed} failed, ${skipped} skipped.`,
+      );
+    }
+
+    return {
+      ran: true,
+      attempted: attempts.length,
+      redeemed: redeemedCount,
+      failed,
+      skipped,
+      totalPayoutUsd,
+      attempts,
+      error: null,
+    };
   }
 
   private async updateSimulationBuyExposurePause(settings: BotSettings, positions: BotPosition[], trades: CopyTradeRecord[]): Promise<boolean> {
@@ -1215,6 +1525,13 @@ export class CopyBotEngine {
         positions = await this.refreshMarkPrices(positions);
       }
 
+      // Simulation settlement: realize (to $1 winner / $0 loser) and close out any
+      // position whose market has resolved, so resolved markets don't linger as
+      // phantom exposure. Real mode resolves via on-chain redemption (manual).
+      if (settings.mode === "simulation" && positions.length > 0) {
+        positions = (await this.settleResolvedPositions(positions)).positions;
+      }
+
       // Fully-automatic live exits: in real mode, sell any position that has hit
       // the configured take-profit / stop-loss / max-hold on this poll.
       if (settings.mode === "real" && positions.length > 0) {
@@ -1228,6 +1545,16 @@ export class CopyBotEngine {
       // fills, and re-score followed wallets from the bot's own copied results.
       if (settings.mode === "real") {
         await this.reconcileLiveOrders("poll");
+        // Fully-automatic redemption of resolved winnings (gated behind
+        // ENABLE_AUTO_REDEEM; no-op otherwise). Never redeems unknown/manual
+        // positions; failures are logged and never break the poll loop.
+        if (config.enableAutoRedeem) {
+          try {
+            await this.redeemResolved({ auto: true });
+          } catch (err) {
+            await appendLog("error", `Automatic redeem pass errored: ${messageFromUnknown(err)}.`);
+          }
+        }
       }
       await this.refreshCopyScores();
 
@@ -1568,11 +1895,18 @@ export class CopyBotEngine {
       positions,
     });
 
-    if (tradeAgeSec > settings.maxTradeAgeSec) {
-      return skip("Skipped stale trade from " + trade.traderName + ": " + tradeAgeSec + "s old.");
+    const maxAgeSec = Math.min(settings.maxTradeAgeSec, MAX_COPY_TRADE_AGE_SEC);
+    if (tradeAgeSec > maxAgeSec) {
+      return skip(
+        "Skipped stale trade from " + trade.traderName + ": " + tradeAgeSec + "s old (max " + maxAgeSec + "s).",
+      );
     }
     if (trade.price <= 0 || trade.price >= 1 || trade.size <= 0) {
       return skip("Skipped malformed trade from " + trade.traderName + ".");
+    }
+    // Never copy into a market that has already resolved/closed.
+    if (isMarketResolved(market)) {
+      return skip("Skipped trade from " + trade.traderName + ": market is resolved/closed.");
     }
 
     const filterReason = buyMarketFilterReason(settings, trade, market);

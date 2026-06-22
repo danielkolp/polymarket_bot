@@ -1,21 +1,20 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { TrendingDownIcon, TrendingUpIcon } from "lucide-animated";
-import { Minus } from "lucide-react";
+import { useEffect } from "react";
+import { TrendingDown, TrendingUp, Minus } from "lucide-react";
+import { useAnimationControls, motion } from "motion/react";
 import { cn } from "@/lib/utils";
 
 /**
- * Direction-aware animated trend arrow (lucide-animated + motion). The icon
- * replays its animation whenever the underlying value changes — so it visibly
- * "ticks" on each live update — and also animates on hover. Flat renders a static
+ * Direction-aware animated trend arrow (lucide-react + motion). The icon replays
+ * a short "tick" animation whenever the underlying value changes — so it visibly
+ * reacts on each live update — and also animates on hover. Flat renders a static
  * dash. Honors prefers-reduced-motion.
+ *
+ * Note: deliberately built from `lucide-react` + `motion` (both reputable,
+ * already-vendored deps) rather than the unmaintained/unattributed
+ * `lucide-animated` package, which was removed during the dependency audit.
  */
-interface AnimHandle {
-  startAnimation: () => void;
-  stopAnimation: () => void;
-}
-
 function prefersReducedMotion(): boolean {
   return typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 }
@@ -30,37 +29,33 @@ export function TrendIcon({
   className?: string;
 }) {
   const v = value ?? 0;
-  const handle = useRef<AnimHandle | null>(null);
+  const controls = useAnimationControls();
 
-  // Replay the animation on mount and whenever the value moves.
+  // Replay the animation whenever the value moves (up = nudge up, down = nudge down).
   useEffect(() => {
     if (v === 0 || prefersReducedMotion()) return;
-    handle.current?.startAnimation();
-  }, [v]);
+    const dy = v > 0 ? -3 : 3;
+    void controls.start({ y: [0, dy, 0], transition: { duration: 0.4, ease: "easeOut" } });
+  }, [v, controls]);
 
-  if (v > 0) {
+  if (v === 0) {
     return (
-      <TrendingUpIcon
-        ref={(h) => {
-          handle.current = (h as AnimHandle | null) ?? null;
-        }}
-        size={size}
-        animateOnHover
-        className={cn("inline-flex shrink-0 items-center text-success", className)}
-      />
+      <Minus className={cn("shrink-0 text-muted-foreground", className)} style={{ width: size, height: size }} />
     );
   }
-  if (v < 0) {
-    return (
-      <TrendingDownIcon
-        ref={(h) => {
-          handle.current = (h as AnimHandle | null) ?? null;
-        }}
-        size={size}
-        animateOnHover
-        className={cn("inline-flex shrink-0 items-center text-destructive", className)}
-      />
-    );
-  }
-  return <Minus className={cn("shrink-0 text-muted-foreground", className)} style={{ width: size, height: size }} />;
+
+  const Icon = v > 0 ? TrendingUp : TrendingDown;
+  return (
+    <motion.span
+      animate={controls}
+      whileHover={{ y: v > 0 ? -2 : 2 }}
+      className={cn(
+        "inline-flex shrink-0 items-center",
+        v > 0 ? "text-success" : "text-destructive",
+        className,
+      )}
+    >
+      <Icon style={{ width: size, height: size }} />
+    </motion.span>
+  );
 }

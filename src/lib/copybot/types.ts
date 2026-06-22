@@ -4,7 +4,19 @@ export type BotMode = "simulation" | "real";
 export type BotRunState = "stopped" | "running" | "paused" | "draining";
 export type SellBehavior = "proportional" | "all";
 export type SizingMode = "fixed" | "percentage" | "hybrid";
-export type RiskPresetId = "conservative" | "balanced" | "aggressive-simulation" | "live-default" | "custom";
+export type RiskPresetId = "conservative" | "balanced" | "aggressive-simulation" | "action" | "live-default" | "custom";
+
+/**
+ * Which Discovery v2 pool surfaced an auto-followed wallet. Manual/pinned wallets
+ * the operator added directly carry their own source tags.
+ */
+export type DiscoverySource =
+  | "profit-1d"
+  | "profit-7d"
+  | "volume"
+  | "high-frequency"
+  | "manual"
+  | "pinned";
 export type TradeStatus = "simulated" | "copied" | "skipped" | "failed" | "dry-run";
 export type LogLevel = "info" | "warning" | "error";
 export type LiveBalanceStatus = "ok" | "warning" | "error" | "unknown";
@@ -145,6 +157,11 @@ export interface FollowedTrader {
   autoDisableReason?: string | null;
   /** Latest copy-performance score derived from the bot's own copied results. */
   copyScore?: CopyScore | null;
+
+  /** Discovery v2: which candidate pool primarily surfaced this auto wallet. */
+  discoverySource?: DiscoverySource;
+  /** Discovery v2: composite ranking score (0..100) from the last refresh. */
+  discoveryScore?: number;
 }
 
 export interface BotPosition {
@@ -414,6 +431,84 @@ export interface LivePositionEntry {
   /** True when the source wallet of this token is a known copied wallet. */
   attributionKnown: boolean;
   redeemable: boolean;
+  /** Neg-risk (multi-outcome) market — redeemed via the NegRiskAdapter, not the CTF. */
+  negativeRisk: boolean;
+}
+
+/**
+ * A resolved position eligible for on-chain redemption, enriched with the
+ * expected USDC payout and whether it is safe to auto-redeem. Derived from the
+ * live-position snapshot; never includes positions already redeemed.
+ */
+export interface RedeemableItem {
+  tokenId: string;
+  conditionId: string;
+  marketTitle: string;
+  outcome: string;
+  shares: number;
+  /** Expected USDC payout if this is a winning position (winner pays $1/share). */
+  expectedPayoutUsd: number;
+  /** True when the position is attributable to a known copied wallet. */
+  attributionKnown: boolean;
+  classification: LivePositionClassification;
+  negativeRisk: boolean;
+  /**
+   * Why this item cannot be auto-redeemed by the bot (proxy/safe wallet, neg-risk,
+   * unknown attribution, …). null = the bot can redeem it directly. Such items are
+   * still surfaced so the operator can redeem them manually on Polymarket.
+   */
+  blockedReason: string | null;
+}
+
+/** Plan summarizing what is redeemable right now (for the dashboard + API GET). */
+export interface RedeemablePlan {
+  fetchedAt: number;
+  mode: BotMode;
+  items: RedeemableItem[];
+  /** Items the bot can redeem itself (blockedReason == null). */
+  redeemableCount: number;
+  /** Items that need manual redemption (blockedReason != null). */
+  manualCount: number;
+  totalExpectedPayoutUsd: number;
+  /** Non-null when the plan could not be built (e.g. live data unavailable). */
+  error: string | null;
+}
+
+/** Outcome of a single on-chain redeem attempt. */
+export interface RedeemAttemptResult {
+  tokenId: string;
+  conditionId: string;
+  success: boolean;
+  txHash: string | null;
+  payoutUsd: number;
+  error: string | null;
+}
+
+/** Summary returned after running a redeem pass (manual or automatic). */
+export interface RedeemRunResult {
+  ran: boolean;
+  attempted: number;
+  redeemed: number;
+  failed: number;
+  skipped: number;
+  totalPayoutUsd: number;
+  attempts: RedeemAttemptResult[];
+  error: string | null;
+}
+
+/** One persisted record of a position that has already been redeemed (de-dupe). */
+export interface RedeemedEntry {
+  tokenId: string;
+  conditionId: string;
+  txHash: string | null;
+  payoutUsd: number;
+  redeemedAt: number;
+  mode: BotMode;
+}
+
+/** Persisted ledger of redeemed positions — the double-redeem guard. */
+export interface RedeemBook {
+  entries: RedeemedEntry[];
 }
 
 /**
@@ -474,6 +569,8 @@ export interface BotStatus {
   logs: BotLogEntry[];
   /** Authoritative live-position reconciliation (real mode); null in simulation. */
   livePositions: LivePositionReconciliation | null;
+  /** Resolved positions eligible for redemption (real mode); empty in simulation. */
+  redeemables: RedeemablePlan;
   /** Structured "can the bot BUY right now?" readiness checklist. */
   buyReadiness: BuyReadiness;
 }

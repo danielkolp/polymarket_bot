@@ -59,6 +59,21 @@ export const config = {
   // Hard per-order USD backstop. Every live BUY is clamped to this regardless of
   // the percentage sizing / exposure caps. Start tiny; raise deliberately.
   liveMaxOrderUsd: num(process.env.LIVE_MAX_ORDER_USD, 5),
+
+  /**
+   * On-chain redemption of resolved (won) positions. Redeeming is NOT part of the
+   * CLOB API — it is a direct ConditionalTokens contract call — so it needs a
+   * Polygon JSON-RPC endpoint. Detection/manual redeem works without these (and is
+   * the default); fully-automatic redeem additionally requires enableAutoRedeem.
+   */
+  // Polygon JSON-RPC URL used ONLY to submit redeemPositions transactions.
+  liveRpcUrl: process.env.POLYMARKET_RPC_URL ?? "",
+  /**
+   * Master switch for FULLY-AUTOMATIC redemption on each real-mode poll. Defaults
+   * to FALSE. When false, resolved winnings are detected and surfaced but only
+   * redeemed via an explicit, confirmed operator action. Requires enableRealTrading.
+   */
+  enableAutoRedeem: bool(process.env.ENABLE_AUTO_REDEEM, false),
   // Warn when locally tracked equity and authoritative live USDC diverge by more
   // than this amount. This does not mutate local PnL/accounting history.
   liveBalanceWarningThresholdUsd: num(process.env.LIVE_BALANCE_WARNING_THRESHOLD_USD, 5),

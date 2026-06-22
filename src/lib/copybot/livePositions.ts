@@ -98,6 +98,7 @@ export async function reconcileLivePositions(
       classification,
       attributionKnown,
       redeemable: accPos.redeemable,
+      negativeRisk: accPos.negativeRisk,
     });
 
     // Authoritative position: keep local cost basis / attribution when present,
@@ -138,6 +139,7 @@ export async function reconcileLivePositions(
       classification: "stale-local-position",
       attributionKnown: local.sourceWallets.some((w) => followed.has(w.toLowerCase())),
       redeemable: false,
+      negativeRisk: false,
     });
   }
 
