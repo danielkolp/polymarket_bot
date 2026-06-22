@@ -1,0 +1,134 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark mossy console. Solid surfaces, no gradients. Lime is the single
+       accent; lavender is a quieter secondary. Text stays soft green-white.
+       Palette: bg #141A16 · surface #1D2520 · primary #C7D98B (lime) ·
+       secondary #B7A3FF (lavender) · text #DCE4D5 · muted #7A8678. */
+    --background: 140 13% 9%;
+    --foreground: 92 22% 86%;
+
+    --card: 143 12% 13%;
+    --card-foreground: 92 22% 86%;
+
+    --muted: 143 12% 18%;
+    --muted-foreground: 112 6% 56%;
+
+    --primary: 74 51% 70%;
+    --primary-foreground: 140 24% 10%;
+
+    --secondary: 253 24% 22%;
+    --secondary-foreground: 253 100% 88%;
+
+    --accent: 143 12% 20%;
+    --accent-foreground: 92 22% 86%;
+
+    --destructive: 4 78% 64%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 150 52% 58%;
+    --success-foreground: 150 40% 10%;
+
+    --warning: 40 88% 62%;
+    --warning-foreground: 40 90% 10%;
+
+    --border: 143 12% 22%;
+    --input: 143 12% 22%;
+    --ring: 74 51% 70%;
+
+    --radius: 0.75rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    font-family: var(--font-space-mono), ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "calt" 1;
+  }
+}
+
+/* Eyebrow / section label — Space Mono set small and wide. The main device for
+   hierarchy: a quiet uppercase label above a louder value or title. */
+.eyebrow {
+  font-size: 0.6875rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: hsl(var(--muted-foreground));
+}
+
+/* Live status dot with a soft pulsing halo (solid color, no gradient). */
+.live-dot {
+  position: relative;
+}
+.live-dot::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 9999px;
+  background: hsl(var(--success) / 0.4);
+  animation: live-halo 1.8s ease-in-out infinite;
+}
+@keyframes live-halo {
+  0%, 100% { transform: scale(0.7); opacity: 0.7; }
+  50% { transform: scale(1.25); opacity: 0; }
+}
+
+/* Thin scrollbars for data tables. */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 9999px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot::after {
+    animation: none;
+  }
+}
+
+
+.value-blink-up {
+  animation: value-blink-up 900ms ease-out;
+}
+
+.value-blink-down {
+  animation: value-blink-down 900ms ease-out;
+}
+
+@keyframes value-blink-up {
+  0% { background: hsl(var(--success) / 0.28); box-shadow: 0 0 0 0 hsl(var(--success) / 0.3); }
+  70% { background: hsl(var(--success) / 0.14); box-shadow: 0 0 0 6px hsl(var(--success) / 0); }
+  100% { background: transparent; box-shadow: none; }
+}
+
+@keyframes value-blink-down {
+  0% { background: hsl(var(--destructive) / 0.28); box-shadow: 0 0 0 0 hsl(var(--destructive) / 0.3); }
+  70% { background: hsl(var(--destructive) / 0.14); box-shadow: 0 0 0 6px hsl(var(--destructive) / 0); }
+  100% { background: transparent; box-shadow: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .value-blink-up,
+  .value-blink-down {
+    animation: none;
+  }
+}
