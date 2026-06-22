@@ -8,10 +8,17 @@
  * the REAL filled shares / average price / notional / tx hashes — or is flagged
  * `unmatched` when the CLOB reports no fill at all.
  *
+ * Matching is conservative by design (see `matchLiveFills`):
+ *   - exact taker-order-id matches are authoritative (`matched`);
+ *   - heuristic (token/side/time) matching is OFF unless explicitly enabled, and
+ *     even then can only ever produce a cautious `partial-match`;
+ *   - a single CLOB fill is never counted toward more than one local record.
+ *
  * It never mutates positions and never places orders; it only annotates records.
- * Position truth in real mode comes from the live account positions reconciler.
  */
+import { config } from "@/lib/config";
 import { fetchLiveTrades, type LiveTradeFill } from "@/lib/execution/liveClob";
+import { tradeIsAuthoritative } from "./ledger";
 import type { CopyTradeRecord, ReconciliationStatus } from "./types";
 
 export interface ReconciliationSummary {
@@ -24,8 +31,14 @@ export interface ReconciliationSummary {
   error: string | null;
 }
 
-/** Fuzzy match window when no order id is available to tie a fill to a record. */
-const MATCH_TIME_WINDOW_MS = 15 * 60 * 1000;
+export interface MatchOptions {
+  /** Allow heuristic token/side/time matching. Default false (order-id only). */
+  allowFuzzy?: boolean;
+  /** Fuzzy match window in ms. */
+  fuzzyWindowMs?: number;
+}
+
+const DEFAULT_FUZZY_WINDOW_MS = 15 * 60 * 1000;
 
 function isReconcilable(record: CopyTradeRecord): boolean {
   return record.mode === "real" && record.status === "copied";
@@ -33,12 +46,7 @@ function isReconcilable(record: CopyTradeRecord): boolean {
 
 /** Count live orders not yet authoritatively reconciled (matched/partial-match). */
 export function countUnreconciledLiveOrders(records: CopyTradeRecord[]): number {
-  return records.filter(
-    (r) =>
-      isReconcilable(r) &&
-      r.reconciliationStatus !== "matched" &&
-      r.reconciliationStatus !== "partial-match",
-  ).length;
+  return records.filter((r) => isReconcilable(r) && !tradeIsAuthoritative(r)).length;
 }
 
 const emptySummary: ReconciliationSummary = {
@@ -52,37 +60,18 @@ const emptySummary: ReconciliationSummary = {
 };
 
 /**
- * Reconcile real-mode copy records against authoritative CLOB fills. Returns a
- * new records array (already-`matched` records are left untouched) plus a summary.
+ * Pure matcher: annotate `records` with authoritative fills from `fills`.
+ * Already-authoritative records are left untouched. Returns new records + counts.
+ * Exported for direct unit testing without any network access.
  */
-export async function reconcileLiveTrades(
+export function matchLiveFills(
   records: CopyTradeRecord[],
+  fills: LiveTradeFill[],
+  options: MatchOptions = {},
   now = Date.now(),
-): Promise<{ records: CopyTradeRecord[]; summary: ReconciliationSummary }> {
-  const targets = records.filter(isReconcilable);
-  if (targets.length === 0) return { records, summary: { ...emptySummary } };
-
-  let fills: LiveTradeFill[];
-  try {
-    fills = await fetchLiveTrades();
-  } catch (err) {
-    // Couldn't verify against the CLOB. Flag unverified records as `error` so the
-    // dashboard surfaces the gap, but don't fabricate or drop fill data.
-    const updated = records.map((record) =>
-      isReconcilable(record) && record.reconciliationStatus !== "matched"
-        ? { ...record, reconciliationStatus: "error" as ReconciliationStatus, reconciledAt: now }
-        : record,
-    );
-    return {
-      records: updated,
-      summary: {
-        ...emptySummary,
-        ran: true,
-        errored: targets.length,
-        error: err instanceof Error ? err.message : String(err),
-      },
-    };
-  }
+): { records: CopyTradeRecord[]; matched: number; partial: number; unmatched: number } {
+  const allowFuzzy = options.allowFuzzy ?? false;
+  const fuzzyWindowMs = options.fuzzyWindowMs ?? DEFAULT_FUZZY_WINDOW_MS;
 
   const byOrder = new Map<string, LiveTradeFill[]>();
   for (const fill of fills) {
@@ -100,7 +89,7 @@ export async function reconcileLiveTrades(
 
   const updated = records.map((record) => {
     if (!isReconcilable(record)) return record;
-    if (record.reconciliationStatus === "matched") return record;
+    if (tradeIsAuthoritative(record)) return record;
 
     let group: LiveTradeFill[] = [];
     let status: ReconciliationStatus = "unmatched";
@@ -111,16 +100,26 @@ export async function reconcileLiveTrades(
       if (group.length > 0) status = "matched";
     }
 
-    // 2) Heuristic fallback: same token + side within a time window.
-    if (group.length === 0) {
-      group = fills.filter(
+    // 2) Optional heuristic fallback — same token + side within a time window.
+    //    Only ever yields a cautious `partial-match`, never `matched`. Refuses to
+    //    guess when multiple distinct candidate orders exist (ambiguous).
+    if (group.length === 0 && allowFuzzy) {
+      const candidates = fills.filter(
         (fill) =>
           !usedFillIds.has(fill.id) &&
           fill.tokenId === record.tokenId &&
           fill.side === record.side &&
-          (fill.matchTimeMs == null || Math.abs(fill.matchTimeMs - record.processedAt) <= MATCH_TIME_WINDOW_MS),
+          (fill.matchTimeMs == null || Math.abs(fill.matchTimeMs - record.processedAt) <= fuzzyWindowMs),
       );
-      if (group.length > 0) status = "partial-match";
+      const distinctOrders = new Set(candidates.map((c) => c.orderId ?? c.id));
+      if (candidates.length > 0 && distinctOrders.size <= 1) {
+        group = candidates;
+        status = "partial-match";
+      } else if (distinctOrders.size > 1) {
+        // Ambiguous — do not guess. Surface as error for manual review.
+        unmatched += 1;
+        return { ...record, reconciliationStatus: "error" as ReconciliationStatus, reconciledAt: now };
+      }
     }
 
     if (group.length === 0) {
@@ -129,8 +128,15 @@ export async function reconcileLiveTrades(
     }
 
     for (const fill of group) usedFillIds.add(fill.id);
-    const shares = group.reduce((sum, fill) => sum + fill.shares, 0);
-    const notional = group.reduce((sum, fill) => sum + fill.notionalUsd, 0);
+    // Never attribute more shares than the local order intended.
+    let shares = group.reduce((sum, fill) => sum + fill.shares, 0);
+    let notional = group.reduce((sum, fill) => sum + fill.notionalUsd, 0);
+    const intended = record.copiedShares;
+    if (intended > 0 && shares > intended * 1.0001) {
+      const scale = intended / shares;
+      notional *= scale;
+      shares = intended;
+    }
     const txHashes = [...new Set(group.flatMap((fill) => fill.txHashes))];
     if (status === "matched") matched += 1;
     else partial += 1;
@@ -145,6 +151,49 @@ export async function reconcileLiveTrades(
       txHashes: txHashes.length > 0 ? txHashes : record.txHashes,
     };
   });
+
+  return { records: updated, matched, partial, unmatched };
+}
+
+/**
+ * Reconcile real-mode copy records against authoritative CLOB fills. Returns a
+ * new records array (already-authoritative records are left untouched) plus a
+ * summary. Fetch/parse failures flag unverified records as `error` so the
+ * dashboard surfaces the gap and new BUYs block — never fabricates fills.
+ */
+export async function reconcileLiveTrades(
+  records: CopyTradeRecord[],
+  now = Date.now(),
+): Promise<{ records: CopyTradeRecord[]; summary: ReconciliationSummary }> {
+  const targets = records.filter(isReconcilable);
+  if (targets.length === 0) return { records, summary: { ...emptySummary } };
+
+  let fills: LiveTradeFill[];
+  try {
+    fills = await fetchLiveTrades();
+  } catch (err) {
+    const updated = records.map((record) =>
+      isReconcilable(record) && !tradeIsAuthoritative(record)
+        ? { ...record, reconciliationStatus: "error" as ReconciliationStatus, reconciledAt: now }
+        : record,
+    );
+    return {
+      records: updated,
+      summary: {
+        ...emptySummary,
+        ran: true,
+        errored: targets.length,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    };
+  }
+
+  const { records: updated, matched, partial, unmatched } = matchLiveFills(
+    records,
+    fills,
+    { allowFuzzy: config.liveAllowFuzzyReconcile },
+    now,
+  );
 
   return {
     records: updated,

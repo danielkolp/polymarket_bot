@@ -27,8 +27,9 @@ import { assertLiveTradingAllowed, placeLiveMarketOrder, type LiveUsdcBalance } 
 import { clearLiveBalanceCache, getLiveUsdcBalance } from "@/lib/execution/liveBalance";
 import { createInitialBotState } from "./defaults";
 import { buildScoreboard, normalizeSkipReason } from "./scoreboard";
-import { countUnreconciledLiveOrders, reconcileLiveTrades } from "./reconciliation";
+import { reconcileLiveTrades } from "./reconciliation";
 import { emptyLiveReconciliation, reconcileLivePositions } from "./livePositions";
+import { evaluateBuyReadiness } from "./liveReadiness";
 import { applyCopyScores } from "./copyScore";
 import { discoverTraders } from "./discovery";
 import {
@@ -505,12 +506,19 @@ export class CopyBotEngine {
     }
 
     const scoreboard = buildScoreboard(settings, statusState, statusMetrics, positions, trades);
+    const buyReadiness = evaluateBuyReadiness({
+      settings,
+      state: statusState,
+      trades,
+      livePositions: settings.mode === "real" ? livePositions : null,
+    });
 
     return {
       state: statusState,
       settings,
       metrics: statusMetrics,
       scoreboard,
+      buyReadiness,
       realTradingEnabled: config.enableRealTrading,
       simulationOnly: !config.enableRealTrading || settings.mode === "simulation",
       bullpen,
@@ -1374,6 +1382,7 @@ export class CopyBotEngine {
           now,
         );
         record.txOrOrderId = res.orderId ?? "";
+        record.reconciliationStatus = "pending";
         return { record, positions: nextPositions };
       } catch (err) {
         clearLiveBalanceCache();
@@ -1433,6 +1442,7 @@ export class CopyBotEngine {
         now,
       );
       record.txOrOrderId = res.orderId ?? "";
+      record.reconciliationStatus = "pending";
       return { record, positions: sold.positions };
     } catch (err) {
       clearLiveBalanceCache();
@@ -1514,6 +1524,7 @@ export class CopyBotEngine {
         record.mode = "real";
         record.status = "copied";
         record.txOrOrderId = res.orderId ?? "";
+        record.reconciliationStatus = "pending";
         await prependTrade(record);
         await appendLog("info", `Live auto-exit sold ${position.outcome}: ${exitReason}.`);
       } catch (err) {
@@ -1635,19 +1646,21 @@ export class CopyBotEngine {
           "% of bankroll). BUYs disabled until next session/day.",
       );
     }
-    // Block NEW live BUYs while too many prior live orders remain unreconciled
-    // against authoritative CLOB fills — the local ledger may be drifting from
-    // on-chain truth. Exits are never blocked.
-    if (settings.mode === "real" && trade.side === "BUY" && config.liveMaxUnreconciledOrders > 0) {
-      const unreconciled = countUnreconciledLiveOrders(priorTrades);
-      if (unreconciled >= config.liveMaxUnreconciledOrders) {
-        return skip(
-          "Skipped LIVE BUY: " +
-            unreconciled +
-            " unreconciled live order(s) (cap " +
-            config.liveMaxUnreconciledOrders +
-            "). Resolve reconciliation before opening new positions.",
-        );
+    // Centralized live-state readiness gate for NEW live BUYs: refuse if any live
+    // data / reconciliation / position state is uncertain (unmatched or errored
+    // fills, stale pending orders, unreconciled cap, missing/stale/unknown live
+    // positions). Exits are never blocked by this.
+    if (settings.mode === "real" && trade.side === "BUY") {
+      const livePositionsSnapshot = await loadLivePositions();
+      const readiness = evaluateBuyReadiness({
+        settings,
+        state,
+        trades: priorTrades,
+        livePositions: livePositionsSnapshot,
+        now,
+      });
+      if (!readiness.buysAllowed) {
+        return skip("Skipped LIVE BUY (readiness): " + readiness.blockers.map((b) => b.detail).join(" | "));
       }
     }
     if (settings.mode === "real" && trade.side === "BUY" && liveBalance && liveBalance.usdcBalance <= settings.minAvailableBalanceUsd) {

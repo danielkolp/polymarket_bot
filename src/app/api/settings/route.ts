@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCopyBotEngine } from "@/lib/copybot/bot";
 import { loadSettings } from "@/lib/copybot/store";
+import { mutationGuard } from "@/lib/server/guard";
 import type { BotSettings } from "@/lib/copybot/types";
 
 export const runtime = "nodejs";
@@ -18,6 +19,8 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  const blocked = mutationGuard(req);
+  if (blocked) return blocked;
   try {
     const patch = (await req.json()) as Partial<BotSettings>;
     return NextResponse.json({

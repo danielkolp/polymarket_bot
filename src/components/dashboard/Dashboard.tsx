@@ -1177,6 +1177,22 @@ export function Dashboard() {
           <span>{status.metrics.dailyLossLockoutReason ?? "Daily loss lockout active. New BUYs are disabled until the next day."}</span>
         </div>
       )}
+      {!status.metrics.panic &&
+        !status.metrics.dailyLossLockout &&
+        !status.buyReadiness.buysAllowed &&
+        status.buyReadiness.blockers.length > 0 && (
+          <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400">
+            <AlertTriangle className="size-4 shrink-0 translate-y-0.5" />
+            <div>
+              <span className="font-medium">New BUYs are blocked.</span>
+              <ul className="mt-0.5 list-disc pl-4 text-xs">
+                {status.buyReadiness.blockers.map((b) => (
+                  <li key={b.code}>{b.detail}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
 
       <StopDialog
         open={stopOpen}

@@ -7,6 +7,7 @@
  * Wallets that score badly past a minimum sample are auto-disabled unless pinned.
  */
 import { positionUnrealizedPnl } from "./accounting";
+import { isFilled as ledgerIsFilled, tradeAvgPrice, tradeFilledShares, tradeNotionalUsd } from "./ledger";
 import type { BotPosition, CopyScore, CopyTradeRecord, FollowedTrader } from "./types";
 
 /** Minimum filled copies before auto-disable rules can fire. */
@@ -16,7 +17,7 @@ const MIN_ATTEMPTS = 8;
 const HIGH_PRICE_THRESHOLD = 0.85;
 
 function isFilled(record: CopyTradeRecord): boolean {
-  return record.status === "simulated" || record.status === "copied";
+  return ledgerIsFilled(record);
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -40,27 +41,28 @@ export function computeCopyScore(
   const skipRatio = attempts > 0 ? skippedCount / attempts : 0;
 
   const realizedPnlUsd = filled.reduce((sum, t) => sum + t.realizedPnlUsd, 0);
-  const investedUsd = buys.reduce((sum, t) => sum + t.copyAmountUsd, 0);
+  const investedUsd = buys.reduce((sum, t) => sum + tradeNotionalUsd(t), 0);
 
   const openPositions = positions.filter((p) => p.sourceWallets.some((w) => w.toLowerCase() === lower));
   const unrealizedPnlUsd = openPositions.reduce((sum, p) => sum + positionUnrealizedPnl(p), 0);
 
   const copyRoi = investedUsd > 0 ? (realizedPnlUsd + unrealizedPnlUsd) / investedUsd : 0;
 
-  // Share-weighted entry slippage vs mid, in bps.
+  // Share-weighted entry slippage vs mid, in bps (authoritative price when reconciled).
   let slipShares = 0;
   let slipBpsWeighted = 0;
   for (const t of buys) {
-    const eff = t.effectivePrice;
+    const eff = tradeAvgPrice(t);
     const ref = t.referencePrice;
-    if (eff != null && ref != null && ref > 0 && t.copiedShares > 0) {
-      slipShares += t.copiedShares;
-      slipBpsWeighted += ((eff - ref) / ref) * 10000 * t.copiedShares;
+    const shares = tradeFilledShares(t);
+    if (ref != null && ref > 0 && shares > 0 && Number.isFinite(eff)) {
+      slipShares += shares;
+      slipBpsWeighted += ((eff - ref) / ref) * 10000 * shares;
     }
   }
   const avgSlippageBps = slipShares > 0 ? slipBpsWeighted / slipShares : 0;
 
-  const highPriceEntryCount = buys.filter((t) => (t.effectivePrice ?? t.price) > HIGH_PRICE_THRESHOLD).length;
+  const highPriceEntryCount = buys.filter((t) => tradeAvgPrice(t) > HIGH_PRICE_THRESHOLD).length;
   const lowLiquidityEntryCount = buys.filter((t) => t.fillStatus === "partial").length;
 
   // Composite 0..100. Centered at 50, rewarded by realistic ROI, penalized by

@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 import { getCopyBotEngine } from "@/lib/copybot/bot";
+import { mutationGuard } from "@/lib/server/guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
+  const blocked = mutationGuard(req);
+  if (blocked) return blocked;
   try {
     let opts: { liquidate?: boolean; source?: "session-close" | "auto-exit" } = {};
     // Body is optional. The window-close beacon and the stop modal both send one;

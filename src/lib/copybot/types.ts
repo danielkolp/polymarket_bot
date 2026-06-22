@@ -265,6 +265,23 @@ export interface BotMetrics {
   panicReason: string | null;
   /** Count of live orders not yet reconciled against authoritative CLOB fills. */
   unreconciledLiveOrders: number;
+
+  // ── Authoritative-vs-mirror accounting (real mode) ──────────────────────────
+  /** Cash computed purely from local mirror estimates (copyAmountUsd). */
+  cashUsdLocalMirror: number;
+  /** Cash computed preferring authoritative reconciled fills where available. */
+  cashUsdAuthoritative: number;
+  /** Mirror cash reserved against live BUYs that are not yet reconciled. */
+  pendingReservedUsd: number;
+  /** Total mirror notional of real orders not yet authoritatively reconciled. */
+  unreconciledNotionalUsd: number;
+  /**
+   * Confidence in the money ledger:
+   *  - "high": no unsafe real orders (or simulation).
+   *  - "degraded": some real orders are pending reconciliation.
+   *  - "blocked": some real orders are unmatched/errored — new BUYs are blocked.
+   */
+  accountingConfidence: "high" | "degraded" | "blocked";
 }
 
 export interface BotState {
@@ -419,6 +436,29 @@ export interface LivePositionReconciliation {
   redeemableCount: number;
 }
 
+/** One readiness gate evaluated when deciding whether new BUYs may proceed. */
+export interface ReadinessGate {
+  code: string;
+  label: string;
+  ok: boolean;
+  /** "block" gates stop new BUYs; "warn" gates are advisory only. */
+  severity: "block" | "warn";
+  detail: string;
+}
+
+/**
+ * Structured answer to "can the bot open a new BUY right now?". Sells, flatten,
+ * and read-only actions are intentionally NOT gated by this.
+ */
+export interface BuyReadiness {
+  mode: BotMode;
+  buysAllowed: boolean;
+  evaluatedAt: number;
+  gates: ReadinessGate[];
+  blockers: ReadinessGate[];
+  warnings: ReadinessGate[];
+}
+
 export interface BotStatus {
   state: BotState;
   settings: BotSettings;
@@ -434,4 +474,6 @@ export interface BotStatus {
   logs: BotLogEntry[];
   /** Authoritative live-position reconciliation (real mode); null in simulation. */
   livePositions: LivePositionReconciliation | null;
+  /** Structured "can the bot BUY right now?" readiness checklist. */
+  buyReadiness: BuyReadiness;
 }

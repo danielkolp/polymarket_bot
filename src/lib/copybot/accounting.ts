@@ -1,4 +1,5 @@
 import { todayKey } from "./defaults";
+import { isFilled, tradeIsUnsafeForAccounting, tradeNotionalUsd } from "./ledger";
 import type { BotMetrics, BotPosition, BotSettings, BotState, CopyTradeRecord } from "./types";
 
 export function clampPrice(price: number): number {
@@ -34,11 +35,22 @@ export function calculateEquity(settings: BotSettings, positions: BotPosition[],
   return calculateCash(settings, trades) + totalExposure(positions);
 }
 
-export function calculateCash(settings: BotSettings, trades: CopyTradeRecord[]): number {
+/**
+ * Cash from the trade ledger. By default this prefers authoritative reconciled
+ * fills (driving the ledger off real fills once they exist) and falls back to the
+ * local mirror estimate before reconciliation. Pass `mirrorOnly` to compute the
+ * pure mirror figure for comparison/diagnostics.
+ */
+export function calculateCash(
+  settings: BotSettings,
+  trades: CopyTradeRecord[],
+  opts: { mirrorOnly?: boolean } = {},
+): number {
   return trades.reduce((cash, trade) => {
-    if (trade.status !== "simulated" && trade.status !== "copied") return cash;
-    if (trade.side === "BUY") return cash - trade.copyAmountUsd;
-    return cash + trade.copyAmountUsd;
+    if (!isFilled(trade)) return cash;
+    const notional = opts.mirrorOnly ? trade.copyAmountUsd : tradeNotionalUsd(trade);
+    if (trade.side === "BUY") return cash - notional;
+    return cash + notional;
   }, settings.startingBalance);
 }
 
@@ -83,10 +95,13 @@ export function buildMetrics(
   now = Date.now(),
 ): { metrics: BotMetrics; state: BotState } {
   const cashUsd = calculateCash(settings, trades);
+  const cashUsdLocalMirror = calculateCash(settings, trades, { mirrorOnly: true });
   const totalExposureUsd = totalExposure(positions);
   const equityUsd = cashUsd + totalExposureUsd;
+  // Realized PnL excludes real orders whose fills are not yet authoritatively
+  // confirmed — their PnL is not final, so it must not be reported as settled.
   const realizedPnlUsd = trades
-    .filter((trade) => trade.status === "simulated" || trade.status === "copied")
+    .filter((trade) => isFilled(trade) && !tradeIsUnsafeForAccounting(trade))
     .reduce((sum, trade) => sum + trade.realizedPnlUsd, 0);
   const unrealizedPnlUsd = positions.reduce((sum, pos) => sum + positionUnrealizedPnl(pos), 0);
   const roi = settings.startingBalance > 0 ? (equityUsd - settings.startingBalance) / settings.startingBalance : 0;
@@ -118,13 +133,21 @@ export function buildMetrics(
     : null;
 
   // Live orders awaiting authoritative CLOB reconciliation.
-  const unreconciledLiveOrders = trades.filter(
-    (t) =>
-      t.mode === "real" &&
-      t.status === "copied" &&
-      t.reconciliationStatus !== "matched" &&
-      t.reconciliationStatus !== "partial-match",
-  ).length;
+  const unsafeRealOrders = trades.filter(tradeIsUnsafeForAccounting);
+  const unreconciledLiveOrders = unsafeRealOrders.length;
+  const unreconciledNotionalUsd = unsafeRealOrders.reduce((sum, t) => sum + Math.abs(t.copyAmountUsd), 0);
+  const pendingReservedUsd = unsafeRealOrders
+    .filter((t) => t.side === "BUY")
+    .reduce((sum, t) => sum + Math.abs(t.copyAmountUsd), 0);
+  const cashUsdAuthoritative = cashUsd; // calculateCash already prefers authoritative fills
+  const hasBlocking = unsafeRealOrders.some(
+    (t) => t.reconciliationStatus === "unmatched" || t.reconciliationStatus === "error",
+  );
+  const accountingConfidence: BotMetrics["accountingConfidence"] = hasBlocking
+    ? "blocked"
+    : unreconciledLiveOrders > 0
+      ? "degraded"
+      : "high";
 
   const nextState: BotState = {
     ...state,
@@ -172,6 +195,11 @@ export function buildMetrics(
       panic: Boolean(state.panic),
       panicReason: state.panic ? state.panicReason ?? "Panic stop engaged." : null,
       unreconciledLiveOrders,
+      cashUsdLocalMirror,
+      cashUsdAuthoritative,
+      pendingReservedUsd,
+      unreconciledNotionalUsd,
+      accountingConfidence,
     },
   };
 }

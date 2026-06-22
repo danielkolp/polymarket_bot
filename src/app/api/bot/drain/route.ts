@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCopyBotEngine } from "@/lib/copybot/bot";
+import { mutationGuard } from "@/lib/server/guard";
 import type { BotSettings } from "@/lib/copybot/types";
 
 export const runtime = "nodejs";
@@ -10,6 +11,8 @@ export const dynamic = "force-dynamic";
  * open ones per the optional take-profit / stop-loss / max-hold rules in the body.
  */
 export async function POST(req: Request) {
+  const blocked = mutationGuard(req);
+  if (blocked) return blocked;
   try {
     let rules: Partial<BotSettings> | undefined;
     try {

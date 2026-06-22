@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCopyBotEngine } from "@/lib/copybot/bot";
+import { mutationGuard } from "@/lib/server/guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,6 +17,8 @@ export const dynamic = "force-dynamic";
  * Panic state is persisted, so a server restart never silently resumes trading.
  */
 export async function POST(req: Request) {
+  const blocked = mutationGuard(req);
+  if (blocked) return blocked;
   try {
     let body: { flatten?: boolean; confirmFlatten?: string; reason?: string; resume?: boolean } = {};
     try {

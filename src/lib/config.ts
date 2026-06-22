@@ -72,6 +72,28 @@ export const config = {
   // remain unreconciled against authoritative CLOB fills. Keeps the local ledger
   // from drifting from on-chain truth. 0 disables the guard.
   liveMaxUnreconciledOrders: numNonNeg(process.env.LIVE_MAX_UNRECONCILED_ORDERS, 5),
+
+  // A real BUY still `pending` reconciliation after this many seconds blocks new
+  // BUYs — we will not pile on orders while a prior fill is unconfirmed.
+  livePendingStaleSeconds: num(process.env.LIVE_PENDING_STALE_SECONDS, 60),
+
+  // Allow heuristic (non-order-id) reconciliation matching. OFF by default: in
+  // real-money mode only exact order-id matches are trusted; everything else is
+  // surfaced as unmatched for manual review rather than guessed.
+  liveAllowFuzzyReconcile: bool(process.env.LIVE_ALLOW_FUZZY_RECONCILE, false),
+
+  // How many pages of CLOB trade history to walk when reconciling (safety cap).
+  liveReconcileMaxPages: num(process.env.LIVE_RECONCILE_MAX_PAGES, 10),
+
+  // Treat the live-position snapshot as stale (and block BUYs) once it is older
+  // than this many seconds.
+  livePositionsStaleSeconds: num(process.env.LIVE_POSITIONS_STALE_SECONDS, 120),
+
+  // Optional shared secret protecting every MUTATING API route (start/stop/reset/
+  // settings/traders/panic/...). When set, requests must present it via the
+  // `x-dashboard-token` header or `dashboard_token` cookie. Leave blank only for
+  // trusted localhost dev. Same-origin (CSRF) checks apply regardless.
+  dashboardAuthToken: process.env.DASHBOARD_AUTH_TOKEN ?? "",
 } as const;
 
 export type AppConfig = typeof config;

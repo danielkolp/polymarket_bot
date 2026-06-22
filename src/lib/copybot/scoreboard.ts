@@ -1,4 +1,5 @@
 import { walletExposure } from "./accounting";
+import { isFilled as ledgerIsFilled, tradeAvgPrice, tradeFilledShares } from "./ledger";
 import { RISK_PRESETS } from "./riskPresets";
 import type {
   BotMetrics,
@@ -13,7 +14,7 @@ import type {
 } from "./types";
 
 function isFilled(trade: CopyTradeRecord): boolean {
-  return trade.status === "simulated" || trade.status === "copied";
+  return ledgerIsFilled(trade);
 }
 
 /**
@@ -40,20 +41,22 @@ export function buildScoreboard(
   let entryShares = 0;
   let entryCost = 0;
   for (const trade of buys) {
-    const price = trade.effectivePrice ?? trade.price;
-    if (trade.copiedShares > 0 && Number.isFinite(price)) {
-      entryShares += trade.copiedShares;
-      entryCost += price * trade.copiedShares;
+    const price = tradeAvgPrice(trade);
+    const shares = tradeFilledShares(trade);
+    if (shares > 0 && Number.isFinite(price)) {
+      entryShares += shares;
+      entryCost += price * shares;
     }
   }
 
   let exitShares = 0;
   let exitCost = 0;
   for (const trade of sells) {
-    const price = trade.effectivePrice ?? trade.price;
-    if (trade.copiedShares > 0 && Number.isFinite(price)) {
-      exitShares += trade.copiedShares;
-      exitCost += price * trade.copiedShares;
+    const price = tradeAvgPrice(trade);
+    const shares = tradeFilledShares(trade);
+    if (shares > 0 && Number.isFinite(price)) {
+      exitShares += shares;
+      exitCost += price * shares;
     }
   }
 

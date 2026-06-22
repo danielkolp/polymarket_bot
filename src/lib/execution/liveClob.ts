@@ -285,35 +285,71 @@ function normalizeLiveTrade(raw: Record<string, unknown>): LiveTradeFill | null 
 }
 
 /**
- * Fetch recent authoritative trade fills for the trading account from the CLOB.
- * This is the source of truth for reconciling local live-order estimates against
- * what actually filled on-chain. Returns [] on a soft failure.
+ * Pull one page of CLOB trades and surface its rows + an optional next cursor.
+ * Throws on an UNEXPECTED payload shape (so reconciliation errors and BUYs block)
+ * — an explicit empty array is a valid "no trades" page and is allowed.
+ */
+function extractTradePage(resp: unknown): { rows: unknown[]; nextCursor: string | null } {
+  if (Array.isArray(resp)) return { rows: resp, nextCursor: null };
+  if (resp && typeof resp === "object") {
+    const obj = resp as Record<string, unknown>;
+    if (Array.isArray(obj.data)) {
+      const cursorRaw = obj.next_cursor ?? obj.nextCursor;
+      const nextCursor = typeof cursorRaw === "string" && cursorRaw && cursorRaw !== "LTE=" ? cursorRaw : null;
+      return { rows: obj.data, nextCursor };
+    }
+  }
+  throw new LiveTradingError(
+    "Polymarket getTrades() returned an unexpected shape; refusing to assume zero fills.",
+  );
+}
+
+/**
+ * Fetch authoritative trade fills for the trading account from the CLOB. This is
+ * the source of truth for reconciling local live-order estimates against what
+ * actually filled on-chain.
+ *
+ * Walks pages (up to config.liveReconcileMaxPages) when the client returns a
+ * cursor-paginated shape, so older fills are not missed. Throws on network errors
+ * OR on an unexpected payload shape — callers turn that into a reconciliation
+ * error that blocks new BUYs. It never silently returns [] on a shape change.
  */
 export async function fetchLiveTrades(): Promise<LiveTradeFill[]> {
   assertLiveTradingAllowed();
   const client = await getLiveClobClient();
-  let resp: unknown;
-  try {
-    // The clob-client exposes getTrades() for the authenticated account.
-    resp = await (client as unknown as { getTrades: (...args: unknown[]) => Promise<unknown> }).getTrades();
-  } catch (err) {
-    throw new LiveTradingError("Failed to fetch live trade history from Polymarket CLOB: " + errorMessage(err));
+  const getTrades = (client as unknown as { getTrades: (...args: unknown[]) => Promise<unknown> }).getTrades;
+  if (typeof getTrades !== "function") {
+    throw new LiveTradingError("Polymarket CLOB client does not expose getTrades(); cannot reconcile fills.");
   }
-
-  // The client may return an array directly or a paginated { data: [...] } shape.
-  const list = Array.isArray(resp)
-    ? resp
-    : Array.isArray((resp as { data?: unknown[] } | null)?.data)
-      ? (resp as { data: unknown[] }).data
-      : [];
 
   const out: LiveTradeFill[] = [];
-  for (const item of list) {
-    if (item && typeof item === "object") {
-      const fill = normalizeLiveTrade(item as Record<string, unknown>);
-      if (fill && fill.shares > 0 && fill.price > 0) out.push(fill);
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  const maxPages = Math.max(1, config.liveReconcileMaxPages);
+
+  for (let page = 0; page < maxPages; page += 1) {
+    let resp: unknown;
+    try {
+      resp = cursor ? await getTrades.call(client, undefined, false, cursor) : await getTrades.call(client);
+    } catch (err) {
+      throw new LiveTradingError("Failed to fetch live trade history from Polymarket CLOB: " + errorMessage(err));
     }
+
+    const { rows, nextCursor } = extractTradePage(resp);
+    for (const item of rows) {
+      if (item && typeof item === "object") {
+        const fill = normalizeLiveTrade(item as Record<string, unknown>);
+        if (fill && fill.shares > 0 && fill.price > 0 && !seen.has(fill.id)) {
+          seen.add(fill.id);
+          out.push(fill);
+        }
+      }
+    }
+
+    if (!nextCursor) break;
+    cursor = nextCursor;
   }
+
   return out;
 }
 
