@@ -16,7 +16,7 @@ import {
   walletExposure,
 } from "./accounting";
 import { inspectBullpenCli } from "./bullpen";
-import { isRiskPresetId } from "./riskPresets";
+import { isRiskPresetId, RISK_PRESETS } from "./riskPresets";
 import { assertLiveTradingAllowed, placeLiveMarketOrder, type LiveUsdcBalance } from "@/lib/execution/liveClob";
 import { clearLiveBalanceCache, getLiveUsdcBalance } from "@/lib/execution/liveBalance";
 import { createInitialBotState } from "./defaults";
@@ -106,20 +106,56 @@ function sanitizeNumber(value: number, fallback: number, min = 0, max = Number.M
   return Math.min(max, Math.max(min, value));
 }
 
+/** Numeric settings that each risk preset pins. Editing one drops to "custom". */
+const PRESET_CONTROLLED_KEYS = [
+  "maxTotalExposurePercent",
+  "maxExposurePerMarketPercent",
+  "minTimeToResolutionMinutes",
+  "minBuyTokenPrice",
+  "maxBuyTokenPrice",
+] as const satisfies readonly (keyof BotSettings)[];
+
 function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): BotSettings {
   if (patch.mode === "real" && !config.enableRealTrading) {
     throw new Error("ENABLE_REAL_TRADING is false. Refusing to enable real mode.");
   }
 
+  // Risk presets are server-authoritative. Selecting a non-custom preset applies
+  // that preset's numeric values; manually editing any preset-controlled numeric
+  // field (without re-selecting a preset) drops the preset to "custom".
+  const selectsPreset = isRiskPresetId(patch.riskPreset) && patch.riskPreset !== "custom";
+  const editsPresetField = PRESET_CONTROLLED_KEYS.some(
+    (key) => patch[key] !== undefined && patch[key] !== current[key],
+  );
+
+  let resolvedPreset: BotSettings["riskPreset"];
+  let presetValues: Partial<BotSettings> = {};
+  if (selectsPreset) {
+    resolvedPreset = patch.riskPreset as BotSettings["riskPreset"];
+    const preset = RISK_PRESETS[resolvedPreset];
+    presetValues = {
+      maxTotalExposurePercent: preset.totalExposurePercent,
+      maxExposurePerMarketPercent: preset.perMarketExposurePercent,
+      minTimeToResolutionMinutes: preset.minTimeToResolutionMinutes,
+      minBuyTokenPrice: preset.minBuyTokenPrice,
+      maxBuyTokenPrice: preset.maxBuyTokenPrice,
+    };
+  } else if (editsPresetField) {
+    resolvedPreset = "custom";
+  } else {
+    resolvedPreset = isRiskPresetId(patch.riskPreset) ? patch.riskPreset : current.riskPreset;
+  }
+
   const next: BotSettings = {
     ...current,
     ...patch,
+    ...presetValues,
     mode: patch.mode === "real" ? "real" : patch.mode === "simulation" ? "simulation" : current.mode,
     sizingMode:
       patch.sizingMode === "fixed" || patch.sizingMode === "percentage" || patch.sizingMode === "hybrid"
         ? patch.sizingMode
         : current.sizingMode,
-    riskPreset: isRiskPresetId(patch.riskPreset) ? patch.riskPreset : current.riskPreset,
+    riskPreset: resolvedPreset,
     sellBehavior: patch.sellBehavior === "all" ? "all" : patch.sellBehavior === "proportional" ? "proportional" : current.sellBehavior,
   };
 
@@ -718,7 +754,11 @@ export class CopyBotEngine {
     const current = await loadSettings();
     const next = sanitizeSettings(current, patch);
     await saveSettings(next);
-    await appendLog("info", "Settings updated.");
+    if (isRiskPresetId(patch.riskPreset) && patch.riskPreset !== "custom") {
+      await appendLog("info", `Risk preset applied: ${RISK_PRESETS[patch.riskPreset].label}.`);
+    } else {
+      await appendLog("info", "Settings updated.");
+    }
 
     const state = await loadBotState(next);
     if (state.runState === "running") {

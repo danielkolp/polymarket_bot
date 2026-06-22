@@ -250,6 +250,14 @@ export interface WalletCopyStat {
 export interface SessionScoreboard {
   activePreset: RiskPresetId;
   presetLabel: string;
+  /** The actual numeric thresholds in force right now (preset- or custom-driven). */
+  activeRiskValues: {
+    maxTotalExposurePercent: number;
+    maxExposurePerMarketPercent: number;
+    minTimeToResolutionMinutes: number;
+    minBuyTokenPrice: number;
+    maxBuyTokenPrice: number;
+  };
   startedAt: number | null;
   runtimeMs: number;
   walletsChecked: number;

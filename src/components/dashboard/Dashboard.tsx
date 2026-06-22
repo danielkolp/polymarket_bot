@@ -808,7 +808,13 @@ function Scoreboard({ scoreboard }: { scoreboard: SessionScoreboard }) {
             <Badge variant="muted">{formatDuration(runtimeMs)} runtime</Badge>
           </span>
         </CardTitle>
-        <CardDescription>Live session summary. Counters reset each time the bot is started.</CardDescription>
+        <CardDescription>
+          Live session summary. Counters reset each time the bot is started. Active thresholds:{" "}
+          {`buy ${cents(scoreboard.activeRiskValues.minBuyTokenPrice)}–${cents(scoreboard.activeRiskValues.maxBuyTokenPrice)}`}
+          {`, resolves > ${scoreboard.activeRiskValues.minTimeToResolutionMinutes} min`}
+          {`, exposure ${scoreboard.activeRiskValues.maxExposurePerMarketPercent}% / market · ${scoreboard.activeRiskValues.maxTotalExposurePercent}% total`}
+          .
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-4">

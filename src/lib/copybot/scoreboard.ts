@@ -110,6 +110,13 @@ export function buildScoreboard(
   return {
     activePreset: settings.riskPreset,
     presetLabel: RISK_PRESETS[settings.riskPreset]?.label ?? settings.riskPreset,
+    activeRiskValues: {
+      maxTotalExposurePercent: settings.maxTotalExposurePercent,
+      maxExposurePerMarketPercent: settings.maxExposurePerMarketPercent,
+      minTimeToResolutionMinutes: settings.minTimeToResolutionMinutes,
+      minBuyTokenPrice: settings.minBuyTokenPrice,
+      maxBuyTokenPrice: settings.maxBuyTokenPrice,
+    },
     startedAt: state.startedAt,
     runtimeMs,
     walletsChecked: state.sessionWalletsChecked,
