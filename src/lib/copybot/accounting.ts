@@ -18,6 +18,18 @@ export function positionUnrealizedPnl(position: BotPosition): number {
   return (position.markPrice - position.avgPrice) * position.shares;
 }
 
+/**
+ * Open exposure (USD) across every position that `wallet` contributed to. A
+ * position shared by multiple source wallets counts toward each of them, so this
+ * is a per-wallet ceiling on "markets this wallet drove us into" rather than a
+ * strict partition of total exposure.
+ */
+export function walletExposure(positions: BotPosition[], wallet: string): number {
+  return positions
+    .filter((position) => position.sourceWallets.includes(wallet))
+    .reduce((sum, position) => sum + positionExposure(position), 0);
+}
+
 export function calculateEquity(settings: BotSettings, positions: BotPosition[], trades: CopyTradeRecord[]): number {
   return calculateCash(settings, trades) + totalExposure(positions);
 }

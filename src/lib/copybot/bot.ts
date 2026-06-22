@@ -13,6 +13,7 @@ import {
   isBelowTradeMinimum,
   positionExposure,
   totalExposure,
+  walletExposure,
 } from "./accounting";
 import { inspectBullpenCli } from "./bullpen";
 import { isRiskPresetId } from "./riskPresets";
@@ -153,6 +154,9 @@ function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): Bo
     minTimeToResolutionMinutes: sanitizeNumber(next.minTimeToResolutionMinutes, current.minTimeToResolutionMinutes, 0, 525600),
     maxTradeAgeSec: sanitizeNumber(next.maxTradeAgeSec, current.maxTradeAgeSec, 5, 86400),
     traderRefreshIntervalMin: sanitizeNumber(next.traderRefreshIntervalMin, current.traderRefreshIntervalMin, 1, 1440),
+    maxCopiesPerWalletPerCycle: Math.round(sanitizeNumber(next.maxCopiesPerWalletPerCycle, current.maxCopiesPerWalletPerCycle, 0, 1000)),
+    maxExposurePerWalletPercent: sanitizeNumber(next.maxExposurePerWalletPercent, current.maxExposurePerWalletPercent, 0, 100),
+    walletTradeCooldownSec: sanitizeNumber(next.walletTradeCooldownSec, current.walletTradeCooldownSec, 0, 86400),
     sessionOnly: typeof next.sessionOnly === "boolean" ? next.sessionOnly : current.sessionOnly,
     autoExitTakeProfitPercent: sanitizeNumber(next.autoExitTakeProfitPercent, current.autoExitTakeProfitPercent, 0, 10000),
     autoExitStopLossPercent: sanitizeNumber(next.autoExitStopLossPercent, current.autoExitStopLossPercent, 0, 100),
@@ -933,6 +937,8 @@ export class CopyBotEngine {
       // Aggregate repeated skip reasons within this poll cycle so the log shows a
       // single grouped line per reason instead of one spammy line per trade.
       const skipBuckets = new Map<string, { level: LogLevel; reason: string; count: number }>();
+      // Per-wallet BUY copies made this cycle, for the per-wallet copy cap.
+      const walletCycleCopies = new Map<string, number>();
 
       for (const trade of traderTrades) {
         const id = sourceTradeId(trade);
@@ -942,10 +948,16 @@ export class CopyBotEngine {
           pausedBuyCount += 1;
           continue;
         }
-        const result = await this.processTrade(trade, settings, state, positions);
+        const result = await this.processTrade(trade, settings, state, positions, walletCycleCopies);
         positions = result.positions;
         await prependTrade(result.record);
         processedCount += 1;
+        if (
+          result.record.side === "BUY" &&
+          (result.record.status === "simulated" || result.record.status === "copied")
+        ) {
+          walletCycleCopies.set(trade.wallet, (walletCycleCopies.get(trade.wallet) ?? 0) + 1);
+        }
         if (result.record.status === "failed") {
           await appendLog("error", result.record.reason);
         } else if (result.record.status === "skipped") {
@@ -1273,6 +1285,7 @@ export class CopyBotEngine {
     settings: BotSettings,
     state: BotState,
     positions: BotPosition[],
+    walletCycleCopies: Map<string, number>,
   ): Promise<{ record: CopyTradeRecord; positions: BotPosition[] }> {
     const now = Date.now();
     const tradeAgeSec = Math.max(0, Math.floor(now / 1000) - trade.timestamp);
@@ -1308,6 +1321,36 @@ export class CopyBotEngine {
 
     const filterReason = buyMarketFilterReason(settings, trade, market);
     if (filterReason) return skip(filterReason);
+
+    // Per-copied-wallet controls (entries only — never block exits). These keep a
+    // single hot wallet from dominating the session regardless of global caps.
+    if (trade.side === "BUY") {
+      if (settings.maxCopiesPerWalletPerCycle > 0) {
+        const already = walletCycleCopies.get(trade.wallet) ?? 0;
+        if (already >= settings.maxCopiesPerWalletPerCycle) {
+          return skip(
+            "Skipped BUY: wallet copy cap of " +
+              settings.maxCopiesPerWalletPerCycle +
+              " trade(s) per poll cycle reached for this wallet.",
+          );
+        }
+      }
+      if (settings.walletTradeCooldownSec > 0) {
+        const cooldownMs = settings.walletTradeCooldownSec * 1000;
+        const lastCopy = priorTrades.find(
+          (record) =>
+            record.traderWallet === trade.wallet &&
+            record.conditionId === trade.conditionId &&
+            (record.status === "copied" || record.status === "simulated"),
+        );
+        if (lastCopy && now - lastCopy.processedAt < cooldownMs) {
+          const remainingSec = Math.ceil((cooldownMs - (now - lastCopy.processedAt)) / 1000);
+          return skip(
+            "Skipped BUY: same wallet/market cooldown active (" + remainingSec + "s of " + settings.walletTradeCooldownSec + "s remaining).",
+          );
+        }
+      }
+    }
 
     let availableBalanceUsd = localAvailableBalanceUsd;
     let equityUsd = localAvailableBalanceUsd + exposureUsd;
@@ -1389,6 +1432,13 @@ export class CopyBotEngine {
     }
     if (trade.side === "BUY" && exposureUsd + requestedAmountUsd > totalCapUsd) {
       return skip("Skipped BUY: total exposure cap " + settings.maxTotalExposurePercent + "% would be exceeded.");
+    }
+    if (trade.side === "BUY" && settings.maxExposurePerWalletPercent > 0) {
+      const walletCapUsd = dollarCapFromPercent(equityUsd, settings.maxExposurePerWalletPercent);
+      const walletExposureUsd = walletExposure(positions, trade.wallet);
+      if (walletExposureUsd + requestedAmountUsd > walletCapUsd) {
+        return skip("Skipped BUY: per-wallet exposure cap " + settings.maxExposurePerWalletPercent + "% would be exceeded for this wallet.");
+      }
     }
 
 

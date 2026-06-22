@@ -1,3 +1,4 @@
+import { walletExposure } from "./accounting";
 import { RISK_PRESETS } from "./riskPresets";
 import type {
   BotMetrics,
@@ -7,6 +8,7 @@ import type {
   CopyTradeRecord,
   SessionScoreboard,
   SkipReasonCount,
+  WalletCopyStat,
   WalletPnl,
 } from "./types";
 
@@ -55,24 +57,41 @@ export function buildScoreboard(
     }
   }
 
-  // Realized P&L attributed to each source wallet (skip the synthetic
-  // session-close / auto-exit pseudo-wallets that have no real address).
-  const walletMap = new Map<string, { name: string; pnl: number }>();
+  // Per-wallet copy activity and realized P&L (skip the synthetic session-close /
+  // auto-exit pseudo-wallets that have no real address).
+  const walletMap = new Map<string, { name: string; pnl: number; buys: number; sells: number }>();
   for (const trade of filled) {
     if (!trade.traderWallet || !/^0x[a-f0-9]{40}$/i.test(trade.traderWallet)) continue;
-    const current = walletMap.get(trade.traderWallet) ?? { name: trade.traderName || trade.traderWallet, pnl: 0 };
+    const current = walletMap.get(trade.traderWallet) ?? { name: trade.traderName || trade.traderWallet, pnl: 0, buys: 0, sells: 0 };
     current.pnl += trade.realizedPnlUsd;
+    if (trade.side === "BUY") current.buys += 1;
+    else current.sells += 1;
     if (trade.traderName) current.name = trade.traderName;
     walletMap.set(trade.traderWallet, current);
   }
 
+  const equityUsd = metrics.equityUsd;
   let bestWallet: WalletPnl | null = null;
   let worstWallet: WalletPnl | null = null;
+  const copiedTradesByWallet: WalletCopyStat[] = [];
   for (const [wallet, value] of walletMap) {
     const entry: WalletPnl = { wallet, name: value.name, realizedPnlUsd: value.pnl };
     if (!bestWallet || entry.realizedPnlUsd > bestWallet.realizedPnlUsd) bestWallet = entry;
     if (!worstWallet || entry.realizedPnlUsd < worstWallet.realizedPnlUsd) worstWallet = entry;
+
+    const exposureUsd = walletExposure(positions, wallet);
+    copiedTradesByWallet.push({
+      wallet,
+      name: value.name,
+      copiedTrades: value.buys + value.sells,
+      buys: value.buys,
+      sells: value.sells,
+      exposureUsd,
+      exposurePercent: equityUsd > 0 ? exposureUsd / equityUsd : 0,
+      realizedPnlUsd: value.pnl,
+    });
   }
+  copiedTradesByWallet.sort((a, b) => b.exposureUsd - a.exposureUsd || b.copiedTrades - a.copiedTrades);
 
   const skipMap = new Map<string, SkipReasonCount>();
   for (const trade of trades) {
@@ -108,6 +127,7 @@ export function buildScoreboard(
     averageExitPrice: exitShares > 0 ? exitCost / exitShares : 0,
     bestWallet,
     worstWallet,
+    copiedTradesByWallet,
     skipsByReason,
   };
 }

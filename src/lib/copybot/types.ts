@@ -37,6 +37,17 @@ export interface BotSettings {
   traderRefreshIntervalMin: number;
 
   /**
+   * Per-copied-wallet risk controls. These stop any single followed wallet from
+   * dominating the session — independent of the global exposure caps.
+   */
+  /** Max BUYs copied from one wallet within a single poll cycle. 0 = unlimited. */
+  maxCopiesPerWalletPerCycle: number;
+  /** Max exposure (% of equity) across markets a single wallet drove us into. 0 = disabled. */
+  maxExposurePerWalletPercent: number;
+  /** Cooldown after copying a wallet+market BUY before copying that pair again. 0 = disabled. */
+  walletTradeCooldownSec: number;
+
+  /**
    * Session-only mode: positions opened during a run are treated as ephemeral.
    * When true, stopping the bot (or closing the dashboard window) auto-liquidates
    * everything instead of leaving open simulated positions behind.
@@ -216,6 +227,21 @@ export interface SkipReasonCount {
   count: number;
 }
 
+/** Per-wallet copy activity + current exposure attributed to that wallet. */
+export interface WalletCopyStat {
+  wallet: string;
+  name: string;
+  /** Filled BUY + SELL copies sourced from this wallet. */
+  copiedTrades: number;
+  buys: number;
+  sells: number;
+  /** Current open exposure (USD) in markets this wallet contributed to. */
+  exposureUsd: number;
+  /** Exposure as a fraction of current equity. */
+  exposurePercent: number;
+  realizedPnlUsd: number;
+}
+
 /**
  * Aggregated, session-oriented snapshot rendered in the scoreboard panel.
  * Derived on demand from settings, state, metrics, the full trade ledger, and
@@ -243,6 +269,8 @@ export interface SessionScoreboard {
   averageExitPrice: number;
   bestWallet: WalletPnl | null;
   worstWallet: WalletPnl | null;
+  /** Per-wallet copy counts + exposure, sorted by exposure then copy count. */
+  copiedTradesByWallet: WalletCopyStat[];
   skipsByReason: SkipReasonCount[];
 }
 

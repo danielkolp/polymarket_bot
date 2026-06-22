@@ -16,7 +16,7 @@ import { RISK_PRESETS, type RiskPreset } from "@/lib/copybot/riskPresets";
 import { DashboardVisuals } from "./DashboardVisuals";
 import { cn } from "@/lib/utils";
 import { fromNow } from "@/lib/time";
-import type { BotLogEntry, BotPosition, BotSettings, BotStatus, CopyTradeRecord, FollowedTrader, RiskPresetId, SessionScoreboard } from "@/lib/copybot/types";
+import type { BotLogEntry, BotPosition, BotSettings, BotStatus, CopyTradeRecord, FollowedTrader, RiskPresetId, SessionScoreboard, WalletCopyStat } from "@/lib/copybot/types";
 
 type ApiEnvelope<T> = { ok: true; data: T; fetchedAt: number } | { ok: false; error: string };
 
@@ -523,6 +523,9 @@ function SettingsPanel({ status, onSave }: { status: BotStatus; onSave: (setting
           <NumberField label="Per-market exposure cap (%)" value={draft.maxExposurePerMarketPercent} step={0.5} onChange={(value) => updateRiskCap("maxExposurePerMarketPercent", value)} />
           <NumberField label="Total exposure cap (%)" value={draft.maxTotalExposurePercent} step={0.5} onChange={(value) => updateRiskCap("maxTotalExposurePercent", value)} />
           <NumberField label="Daily loss cap (%)" value={draft.maxDailyLossPercent} step={0.5} onChange={(value) => update("maxDailyLossPercent", value)} />
+          <NumberField label="Max copies / wallet / cycle" value={draft.maxCopiesPerWalletPerCycle} step={1} min={0} onChange={(value) => update("maxCopiesPerWalletPerCycle", value)} />
+          <NumberField label="Per-wallet exposure cap (%)" value={draft.maxExposurePerWalletPercent} step={1} min={0} max={100} onChange={(value) => update("maxExposurePerWalletPercent", value)} />
+          <NumberField label="Same wallet/market cooldown (sec)" value={draft.walletTradeCooldownSec} step={15} min={0} onChange={(value) => update("walletTradeCooldownSec", value)} />
           <NumberField label="Starting balance ($)" value={draft.startingBalance} step={1} min={1} onChange={(value) => update("startingBalance", value)} />
           <NumberField label="Min available balance ($)" value={draft.minAvailableBalanceUsd} step={0.25} onChange={(value) => update("minAvailableBalanceUsd", value)} />
           <NumberField label="Polling interval (sec)" value={draft.pollingIntervalSec} step={5} min={5} onChange={(value) => update("pollingIntervalSec", value)} />
@@ -833,6 +836,41 @@ function Scoreboard({ scoreboard }: { scoreboard: SessionScoreboard }) {
             sub={scoreboard.worstWallet ? `${scoreboard.worstWallet.name} · ${signedMoney(scoreboard.worstWallet.realizedPnlUsd)}` : "no closed trades"}
             tone={scoreboard.worstWallet ? tone(scoreboard.worstWallet.realizedPnlUsd) : "neutral"}
           />
+        </div>
+
+        <div>
+          <div className="eyebrow mb-1.5 text-[10px] text-muted-foreground">Copied trades by wallet</div>
+          {scoreboard.copiedTradesByWallet.length === 0 ? (
+            <div className="rounded-md border border-border bg-background/40 px-2.5 py-2 text-xs text-muted-foreground">No copied trades yet.</div>
+          ) : (
+            <div className="max-h-[200px] overflow-auto scrollbar-thin pr-1">
+              <table className="w-full text-xs">
+                <thead className="text-[10px] text-muted-foreground">
+                  <tr className="border-b border-border text-left">
+                    <th className="py-1 pr-2">Wallet</th>
+                    <th className="py-1 pr-2 text-right">Copies</th>
+                    <th className="py-1 pr-2 text-right">B / S</th>
+                    <th className="py-1 pr-2 text-right">Exposure</th>
+                    <th className="py-1 text-right">Realized P&L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {scoreboard.copiedTradesByWallet.map((wallet: WalletCopyStat) => (
+                    <tr key={wallet.wallet} className="border-b border-border/60">
+                      <td className="max-w-[180px] truncate py-1 pr-2" title={`${wallet.name} · ${wallet.wallet}`}>
+                        <span className="font-medium">{wallet.name}</span>
+                        <span className="ml-1 text-muted-foreground">{shortWallet(wallet.wallet)}</span>
+                      </td>
+                      <td className="py-1 pr-2 text-right tabular-nums">{wallet.copiedTrades}</td>
+                      <td className="py-1 pr-2 text-right tabular-nums text-muted-foreground">{wallet.buys}/{wallet.sells}</td>
+                      <td className="py-1 pr-2 text-right tabular-nums">{money(wallet.exposureUsd)} <span className="text-muted-foreground">({percent(wallet.exposurePercent)})</span></td>
+                      <td className={cn("py-1 text-right tabular-nums", wallet.realizedPnlUsd > 0 ? "text-success" : wallet.realizedPnlUsd < 0 ? "text-destructive" : "text-muted-foreground")}>{signedMoney(wallet.realizedPnlUsd)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
 
         <div>
