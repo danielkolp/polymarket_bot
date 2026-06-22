@@ -133,6 +133,11 @@ export async function discoverTraders(
       lastTradeAt: candidate.lastTradeAt,
       addedAt: previous?.addedAt ?? now,
       updatedAt: now,
+      // Preserve operator/scoring state across discovery refreshes.
+      pinned: previous?.pinned,
+      autoDisabled: previous?.autoDisabled,
+      autoDisableReason: previous?.autoDisableReason,
+      copyScore: previous?.copyScore,
     });
   }
 

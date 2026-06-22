@@ -77,6 +77,18 @@ export function assertLiveTradingAllowed(): void {
   }
 }
 
+/**
+ * The address that actually holds the account's positions/collateral: the funder
+ * (proxy/safe) when configured, otherwise the EOA derived from the signing key.
+ * Used to fetch authoritative live positions. Throws unless live is configured.
+ */
+export function getLiveAccountAddress(): string {
+  assertLiveTradingAllowed();
+  const funder = config.liveFunderAddress.trim();
+  if (funder) return funder.toLowerCase();
+  return new Wallet(config.livePrivateKey.trim()).address.toLowerCase();
+}
+
 let clientPromise: Promise<ClobClient> | null = null;
 
 async function buildClient(): Promise<ClobClient> {
@@ -206,6 +218,103 @@ export async function ensureUsdcAllowance(): Promise<void> {
   } catch {
     // ignore — surfaced elsewhere if an order later fails on allowance
   }
+}
+
+/** One authoritative fill from the CLOB trade history (real money). */
+export interface LiveTradeFill {
+  /** CLOB trade id. */
+  id: string;
+  /** The taker order id this fill settled, if present. */
+  orderId: string | null;
+  tokenId: string;
+  conditionId: string;
+  side: "BUY" | "SELL";
+  /** Shares filled. */
+  shares: number;
+  /** Per-share fill price, 0..1. */
+  price: number;
+  /** USDC notional (shares * price). */
+  notionalUsd: number;
+  status: string | null;
+  /** Match/settlement time in ms epoch, if available. */
+  matchTimeMs: number | null;
+  txHashes: string[];
+}
+
+function toNum(value: unknown): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  if (typeof value === "string") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+function normalizeLiveTrade(raw: Record<string, unknown>): LiveTradeFill | null {
+  const tokenId = String(raw.asset_id ?? raw.assetId ?? raw.tokenID ?? raw.token_id ?? "");
+  if (!tokenId) return null;
+  const idRaw = raw.id ?? raw.trade_id ?? raw.tradeId;
+  const orderIdRaw = raw.taker_order_id ?? raw.takerOrderId ?? raw.order_id ?? raw.orderID ?? null;
+  const sideRaw = String(raw.side ?? "").toUpperCase();
+  const shares = toNum(raw.size ?? raw.matched_amount ?? raw.amount);
+  const price = toNum(raw.price);
+  const matchRaw = raw.match_time ?? raw.matchTime ?? raw.timestamp;
+  const matchSec = toNum(matchRaw);
+  // match_time is typically unix seconds; tolerate ms by leaving large values as-is.
+  const matchTimeMs = matchSec > 0 ? (matchSec > 1e12 ? matchSec : matchSec * 1000) : null;
+  const txField = raw.transaction_hash ?? raw.transactionHash ?? raw.bucket_index;
+  const txHashes = Array.isArray(raw.transactionsHashes)
+    ? (raw.transactionsHashes as unknown[]).map(String)
+    : typeof txField === "string" && txField.startsWith("0x")
+      ? [txField]
+      : [];
+
+  return {
+    id: idRaw ? String(idRaw) : `${tokenId}:${matchSec}:${price}:${shares}`,
+    orderId: orderIdRaw ? String(orderIdRaw) : null,
+    tokenId,
+    conditionId: String(raw.market ?? raw.condition_id ?? raw.conditionId ?? ""),
+    side: sideRaw === "SELL" ? "SELL" : "BUY",
+    shares,
+    price,
+    notionalUsd: shares * price,
+    status: raw.status != null ? String(raw.status) : null,
+    matchTimeMs,
+    txHashes,
+  };
+}
+
+/**
+ * Fetch recent authoritative trade fills for the trading account from the CLOB.
+ * This is the source of truth for reconciling local live-order estimates against
+ * what actually filled on-chain. Returns [] on a soft failure.
+ */
+export async function fetchLiveTrades(): Promise<LiveTradeFill[]> {
+  assertLiveTradingAllowed();
+  const client = await getLiveClobClient();
+  let resp: unknown;
+  try {
+    // The clob-client exposes getTrades() for the authenticated account.
+    resp = await (client as unknown as { getTrades: (...args: unknown[]) => Promise<unknown> }).getTrades();
+  } catch (err) {
+    throw new LiveTradingError("Failed to fetch live trade history from Polymarket CLOB: " + errorMessage(err));
+  }
+
+  // The client may return an array directly or a paginated { data: [...] } shape.
+  const list = Array.isArray(resp)
+    ? resp
+    : Array.isArray((resp as { data?: unknown[] } | null)?.data)
+      ? (resp as { data: unknown[] }).data
+      : [];
+
+  const out: LiveTradeFill[] = [];
+  for (const item of list) {
+    if (item && typeof item === "object") {
+      const fill = normalizeLiveTrade(item as Record<string, unknown>);
+      if (fill && fill.shares > 0 && fill.price > 0) out.push(fill);
+    }
+  }
+  return out;
 }
 
 export interface LiveMarketOrderParams {

@@ -97,7 +97,8 @@ export function buildMetrics(
   const totalFrictionUsd = filled.reduce((sum, t) => sum + (t.frictionUsd ?? 0), 0);
   const totalFeesUsd = filled.reduce((sum, t) => sum + (t.feeUsd ?? 0), 0);
   const dailyDate = todayKey(now);
-  const dailyStartEquityUsd = state.dailyDate === dailyDate ? state.dailyStartEquityUsd : equityUsd;
+  const sameDay = state.dailyDate === dailyDate;
+  const dailyStartEquityUsd = sameDay ? state.dailyStartEquityUsd : equityUsd;
   const peakEquityUsd = Math.max(state.peakEquityUsd || settings.startingBalance, equityUsd);
   const maxDrawdown = peakEquityUsd > 0 ? Math.max(0, (peakEquityUsd - equityUsd) / peakEquityUsd) : 0;
   const availableBalanceUsd = Math.max(0, cashUsd);
@@ -105,11 +106,32 @@ export function buildMetrics(
   const exposureCap = settings.maxTotalExposurePercent / 100;
   const buyExposurePaused = settings.mode === "simulation" && exposureCap > 0 && totalExposurePercent >= exposureCap - 1e-9;
 
+  const dailyPnlUsd = equityUsd - dailyStartEquityUsd;
+  // Hard daily-loss lockout. Latches once breached and stays latched for the rest
+  // of the local day (cleared only at the day boundary or on reset), so a brief
+  // equity bounce can't silently re-enable BUYs after a bad day.
+  const dailyLossCapUsd = dollarCapFromPercent(dailyStartEquityUsd, settings.maxDailyLossPercent);
+  const lossBreachedNow = settings.maxDailyLossPercent > 0 && dailyLossCapUsd > 0 && dailyPnlUsd <= -dailyLossCapUsd;
+  const dailyLossLockout = sameDay ? Boolean(state.dailyLossLockout) || lossBreachedNow : false;
+  const dailyLossLockoutReason = dailyLossLockout
+    ? `Daily loss ${dailyPnlUsd.toFixed(2)} USD reached the ${settings.maxDailyLossPercent}% cap (-${dailyLossCapUsd.toFixed(2)} USD). New BUYs disabled until the next day.`
+    : null;
+
+  // Live orders awaiting authoritative CLOB reconciliation.
+  const unreconciledLiveOrders = trades.filter(
+    (t) =>
+      t.mode === "real" &&
+      t.status === "copied" &&
+      t.reconciliationStatus !== "matched" &&
+      t.reconciliationStatus !== "partial-match",
+  ).length;
+
   const nextState: BotState = {
     ...state,
     dailyDate,
     dailyStartEquityUsd,
     peakEquityUsd,
+    dailyLossLockout,
   };
 
   return {
@@ -142,9 +164,14 @@ export function buildMetrics(
       totalExposureUsd,
       totalExposurePercent,
       maxDrawdown,
-      dailyPnlUsd: equityUsd - dailyStartEquityUsd,
+      dailyPnlUsd,
       totalFrictionUsd,
       totalFeesUsd,
+      dailyLossLockout,
+      dailyLossLockoutReason,
+      panic: Boolean(state.panic),
+      panicReason: state.panic ? state.panicReason ?? "Panic stop engaged." : null,
+      unreconciledLiveOrders,
     },
   };
 }

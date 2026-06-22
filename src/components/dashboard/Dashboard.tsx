@@ -3,7 +3,7 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import useSWR from "swr";
-import { Activity, AlertTriangle, Bot, DollarSign, Hand, Pause, Play, Plus, RefreshCcw, RotateCcw, Square, Timer, Trash2, Wallet } from "lucide-react";
+import { Activity, AlertTriangle, Bot, DollarSign, Hand, OctagonX, Pause, Play, Plus, RefreshCcw, RotateCcw, ShieldCheck, Square, Timer, Trash2, Wallet } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1140,9 +1140,43 @@ export function Dashboard() {
             <Button size="sm" variant="outline" onClick={() => runAction("marks", "/api/bot/marks")} disabled={busy !== null || status.positions.length === 0} title="Pull live Polymarket prices for your open positions now."><Activity className="size-3" /> {busy === "marks" ? "Updating..." : "Update prices"}</Button>
             <Button size="sm" variant="ghost" onClick={() => mutate()}><RefreshCcw className="size-3" /> Refresh</Button>
             <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setResetOpen(true)} disabled={busy !== null} title="Clear positions, trades, and P&L back to the starting balance."><RotateCcw className="size-3" /> Reset</Button>
+            {status.metrics.panic ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => runAction("resume", "/api/bot/panic", { resume: true })}
+                disabled={busy !== null}
+                title="Clear the panic stop. The bot stays stopped until you click Start."
+              >
+                <ShieldCheck className="size-3" /> Resume
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={() => runAction("panic", "/api/bot/panic")}
+                disabled={busy !== null}
+                title="Emergency stop: halt the loop and block all new BUYs. Persisted across restarts."
+              >
+                <OctagonX className="size-3" /> Panic stop
+              </Button>
+            )}
           </div>
         </div>
       </header>
+
+      {status.metrics.panic && (
+        <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <OctagonX className="size-4 shrink-0" />
+          <span>{status.metrics.panicReason ?? "Panic stop engaged."} New BUYs are disabled until you Resume and Start.</span>
+        </div>
+      )}
+      {!status.metrics.panic && status.metrics.dailyLossLockout && (
+        <div className="flex items-center gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400">
+          <AlertTriangle className="size-4 shrink-0" />
+          <span>{status.metrics.dailyLossLockoutReason ?? "Daily loss lockout active. New BUYs are disabled until the next day."}</span>
+        </div>
+      )}
 
       <StopDialog
         open={stopOpen}

@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import { DEFAULT_BOT_SETTINGS, createInitialBotState } from "./defaults";
+import { applyRiskPreset } from "./riskPresets";
 import type {
   BotLogEntry,
   BotPosition,
@@ -9,6 +10,7 @@ import type {
   CopyTradeRecord,
   EquityPoint,
   FollowedTrader,
+  LivePositionReconciliation,
   SeenTradeBook,
 } from "./types";
 
@@ -21,6 +23,7 @@ const POSITIONS_FILE = path.join(DATA_DIR, "positions.json");
 const EQUITY_FILE = path.join(DATA_DIR, "equity-curve.json");
 const ERRORS_FILE = path.join(DATA_DIR, "errors.log");
 const STATE_FILE = path.join(DATA_DIR, "bot-state.json");
+const LIVE_POSITIONS_FILE = path.join(DATA_DIR, "live-positions.json");
 
 const MAX_TRADES = 1000;
 const MAX_LOGS = 500;
@@ -32,7 +35,10 @@ function clone<T>(value: T): T {
 }
 
 function mergeSettings(value: Partial<BotSettings> | null | undefined): BotSettings {
-  return { ...DEFAULT_BOT_SETTINGS, ...(value ?? {}) };
+  // Re-apply the active risk preset on every merge so stale persisted JSON that
+  // kept old numeric fields under a non-custom preset label is corrected at load
+  // (and re-save) time. Custom settings pass through untouched.
+  return applyRiskPreset({ ...DEFAULT_BOT_SETTINGS, ...(value ?? {}) });
 }
 
 function initialEquityCurve(settings: BotSettings, now = Date.now()): EquityPoint[] {
@@ -163,6 +169,15 @@ export async function loadBotState(settings?: BotSettings): Promise<BotState> {
 
 export async function saveBotState(state: BotState): Promise<void> {
   await enqueueWrite(() => writeJson(STATE_FILE, state));
+}
+
+/** Latest authoritative live-position reconciliation snapshot (real mode). */
+export async function loadLivePositions(): Promise<LivePositionReconciliation | null> {
+  return readJson<LivePositionReconciliation | null>(LIVE_POSITIONS_FILE, null);
+}
+
+export async function saveLivePositions(snapshot: LivePositionReconciliation | null): Promise<void> {
+  await enqueueWrite(() => writeJson(LIVE_POSITIONS_FILE, snapshot));
 }
 
 export async function ensureErrorLog(): Promise<void> {

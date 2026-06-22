@@ -11,6 +11,12 @@ function num(value: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+/** Like num(), but allows zero (for thresholds where 0 is meaningful). */
+function numNonNeg(value: string | undefined, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 function bool(value: string | undefined, fallback = false): boolean {
   if (value == null) return fallback;
   return value.trim().toLowerCase() === "true";
@@ -56,6 +62,16 @@ export const config = {
   // Warn when locally tracked equity and authoritative live USDC diverge by more
   // than this amount. This does not mutate local PnL/accounting history.
   liveBalanceWarningThresholdUsd: num(process.env.LIVE_BALANCE_WARNING_THRESHOLD_USD, 5),
+
+  // When true (default), a persisted panic stop is NOT cleared automatically on
+  // restart — the operator must explicitly resume. This prevents a crash/restart
+  // from silently re-enabling live trading after an emergency stop.
+  liveRequireManualResumeAfterPanic: bool(process.env.LIVE_REQUIRE_MANUAL_RESUME_AFTER_PANIC, true),
+
+  // Block placing new live orders once this many previously-placed live orders
+  // remain unreconciled against authoritative CLOB fills. Keeps the local ledger
+  // from drifting from on-chain truth. 0 disables the guard.
+  liveMaxUnreconciledOrders: numNonNeg(process.env.LIVE_MAX_UNRECONCILED_ORDERS, 5),
 } as const;
 
 export type AppConfig = typeof config;

@@ -9,6 +9,17 @@ export type TradeStatus = "simulated" | "copied" | "skipped" | "failed" | "dry-r
 export type LogLevel = "info" | "warning" | "error";
 export type LiveBalanceStatus = "ok" | "warning" | "error" | "unknown";
 
+/** Lifecycle of matching a local live order against authoritative CLOB fills. */
+export type ReconciliationStatus = "pending" | "matched" | "partial-match" | "unmatched" | "error";
+
+/** How a live account position relates to the bot's local position ledger. */
+export type LivePositionClassification =
+  | "known-bot-position"
+  | "manual-position"
+  | "unknown-existing-position"
+  | "stale-local-position"
+  | "missing-live-position";
+
 export interface BotSettings {
   mode: BotMode;
   startingBalance: number;
@@ -72,6 +83,46 @@ export interface BotSettings {
   fallbackSpreadBps: number;
 }
 
+/**
+ * Score derived from the bot's OWN copied results for a wallet — not public
+ * leaderboard PnL. This is what should decide which wallets survive into live
+ * mode. All component metrics are computed from the local copy-trade ledger and
+ * current positions, so they reflect realistic (post-fill) outcomes.
+ */
+export interface CopyScore {
+  wallet: string;
+  /** Filled BUY copies sourced from this wallet. */
+  copiedBuys: number;
+  /** Filled SELL copies sourced from this wallet. */
+  copiedSells: number;
+  /** Filled copies (buys + sells). */
+  filledCopies: number;
+  /** Skipped source trades from this wallet. */
+  skippedCount: number;
+  /** skipped / (skipped + filled). High = this wallet's trades rarely pass gates. */
+  skipRatio: number;
+  /** Realized P&L attributed to this wallet's copied trades. */
+  realizedPnlUsd: number;
+  /** Unrealized P&L of still-open positions this wallet contributed to. */
+  unrealizedPnlUsd: number;
+  /** Total USD put to work on this wallet's copied BUYs (cost basis). */
+  investedUsd: number;
+  /** (realized + unrealized) / invested. */
+  copyRoi: number;
+  /** Share-weighted average entry slippage vs mid, in bps, across copied BUYs. */
+  avgSlippageBps: number;
+  /** Copied BUY entries above 85c (asymmetric-risk entries). */
+  highPriceEntryCount: number;
+  /** Copied BUY entries that only partially filled (thin-book proxy). */
+  lowLiquidityEntryCount: number;
+  /** Open positions still attributed to this wallet (potential missed exits). */
+  openPositionCount: number;
+  /** Composite 0..100 score; higher is better. */
+  score: number;
+  /** Non-null when scoring rules recommend auto-disabling this wallet. */
+  autoDisableReason: string | null;
+}
+
 export interface FollowedTrader {
   wallet: string;
   name: string;
@@ -86,6 +137,14 @@ export interface FollowedTrader {
   lastTradeAt: number | null;
   addedAt: number;
   updatedAt: number;
+
+  /** Manual override: a pinned wallet is never auto-disabled by scoring. */
+  pinned?: boolean;
+  /** Set true when copy-scoring rules disabled this wallet (separate from `enabled`). */
+  autoDisabled?: boolean;
+  autoDisableReason?: string | null;
+  /** Latest copy-performance score derived from the bot's own copied results. */
+  copyScore?: CopyScore | null;
 }
 
 export interface BotPosition {
@@ -137,6 +196,20 @@ export interface CopyTradeRecord {
   frictionUsd?: number;
   fillStatus?: "filled" | "partial" | "rejected";
   costSource?: "book" | "quote" | "assumed";
+
+  // ── Authoritative live-fill reconciliation (real mode only) ─────────────────
+  /** When this record was last reconciled against CLOB trade history (ms epoch). */
+  reconciledAt?: number;
+  /** Result of matching this live order to authoritative CLOB fills. */
+  reconciliationStatus?: ReconciliationStatus;
+  /** Real filled shares per the CLOB, once reconciled. */
+  actualFilledShares?: number;
+  /** Real share-weighted average fill price per the CLOB, once reconciled. */
+  actualAvgPrice?: number;
+  /** Real USDC spent (BUY) / received (SELL) per the CLOB, once reconciled. */
+  actualNotionalUsd?: number;
+  /** On-chain settlement transaction hashes for the matched fills. */
+  txHashes?: string[];
 }
 
 export interface BotLogEntry {
@@ -183,6 +256,15 @@ export interface BotMetrics {
   /** Total spread/slippage + fees paid across simulated fills (the cost drag). */
   totalFrictionUsd: number;
   totalFeesUsd: number;
+
+  /** Hard daily-loss lockout: when true, no new BUY may be opened until the next day. */
+  dailyLossLockout: boolean;
+  dailyLossLockoutReason: string | null;
+  /** Panic stop engaged: all new BUYs are blocked until panic is cleared. */
+  panic: boolean;
+  panicReason: string | null;
+  /** Count of live orders not yet reconciled against authoritative CLOB fills. */
+  unreconciledLiveOrders: number;
 }
 
 export interface BotState {
@@ -202,6 +284,21 @@ export interface BotState {
   sessionWalletsChecked: number;
   /** Cumulative trader trades scanned since the current session was started. */
   sessionTradesScanned: number;
+
+  /**
+   * Latched daily-loss lockout. Set true once the daily-loss cap is breached;
+   * cleared only at the local day boundary (or on reset). While true, no new BUY
+   * is opened in any mode — sells/flattening stay allowed.
+   */
+  dailyLossLockout: boolean;
+  /**
+   * Emergency panic stop. Persisted so a server restart never silently resumes
+   * trading. While true, all new BUYs are refused; reads, sells, and flattening
+   * still work. Cleared explicitly via the resume endpoint.
+   */
+  panic: boolean;
+  panicAt: number | null;
+  panicReason: string | null;
 }
 
 export interface SeenTradeBook {
@@ -282,6 +379,46 @@ export interface SessionScoreboard {
   skipsByReason: SkipReasonCount[];
 }
 
+/** One live account position cross-referenced against the local ledger. */
+export interface LivePositionEntry {
+  tokenId: string;
+  conditionId: string;
+  marketTitle: string;
+  outcome: string;
+  /** Shares per the authoritative account (0 when only a stale local position exists). */
+  liveShares: number;
+  /** Shares per the local ledger (0 when the bot never tracked it). */
+  localShares: number;
+  /** Current mark/exit price for valuing live exposure, 0..1. */
+  markPrice: number;
+  /** liveShares * markPrice. */
+  exposureUsd: number;
+  classification: LivePositionClassification;
+  /** True when the source wallet of this token is a known copied wallet. */
+  attributionKnown: boolean;
+  redeemable: boolean;
+}
+
+/**
+ * Snapshot of authoritative live positions reconciled against the local ledger.
+ * Built on real-mode start (and refreshed on demand); read-only — never trades.
+ */
+export interface LivePositionReconciliation {
+  fetchedAt: number;
+  ok: boolean;
+  error: string | null;
+  entries: LivePositionEntry[];
+  /** Total live exposure (USD) across all account positions. */
+  totalLiveExposureUsd: number;
+  /** Live exposure (USD) the bot cannot attribute to a known copied wallet. */
+  unattributedExposureUsd: number;
+  /** Positions present live but unknown to the bot (manual / pre-existing). */
+  unknownPositionCount: number;
+  /** Positions the local ledger thinks exist but the account does not (stale). */
+  stalePositionCount: number;
+  redeemableCount: number;
+}
+
 export interface BotStatus {
   state: BotState;
   settings: BotSettings;
@@ -295,4 +432,6 @@ export interface BotStatus {
   recentTrades: CopyTradeRecord[];
   equityCurve: EquityPoint[];
   logs: BotLogEntry[];
+  /** Authoritative live-position reconciliation (real mode); null in simulation. */
+  livePositions: LivePositionReconciliation | null;
 }

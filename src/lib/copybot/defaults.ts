@@ -59,5 +59,9 @@ export function createInitialBotState(startingBalance: number, now = Date.now())
     firstRunBootstrappedAt: null,
     sessionWalletsChecked: 0,
     sessionTradesScanned: 0,
+    dailyLossLockout: false,
+    panic: false,
+    panicAt: null,
+    panicReason: null,
   };
 }
