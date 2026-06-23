@@ -61,7 +61,7 @@ export interface BotSettings {
 
   /**
    * Per-copied-wallet risk controls. These stop any single followed wallet from
-   * dominating the session — independent of the global exposure caps.
+   * dominating the session â€” independent of the global exposure caps.
    */
   /** Max BUYs copied from one wallet within a single poll cycle. 0 = unlimited. */
   maxCopiesPerWalletPerCycle: number;
@@ -83,7 +83,7 @@ export interface BotSettings {
 
   /**
    * Realistic execution-cost model. When true (default), copies fill against the
-   * live order book with spread, slippage, partial fills, and fees — so the
+   * live order book with spread, slippage, partial fills, and fees â€” so the
    * equity curve reflects net-of-cost P&L rather than idealized fills.
    */
   realisticFills: boolean;
@@ -96,7 +96,7 @@ export interface BotSettings {
 }
 
 /**
- * Score derived from the bot's OWN copied results for a wallet — not public
+ * Score derived from the bot's OWN copied results for a wallet â€” not public
  * leaderboard PnL. This is what should decide which wallets survive into live
  * mode. All component metrics are computed from the local copy-trade ledger and
  * current positions, so they reflect realistic (post-fill) outcomes.
@@ -133,6 +133,8 @@ export interface CopyScore {
   score: number;
   /** Non-null when scoring rules recommend auto-disabling this wallet. */
   autoDisableReason: string | null;
+  /** Non-null when this wallet should remain enabled but watched closely. */
+  reviewReason: string | null;
 }
 
 export interface FollowedTrader {
@@ -155,6 +157,9 @@ export interface FollowedTrader {
   /** Set true when copy-scoring rules disabled this wallet (separate from `enabled`). */
   autoDisabled?: boolean;
   autoDisableReason?: string | null;
+  /** Set true when scoring found weak/early negative signals that should not disable the wallet yet. */
+  underReview?: boolean;
+  reviewReason?: string | null;
   /** Latest copy-performance score derived from the bot's own copied results. */
   copyScore?: CopyScore | null;
 
@@ -214,7 +219,7 @@ export interface CopyTradeRecord {
   fillStatus?: "filled" | "partial" | "rejected";
   costSource?: "book" | "quote" | "assumed";
 
-  // ── Authoritative live-fill reconciliation (real mode only) ─────────────────
+  // â”€â”€ Authoritative live-fill reconciliation (real mode only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   /** When this record was last reconciled against CLOB trade history (ms epoch). */
   reconciledAt?: number;
   /** Result of matching this live order to authoritative CLOB fills. */
@@ -266,6 +271,8 @@ export interface BotMetrics {
   failedTrades: number;
   skippedTrades: number;
   openPositions: number;
+  /** Remaining cost basis of currently open positions. */
+  totalOpenCostBasisUsd: number;
   totalExposureUsd: number;
   totalExposurePercent: number;
   maxDrawdown: number;
@@ -283,10 +290,10 @@ export interface BotMetrics {
   /** Count of live orders not yet reconciled against authoritative CLOB fills. */
   unreconciledLiveOrders: number;
 
-  // ── Authoritative-vs-mirror accounting (real mode) ──────────────────────────
+  // â”€â”€ Authoritative-vs-mirror accounting (real mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   /** Cash computed purely from local mirror estimates (copyAmountUsd). */
   cashUsdLocalMirror: number;
-  /** Cash computed preferring authoritative reconciled fills where available. */
+  /** Cash used by dashboard accounting after applying authoritative fills and open cost basis. */
   cashUsdAuthoritative: number;
   /** Mirror cash reserved against live BUYs that are not yet reconciled. */
   pendingReservedUsd: number;
@@ -296,7 +303,7 @@ export interface BotMetrics {
    * Confidence in the money ledger:
    *  - "high": no unsafe real orders (or simulation).
    *  - "degraded": some real orders are pending reconciliation.
-   *  - "blocked": some real orders are unmatched/errored — new BUYs are blocked.
+   *  - "blocked": some real orders are unmatched/errored â€” new BUYs are blocked.
    */
   accountingConfidence: "high" | "degraded" | "blocked";
 }
@@ -322,7 +329,7 @@ export interface BotState {
   /**
    * Latched daily-loss lockout. Set true once the daily-loss cap is breached;
    * cleared only at the local day boundary (or on reset). While true, no new BUY
-   * is opened in any mode — sells/flattening stay allowed.
+   * is opened in any mode â€” sells/flattening stay allowed.
    */
   dailyLossLockout: boolean;
   /**
@@ -376,7 +383,7 @@ export interface WalletCopyStat {
 /**
  * Aggregated, session-oriented snapshot rendered in the scoreboard panel.
  * Derived on demand from settings, state, metrics, the full trade ledger, and
- * the followed-trader list — it holds no independent persisted state.
+ * the followed-trader list â€” it holds no independent persisted state.
  */
 export interface SessionScoreboard {
   activePreset: RiskPresetId;
@@ -431,7 +438,7 @@ export interface LivePositionEntry {
   /** True when the source wallet of this token is a known copied wallet. */
   attributionKnown: boolean;
   redeemable: boolean;
-  /** Neg-risk (multi-outcome) market — redeemed via the NegRiskAdapter, not the CTF. */
+  /** Neg-risk (multi-outcome) market â€” redeemed via the NegRiskAdapter, not the CTF. */
   negativeRisk: boolean;
 }
 
@@ -454,7 +461,7 @@ export interface RedeemableItem {
   negativeRisk: boolean;
   /**
    * Why this item cannot be auto-redeemed by the bot (proxy/safe wallet, neg-risk,
-   * unknown attribution, …). null = the bot can redeem it directly. Such items are
+   * unknown attribution, â€¦). null = the bot can redeem it directly. Such items are
    * still surfaced so the operator can redeem them manually on Polymarket.
    */
   blockedReason: string | null;
@@ -506,14 +513,14 @@ export interface RedeemedEntry {
   mode: BotMode;
 }
 
-/** Persisted ledger of redeemed positions — the double-redeem guard. */
+/** Persisted ledger of redeemed positions â€” the double-redeem guard. */
 export interface RedeemBook {
   entries: RedeemedEntry[];
 }
 
 /**
  * Snapshot of authoritative live positions reconciled against the local ledger.
- * Built on real-mode start (and refreshed on demand); read-only — never trades.
+ * Built on real-mode start (and refreshed on demand); read-only â€” never trades.
  */
 export interface LivePositionReconciliation {
   fetchedAt: number;

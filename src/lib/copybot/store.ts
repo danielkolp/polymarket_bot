@@ -31,7 +31,9 @@ const REDEEMED_FILE = path.join(DATA_DIR, "redeemed.json");
 const MAX_TRADES = 1000;
 const MAX_LOGS = 500;
 const MAX_EQUITY_POINTS = 1500;
+const JSON_READ_RETRY_DELAYS_MS = [20, 50, 100];
 let writeChain = Promise.resolve();
+const lastGoodJson = new Map<string, unknown>();
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -48,26 +50,67 @@ function initialEquityCurve(settings: BotSettings, now = Date.now()): EquityPoin
   return [{ ts: now, equityUsd: settings.startingBalance, cashUsd: settings.startingBalance, exposureUsd: 0 }];
 }
 
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function ensureDataDir(): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true });
 }
 
 async function readJson<T>(file: string, fallback: T): Promise<T> {
   await ensureDataDir();
-  try {
-    const raw = await fs.readFile(file, "utf8");
-    return JSON.parse(raw) as T;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT") throw err;
-    await writeJson(file, fallback);
-    return clone(fallback);
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt <= JSON_READ_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const raw = await fs.readFile(file, "utf8");
+      if (raw.trim().length === 0) throw new SyntaxError(`Empty JSON file: ${path.basename(file)}`);
+      const parsed = JSON.parse(raw) as T;
+      lastGoodJson.set(file, clone(parsed));
+      return parsed;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        await writeJson(file, fallback);
+        return clone(fallback);
+      }
+      if (!(err instanceof SyntaxError)) throw err;
+      lastError = err;
+      const delayMs = JSON_READ_RETRY_DELAYS_MS[attempt];
+      if (delayMs != null) await wait(delayMs);
+    }
   }
+
+  const cached = lastGoodJson.get(file);
+  if (cached !== undefined) return clone(cached) as T;
+  if (process.env.NODE_ENV !== "test") {
+    console.warn(
+      `[copybot-store] ${path.basename(file)} contained unreadable JSON after retries; using fallback snapshot.`,
+      lastError,
+    );
+  }
+  return clone(fallback);
 }
 
 async function writeJson<T>(file: string, value: T): Promise<void> {
   await ensureDataDir();
-  await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tmpFile = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  try {
+    await fs.writeFile(tmpFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await fs.rename(tmpFile, file);
+    lastGoodJson.set(file, clone(value));
+  } catch (err) {
+    try {
+      await fs.unlink(tmpFile);
+    } catch {
+      // Best effort cleanup; preserve the original write failure.
+    }
+    throw err;
+  }
 }
 
 function enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {

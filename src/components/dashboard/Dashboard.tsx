@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { TrendIcon } from "@/components/ui/trend-icon";
-import { RISK_PRESETS, type RiskPreset } from "@/lib/copybot/riskPresets";
+import { applyRealModeSafetyCaps, RISK_PRESETS, type RiskPreset } from "@/lib/copybot/riskPresets";
 import { DashboardVisuals } from "./DashboardVisuals";
 import { cn } from "@/lib/utils";
 import { fromNow } from "@/lib/time";
@@ -20,10 +20,22 @@ import type { BotLogEntry, BotPosition, BotSettings, BotStatus, CopyTradeRecord,
 
 type ApiEnvelope<T> = { ok: true; data: T; fetchedAt: number } | { ok: false; error: string };
 
+async function readApiEnvelope<T>(res: Response): Promise<ApiEnvelope<T>> {
+  const text = await res.text();
+  if (text.trim().length === 0) {
+    return { ok: false, error: "Server returned an empty response. Showing the last good dashboard snapshot." };
+  }
+  try {
+    return JSON.parse(text) as ApiEnvelope<T>;
+  } catch {
+    return { ok: false, error: "Server returned incomplete JSON. Showing the last good dashboard snapshot." };
+  }
+}
+
 async function jsonFetcher<T>(url: string): Promise<T> {
   const res = await fetch(url, { cache: "no-store" });
-  const json = (await res.json()) as ApiEnvelope<T>;
-  if (!res.ok || !json.ok) throw new Error(json.ok ? "Request failed" : json.error);
+  const json = await readApiEnvelope<T>(res);
+  if (!res.ok || !json.ok) throw new Error(json.ok ? `Request failed (${res.status})` : json.error);
   return json.data;
 }
 
@@ -33,8 +45,8 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
-  const json = (await res.json()) as ApiEnvelope<T>;
-  if (!res.ok || !json.ok) throw new Error(json.ok ? "Request failed" : json.error);
+  const json = await readApiEnvelope<T>(res);
+  if (!res.ok || !json.ok) throw new Error(json.ok ? `Request failed (${res.status})` : json.error);
   return json.data;
 }
 
@@ -187,15 +199,17 @@ function BlinkValue({
   children,
   className,
   showIcon = true,
+  contained = false,
 }: {
   value: number | null | undefined;
   children: ReactNode;
   className?: string;
   showIcon?: boolean;
+  contained?: boolean;
 }) {
   const pulse = useValuePulse(value);
   return (
-    <span className={cn("inline-flex items-center justify-end gap-1 rounded px-1 transition-colors", pulseClass(pulse.direction), className)}>
+    <span className={cn("inline-flex items-center justify-end gap-1 rounded px-1 transition-colors", pulseClass(pulse.direction), contained && "value-blink-contained", className)}>
       {showIcon && pulse.direction && <TrendIcon value={pulse.delta} size={13} />}
       {children}
     </span>
@@ -242,7 +256,7 @@ function StatusBadge({ status }: { status: BotStatus }) {
   const runState = status.state.runState;
   const variant =
     runState === "running" ? "success" : runState === "paused" || runState === "draining" ? "warning" : "muted";
-  const label = runState === "draining" ? "draining · exit-only" : runState;
+  const label = runState === "draining" ? "draining - exit-only" : runState;
   const liveBalanceVariant =
     status.metrics.liveBalanceStatus === "ok"
       ? "success"
@@ -310,7 +324,7 @@ function StopDialog({
       open={open}
       onOpenChange={onOpenChange}
       title={`You have ${openCount} open copied position${openCount === 1 ? "" : "s"}.`}
-      description={`${money(status.metrics.totalExposureUsd)} exposure · ${signedMoney(status.metrics.unrealizedPnlUsd)} unrealized. Choose how to handle them before the bot stops.`}
+      description={`${money(status.metrics.totalExposureUsd)} exposure - ${signedMoney(status.metrics.unrealizedPnlUsd)} unrealized. Choose how to handle them before the bot stops.`}
     >
       <div className="space-y-2">
         <button
@@ -441,25 +455,27 @@ function SettingsPanel({ status, onSave }: { status: BotStatus; onSave: (setting
     setDraft(status.settings);
   }, [settingsKey]);
 
-  const update = <K extends keyof BotSettings>(key: K, value: BotSettings[K]) => setDraft((current) => ({ ...current, [key]: value }));
+  const update = <K extends keyof BotSettings>(key: K, value: BotSettings[K]) => setDraft((current) => applyRealModeSafetyCaps({ ...current, [key]: value }));
   const applyRiskPreset = (presetId: RiskPresetId) => {
     const preset: RiskPreset = RISK_PRESETS[presetId];
     setDraft((current) =>
-      presetId === "custom"
-        ? { ...current, riskPreset: "custom" }
-        : {
-            ...current,
-            riskPreset: presetId,
-            maxTotalExposurePercent: preset.totalExposurePercent,
-            maxExposurePerMarketPercent: preset.perMarketExposurePercent,
-            minTimeToResolutionMinutes: preset.minTimeToResolutionMinutes,
-            minBuyTokenPrice: preset.minBuyTokenPrice,
-            maxBuyTokenPrice: preset.maxBuyTokenPrice,
-            // Presets may pin extra fields (e.g. Action Mode's discovery breadth
-            // and conviction thresholds). Mirror them so the form matches what the
-            // server will pin on save.
-            ...preset.extraSettings,
-          },
+      applyRealModeSafetyCaps(
+        presetId === "custom"
+          ? { ...current, riskPreset: "custom" }
+          : {
+              ...current,
+              riskPreset: presetId,
+              maxTotalExposurePercent: preset.totalExposurePercent,
+              maxExposurePerMarketPercent: preset.perMarketExposurePercent,
+              minTimeToResolutionMinutes: preset.minTimeToResolutionMinutes,
+              minBuyTokenPrice: preset.minBuyTokenPrice,
+              maxBuyTokenPrice: preset.maxBuyTokenPrice,
+              // Presets may pin extra fields (e.g. Action Mode's discovery breadth
+              // and conviction thresholds). Mirror them so the form matches what the
+              // server will pin on save.
+              ...preset.extraSettings,
+            },
+      ),
     );
   };
   const updateRiskCap = (
@@ -471,7 +487,7 @@ function SettingsPanel({ status, onSave }: { status: BotStatus; onSave: (setting
       | "maxBuyTokenPrice",
     value: number,
   ) => {
-    setDraft((current) => ({ ...current, riskPreset: "custom", [key]: value }));
+    setDraft((current) => applyRealModeSafetyCaps({ ...current, riskPreset: "custom", [key]: value }));
   };
   const save = async () => {
     setSaving(true);
@@ -618,9 +634,15 @@ function TraderTable({ traders, onToggle, onRemove }: { traders: FollowedTrader[
                   {trader.discoverySource ?? trader.source}
                 </Badge>
                 {trader.discoveryScore != null && (
-                  <span className="ml-1 text-[11px] text-muted-foreground" title="Discovery v2 composite rank score (0–100)">
+                  <span className="ml-1 text-[11px] text-muted-foreground" title="Discovery v2 composite rank score (0-100)">
                     {trader.discoveryScore.toFixed(0)}
                   </span>
+                )}
+                {trader.autoDisabled && (
+                  <Badge variant="destructive" className="ml-1" title={trader.autoDisableReason ?? undefined}>auto-disabled</Badge>
+                )}
+                {!trader.autoDisabled && trader.underReview && (
+                  <Badge variant="warning" className="ml-1" title={trader.reviewReason ?? trader.copyScore?.reviewReason ?? undefined}>under review</Badge>
                 )}
               </div>
               <div className={cn("mt-2 flex justify-between gap-2 tabular-nums md:mt-0 md:block md:text-right", trader.weeklyPnlUsd >= 0 ? "text-success" : "text-destructive")}>
@@ -673,7 +695,7 @@ function PositionTable({ positions, equity }: { positions: BotPosition[]; equity
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <CardTitle>Open Positions</CardTitle>
-            <CardDescription>Live Polymarket marks — refreshed each poll and via &ldquo;Update prices.&rdquo;</CardDescription>
+            <CardDescription>Live Polymarket marks - refreshed each poll and via &ldquo;Update prices.&rdquo;</CardDescription>
           </div>
           {positions.length > 0 && (
             <div className="text-right text-xs">
@@ -715,17 +737,17 @@ function PositionTable({ positions, equity }: { positions: BotPosition[]; equity
                     <td className="py-2 pr-3 text-right tabular-nums">{position.shares.toFixed(2)}</td>
                     <td className="py-2 pr-3 text-right tabular-nums">{(position.avgPrice * 100).toFixed(1)}c</td>
                     <td className="py-2 pr-3 text-right tabular-nums">
-                      <BlinkValue value={position.markPrice}>{(position.markPrice * 100).toFixed(1)}c</BlinkValue>
+                      <BlinkValue value={position.markPrice} showIcon={false} contained className="min-w-[6ch]">{(position.markPrice * 100).toFixed(1)}c</BlinkValue>
                     </td>
                     <td className={cn("py-2 pr-3 text-right tabular-nums", up && "text-success", down && "text-destructive", !up && !down && "text-muted-foreground")}>
-                      <span className="inline-flex items-center justify-end gap-1">
+                      <span className="inline-flex min-h-5 items-center justify-end gap-1">
                         <TrendIcon value={unrealized} size={13} />
-                        <BlinkValue value={unrealized} showIcon={false}>{signedMoney(unrealized)}</BlinkValue>
+                        <BlinkValue value={unrealized} showIcon={false} contained className="min-w-[9ch]">{signedMoney(unrealized)}</BlinkValue>
                         <span className="text-[11px] opacity-70">({percent(unrealizedPct)})</span>
                       </span>
                     </td>
                     <td className="py-2 pr-3 text-right tabular-nums">
-                      <BlinkValue value={exposure}>{money(exposure)}</BlinkValue>
+                      <BlinkValue value={exposure} showIcon={false} contained className="min-w-[8ch]">{money(exposure)}</BlinkValue>
                     </td>
                     <td className="py-2 text-right tabular-nums">{percent(equity > 0 ? exposure / equity : 0)}</td>
                   </tr>
@@ -826,9 +848,9 @@ function Scoreboard({ scoreboard }: { scoreboard: SessionScoreboard }) {
         </CardTitle>
         <CardDescription>
           Live session summary. Counters reset each time the bot is started. Active thresholds:{" "}
-          {`buy ${cents(scoreboard.activeRiskValues.minBuyTokenPrice)}–${cents(scoreboard.activeRiskValues.maxBuyTokenPrice)}`}
+          {`buy ${cents(scoreboard.activeRiskValues.minBuyTokenPrice)}-${cents(scoreboard.activeRiskValues.maxBuyTokenPrice)}`}
           {`, resolves > ${scoreboard.activeRiskValues.minTimeToResolutionMinutes} min`}
-          {`, exposure ${scoreboard.activeRiskValues.maxExposurePerMarketPercent}% / market · ${scoreboard.activeRiskValues.maxTotalExposurePercent}% total`}
+          {`, exposure ${scoreboard.activeRiskValues.maxExposurePerMarketPercent}% / market - ${scoreboard.activeRiskValues.maxTotalExposurePercent}% total`}
           .
         </CardDescription>
       </CardHeader>
@@ -849,13 +871,13 @@ function Scoreboard({ scoreboard }: { scoreboard: SessionScoreboard }) {
           <ScoreTile
             label="Best wallet"
             value={scoreboard.bestWallet ? shortWallet(scoreboard.bestWallet.wallet) : "-"}
-            sub={scoreboard.bestWallet ? `${scoreboard.bestWallet.name} · ${signedMoney(scoreboard.bestWallet.realizedPnlUsd)}` : "no closed trades"}
+            sub={scoreboard.bestWallet ? `${scoreboard.bestWallet.name} - ${signedMoney(scoreboard.bestWallet.realizedPnlUsd)}` : "no closed trades"}
             tone={scoreboard.bestWallet ? tone(scoreboard.bestWallet.realizedPnlUsd) : "neutral"}
           />
           <ScoreTile
             label="Worst wallet"
             value={scoreboard.worstWallet ? shortWallet(scoreboard.worstWallet.wallet) : "-"}
-            sub={scoreboard.worstWallet ? `${scoreboard.worstWallet.name} · ${signedMoney(scoreboard.worstWallet.realizedPnlUsd)}` : "no closed trades"}
+            sub={scoreboard.worstWallet ? `${scoreboard.worstWallet.name} - ${signedMoney(scoreboard.worstWallet.realizedPnlUsd)}` : "no closed trades"}
             tone={scoreboard.worstWallet ? tone(scoreboard.worstWallet.realizedPnlUsd) : "neutral"}
           />
         </div>
@@ -879,7 +901,7 @@ function Scoreboard({ scoreboard }: { scoreboard: SessionScoreboard }) {
                 <tbody>
                   {scoreboard.copiedTradesByWallet.map((wallet: WalletCopyStat) => (
                     <tr key={wallet.wallet} className="border-b border-border/60">
-                      <td className="max-w-[180px] truncate py-1 pr-2" title={`${wallet.name} · ${wallet.wallet}`}>
+                      <td className="max-w-[180px] truncate py-1 pr-2" title={`${wallet.name} - ${wallet.wallet}`}>
                         <span className="font-medium">{wallet.name}</span>
                         <span className="ml-1 text-muted-foreground">{shortWallet(wallet.wallet)}</span>
                       </td>
@@ -903,7 +925,7 @@ function Scoreboard({ scoreboard }: { scoreboard: SessionScoreboard }) {
             <div className="max-h-[180px] space-y-1 overflow-auto scrollbar-thin pr-1">
               {scoreboard.skipsByReason.map((skip) => (
                 <div key={skip.reason} className="flex items-start gap-2 rounded-md border border-border bg-background/40 px-2.5 py-1.5 text-xs">
-                  <Badge variant="muted" className="shrink-0 tabular-nums">×{skip.count}</Badge>
+                  <Badge variant="muted" className="shrink-0 tabular-nums">x{skip.count}</Badge>
                   <span className="leading-relaxed text-muted-foreground">{skip.reason}</span>
                 </div>
               ))}
@@ -1038,7 +1060,7 @@ function BotStatusCard({ status }: { status: BotStatus }) {
 /**
  * Resolved-winnings redemption (real mode). Shows positions the account can
  * redeem for USDC, the expected payout, and which need manual action (proxy/safe/
- * neg-risk). Redeeming requires typing the confirmation text — the bot never
+ * neg-risk). Redeeming requires typing the confirmation text - the bot never
  * redeems from this panel without it. Fully-automatic redemption is a separate,
  * server-side opt-in (ENABLE_AUTO_REDEEM).
  */
@@ -1077,7 +1099,7 @@ function RedeemablesPanel({
         <CardDescription>
           {plan.error
             ? plan.error
-            : `${money(plan.totalExpectedPayoutUsd)} expected · ${plan.redeemableCount} redeemable by bot, ${plan.manualCount} need manual action.`}
+            : `${money(plan.totalExpectedPayoutUsd)} expected - ${plan.redeemableCount} redeemable by bot, ${plan.manualCount} need manual action.`}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -1106,7 +1128,7 @@ function RedeemablesPanel({
                       ) : item.attributionKnown ? (
                         <Badge variant="success">bot</Badge>
                       ) : (
-                        <Badge variant="muted" title="Unknown/manual position — only redeemed if you opt in.">unknown</Badge>
+                        <Badge variant="muted" title="Unknown/manual position - only redeemed if you opt in.">unknown</Badge>
                       )}
                     </td>
                   </tr>
@@ -1230,7 +1252,7 @@ export function Dashboard() {
         });
         navigator.sendBeacon("/api/bot/stop", blob);
       } catch {
-        // Best effort — nothing we can do if the beacon is rejected on unload.
+        // Best effort - nothing we can do if the beacon is rejected on unload.
       }
     };
     window.addEventListener("pagehide", onHide);
@@ -1253,7 +1275,7 @@ export function Dashboard() {
     return <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">Loading copy bot dashboard...</div>;
   }
 
-  if (error || !status) {
+  if (!status) {
     return (
       <div className="mx-auto max-w-4xl p-6">
         <Card className="border-destructive/40">
@@ -1274,7 +1296,7 @@ export function Dashboard() {
             {status.state.runState === "running" ? (
               <>
                 <span className="live-dot inline-block size-2 rounded-full bg-success" />
-                Live · polling
+                Live - polling
               </>
             ) : (
               <>
@@ -1335,6 +1357,12 @@ export function Dashboard() {
         </div>
       </header>
 
+      {error && (
+        <div className="flex items-center gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400">
+          <AlertTriangle className="size-4 shrink-0" />
+          <span>Latest refresh failed: {error instanceof Error ? error.message : "Failed to refresh bot status."}</span>
+        </div>
+      )}
       {status.metrics.panic && (
         <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           <OctagonX className="size-4 shrink-0" />
@@ -1440,7 +1468,7 @@ export function Dashboard() {
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-8">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-9">
         {status.settings.mode === "real" && (
           <StatCard
             label="Live USDC"
@@ -1450,15 +1478,16 @@ export function Dashboard() {
             tone={status.metrics.liveBalanceStatus === "error" || status.metrics.liveBalanceStatus === "warning" ? "neg" : "neutral"}
           />
         )}
-        <StatCard label="Current balance" value={money(status.metrics.equityUsd)} pulseValue={status.metrics.equityUsd} sub={"local cash " + money(status.metrics.cashUsd)} />
-        <StatCard label="Available balance" value={money(status.metrics.availableBalanceUsd)} pulseValue={status.metrics.availableBalanceUsd} sub="cash available for next buy" />
+        <StatCard label="Current equity" value={money(status.metrics.equityUsd)} pulseValue={status.metrics.equityUsd} sub={`${signedMoney(totalPnl)} total P&L | ${percent(status.metrics.roi)} ROI`} />
+        <StatCard label="Cash" value={money(status.metrics.cashUsd)} pulseValue={status.metrics.cashUsd} sub="local accounting cash" />
+        <StatCard label="Exposure" value={money(status.metrics.totalExposureUsd)} pulseValue={status.metrics.totalExposureUsd} sub={`cost basis ${money(status.metrics.totalOpenCostBasisUsd)}`} />
+        <StatCard label="Realized P&L" value={signedMoney(status.metrics.realizedPnlUsd)} tone={tone(status.metrics.realizedPnlUsd)} arrow={status.metrics.realizedPnlUsd} pulseValue={status.metrics.realizedPnlUsd} />
+        <StatCard label="Unrealized P&L" value={signedMoney(status.metrics.unrealizedPnlUsd)} tone={tone(status.metrics.unrealizedPnlUsd)} arrow={status.metrics.unrealizedPnlUsd} pulseValue={status.metrics.unrealizedPnlUsd} />
         <StatCard label="Next trade size" value={money(status.metrics.nextTradeSizeUsd)} pulseValue={status.metrics.nextTradeSizeUsd} sub={`${status.settings.percentageCopySize}% sizing mode`} />
-        <StatCard label="Total P&L" value={signedMoney(totalPnl)} tone={tone(totalPnl)} arrow={totalPnl} pulseValue={totalPnl} sub={`${percent(status.metrics.roi)} ROI`} />
         <StatCard label="Win rate" value={percent(status.metrics.winRate, 0)} sub={`${status.metrics.winners}W / ${status.metrics.losers}L`} />
-        <StatCard label="Bankroll at risk" value={percent(status.metrics.totalExposurePercent)} pulseValue={status.metrics.totalExposurePercent} sub={`${money(status.metrics.totalExposureUsd)} exposure`} tone={status.metrics.totalExposurePercent > 0.4 ? "neg" : "neutral"} />
-        <StatCard label="Cost drag" value={money(status.metrics.totalFrictionUsd)} sub={`incl. ${money(status.metrics.totalFeesUsd)} fees${status.settings.realisticFills ? "" : " · idealized"}`} tone={status.metrics.totalFrictionUsd > 0 ? "neg" : "neutral"} />
+        <StatCard label="Bankroll at risk" value={percent(status.metrics.totalExposurePercent)} pulseValue={status.metrics.totalExposurePercent} sub={`${money(status.metrics.totalExposureUsd)} / ${money(status.metrics.equityUsd)} equity`} tone={status.metrics.totalExposurePercent > 0.4 ? "neg" : "neutral"} />
+        <StatCard label="Cost drag" value={money(status.metrics.totalFrictionUsd)} sub={`incl. ${money(status.metrics.totalFeesUsd)} fees${status.settings.realisticFills ? "" : " - idealized"}`} tone={status.metrics.totalFrictionUsd > 0 ? "neg" : "neutral"} />
       </div>
-
       <Scoreboard scoreboard={status.scoreboard} />
 
       <DashboardVisuals status={status} totalPnl={totalPnl} />

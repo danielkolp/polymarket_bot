@@ -6,8 +6,8 @@
   :root {
     /* Dark mossy console. Solid surfaces, no gradients. Lime is the single
        accent; lavender is a quieter secondary. Text stays soft green-white.
-       Palette: bg #141A16 · surface #1D2520 · primary #C7D98B (lime) ·
-       secondary #B7A3FF (lavender) · text #DCE4D5 · muted #7A8678. */
+       Palette: bg #141A16 Â· surface #1D2520 Â· primary #C7D98B (lime) Â·
+       secondary #B7A3FF (lavender) Â· text #DCE4D5 Â· muted #7A8678. */
     --background: 140 13% 9%;
     --foreground: 92 22% 86%;
 
@@ -56,7 +56,7 @@
   }
 }
 
-/* Eyebrow / section label — Space Mono set small and wide. The main device for
+/* Eyebrow / section label â€” Space Mono set small and wide. The main device for
    hierarchy: a quiet uppercase label above a louder value or title. */
 .eyebrow {
   font-size: 0.6875rem;
@@ -126,6 +126,24 @@
   100% { background: transparent; box-shadow: none; }
 }
 
+
+.value-blink-contained.value-blink-up {
+  animation-name: value-blink-contained-up;
+}
+
+.value-blink-contained.value-blink-down {
+  animation-name: value-blink-contained-down;
+}
+
+@keyframes value-blink-contained-up {
+  0% { background: hsl(var(--success) / 0.22); }
+  100% { background: transparent; }
+}
+
+@keyframes value-blink-contained-down {
+  0% { background: hsl(var(--destructive) / 0.22); }
+  100% { background: transparent; }
+}
 @media (prefers-reduced-motion: reduce) {
   .value-blink-up,
   .value-blink-down {

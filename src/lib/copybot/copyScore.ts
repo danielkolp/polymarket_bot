@@ -1,19 +1,22 @@
 /**
- * Copy-wallet scoring based on the BOT'S OWN copied results — not public
+ * Copy-wallet scoring based on the BOT'S OWN copied results, not public
  * leaderboard PnL. Discovery finds candidates; this is what decides survivors.
  *
  * Every metric is derived from the local copy-trade ledger and current positions,
  * so it reflects realistic, post-fill outcomes (slippage, skipped trades, exits).
- * Wallets that score badly past a minimum sample are auto-disabled unless pinned.
+ * Wallets that score badly past a meaningful sample are auto-disabled unless pinned.
  */
 import { positionUnrealizedPnl } from "./accounting";
 import { isFilled as ledgerIsFilled, tradeAvgPrice, tradeFilledShares, tradeNotionalUsd } from "./ledger";
 import type { BotPosition, CopyScore, CopyTradeRecord, FollowedTrader } from "./types";
 
-/** Minimum filled copies before auto-disable rules can fire. */
-const MIN_SAMPLE = 5;
-/** Minimum attempts (filled + skipped) before the skip-ratio rule can fire. */
+/** Minimum filled copies before ROI-based auto-disable can fire. */
+const MIN_AUTO_DISABLE_FILLED_COPIES = 40;
+/** ROI must be materially negative before a wallet is auto-disabled. */
+const NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD = -0.05;
+/** Minimum attempts (filled + skipped) before the skip-ratio review rule can fire. */
 const MIN_ATTEMPTS = 8;
+const HIGH_SKIP_RATIO = 0.85;
 const HIGH_PRICE_THRESHOLD = 0.85;
 
 function isFilled(record: CopyTradeRecord): boolean {
@@ -74,12 +77,21 @@ export function computeCopyScore(
   score -= buys.length > 0 ? (highPriceEntryCount / buys.length) * 10 : 0;
   score = clamp(score, 0, 100);
 
-  // Auto-disable rules (callers skip these for pinned wallets).
+  // Auto-disable only after a material losing sample. Early or slight negative
+  // ROI, including tiny unrealized drawdowns, stays enabled but under review.
   let autoDisableReason: string | null = null;
-  if (filled.length >= MIN_SAMPLE && copyRoi < 0) {
+  let reviewReason: string | null = null;
+  if (filled.length >= MIN_AUTO_DISABLE_FILLED_COPIES && copyRoi <= NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD) {
     autoDisableReason = `Negative copy ROI (${(copyRoi * 100).toFixed(1)}%) after ${filled.length} copied trades.`;
-  } else if (attempts >= MIN_ATTEMPTS && skipRatio > 0.85) {
-    autoDisableReason = `${(skipRatio * 100).toFixed(0)}% of this wallet's trades fail risk gates (${skippedCount}/${attempts}).`;
+  } else if (filled.length > 0 && copyRoi < 0) {
+    const roiText = `${(copyRoi * 100).toFixed(1)}%`;
+    if (copyRoi <= NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD) {
+      reviewReason = `Under review: negative copy ROI (${roiText}) after ${filled.length}/${MIN_AUTO_DISABLE_FILLED_COPIES} copied trades.`;
+    } else {
+      reviewReason = `Under review: copy ROI (${roiText}) is negative but above the ${(Math.abs(NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD) * 100).toFixed(0)}% auto-disable threshold.`;
+    }
+  } else if (attempts >= MIN_ATTEMPTS && skipRatio > HIGH_SKIP_RATIO) {
+    reviewReason = `Under review: ${(skipRatio * 100).toFixed(0)}% of this wallet's trades fail risk gates (${skippedCount}/${attempts}).`;
   }
 
   return {
@@ -99,6 +111,7 @@ export function computeCopyScore(
     openPositionCount: openPositions.length,
     score,
     autoDisableReason,
+    reviewReason,
   };
 }
 
@@ -126,10 +139,19 @@ export function applyCopyScores(
 
     if (trader.pinned) {
       // Pinned: keep scoring visible, but never auto-disable.
-      return { ...trader, copyScore, autoDisabled: false, autoDisableReason: null };
+      const pinnedReviewReason = copyScore.reviewReason ?? copyScore.autoDisableReason;
+      return {
+        ...trader,
+        copyScore,
+        autoDisabled: false,
+        autoDisableReason: null,
+        underReview: pinnedReviewReason != null,
+        reviewReason: pinnedReviewReason,
+      };
     }
 
     const shouldDisable = copyScore.autoDisableReason != null;
+    const shouldReview = !shouldDisable && copyScore.reviewReason != null;
     if (shouldDisable && !wasAutoDisabled) {
       newlyDisabled.push({ wallet: trader.wallet, name: trader.name, reason: copyScore.autoDisableReason! });
     }
@@ -139,6 +161,8 @@ export function applyCopyScores(
       copyScore,
       autoDisabled: shouldDisable,
       autoDisableReason: copyScore.autoDisableReason,
+      underReview: shouldReview,
+      reviewReason: shouldReview ? copyScore.reviewReason : null,
     };
   });
 

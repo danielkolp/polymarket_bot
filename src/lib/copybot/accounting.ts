@@ -7,6 +7,14 @@ export function clampPrice(price: number): number {
   return Math.min(0.99, Math.max(0.01, price));
 }
 
+export function positionCostBasis(position: BotPosition): number {
+  return Math.max(0, position.shares * position.avgPrice);
+}
+
+export function totalOpenCostBasis(positions: BotPosition[]): number {
+  return positions.reduce((sum, pos) => sum + positionCostBasis(pos), 0);
+}
+
 export function positionExposure(position: BotPosition): number {
   return Math.max(0, position.shares * position.markPrice);
 }
@@ -16,7 +24,7 @@ export function totalExposure(positions: BotPosition[]): number {
 }
 
 export function positionUnrealizedPnl(position: BotPosition): number {
-  return (position.markPrice - position.avgPrice) * position.shares;
+  return positionExposure(position) - positionCostBasis(position);
 }
 
 /**
@@ -31,15 +39,36 @@ export function walletExposure(positions: BotPosition[], wallet: string): number
     .reduce((sum, position) => sum + positionExposure(position), 0);
 }
 
-export function calculateEquity(settings: BotSettings, positions: BotPosition[], trades: CopyTradeRecord[]): number {
-  return calculateCash(settings, trades) + totalExposure(positions);
+function filledForSettledPnl(trade: CopyTradeRecord): boolean {
+  return isFilled(trade) && !tradeIsUnsafeForAccounting(trade);
+}
+
+export function realizedPnlFromTrades(trades: CopyTradeRecord[]): number {
+  return trades
+    .filter(filledForSettledPnl)
+    .reduce((sum, trade) => sum + trade.realizedPnlUsd, 0);
 }
 
 /**
- * Cash from the trade ledger. By default this prefers authoritative reconciled
- * fills (driving the ledger off real fills once they exist) and falls back to the
- * local mirror estimate before reconciliation. Pass `mirrorOnly` to compute the
- * pure mirror figure for comparison/diagnostics.
+ * Dashboard/accounting cash derived from the same invariant as equity:
+ * cash = starting balance + settled realized P&L - open cost basis.
+ *
+ * This deliberately does not replay the retained trade list for open BUY cost.
+ * The current open-position ledger is the source of truth for remaining cost
+ * basis, which keeps cash/equity stable even when old trade rows are compacted.
+ */
+export function calculateAccountCash(settings: BotSettings, positions: BotPosition[], trades: CopyTradeRecord[]): number {
+  return settings.startingBalance + realizedPnlFromTrades(trades) - totalOpenCostBasis(positions);
+}
+
+export function calculateEquity(settings: BotSettings, positions: BotPosition[], trades: CopyTradeRecord[]): number {
+  return calculateAccountCash(settings, positions, trades) + totalExposure(positions);
+}
+
+/**
+ * Retained-trade cash replay. Kept for reconciliation diagnostics only. It can
+ * diverge from dashboard cash if the retained trade list no longer contains every
+ * open BUY, so buildMetrics does not use it as the equity source of truth.
  */
 export function calculateCash(
   settings: BotSettings,
@@ -55,7 +84,7 @@ export function calculateCash(
 }
 
 export function calculateAvailableBalance(settings: BotSettings, positions: BotPosition[], trades: CopyTradeRecord[]): number {
-  return Math.max(0, calculateCash(settings, trades));
+  return Math.max(0, calculateAccountCash(settings, positions, trades));
 }
 
 export function dollarCapFromPercent(bankrollUsd: number, percent: number): number {
@@ -94,19 +123,20 @@ export function buildMetrics(
   trades: CopyTradeRecord[],
   now = Date.now(),
 ): { metrics: BotMetrics; state: BotState } {
-  const cashUsd = calculateCash(settings, trades);
-  const cashUsdLocalMirror = calculateCash(settings, trades, { mirrorOnly: true });
+  const realizedPnlUsd = realizedPnlFromTrades(trades);
+  const totalOpenCostBasisUsd = totalOpenCostBasis(positions);
   const totalExposureUsd = totalExposure(positions);
-  const equityUsd = cashUsd + totalExposureUsd;
-  // Realized PnL excludes real orders whose fills are not yet authoritatively
-  // confirmed — their PnL is not final, so it must not be reported as settled.
-  const realizedPnlUsd = trades
-    .filter((trade) => isFilled(trade) && !tradeIsUnsafeForAccounting(trade))
-    .reduce((sum, trade) => sum + trade.realizedPnlUsd, 0);
-  const unrealizedPnlUsd = positions.reduce((sum, pos) => sum + positionUnrealizedPnl(pos), 0);
-  const roi = settings.startingBalance > 0 ? (equityUsd - settings.startingBalance) / settings.startingBalance : 0;
-  const winners = trades.filter((t) => (t.status === "simulated" || t.status === "copied") && t.realizedPnlUsd > 0).length;
-  const losers = trades.filter((t) => (t.status === "simulated" || t.status === "copied") && t.realizedPnlUsd < 0).length;
+  const unrealizedPnlUsd = totalExposureUsd - totalOpenCostBasisUsd;
+  const equityUsd = settings.startingBalance + realizedPnlUsd + unrealizedPnlUsd;
+  const cashUsd = equityUsd - totalExposureUsd;
+  const availableBalanceUsd = Math.max(0, cashUsd);
+
+  const retainedTradeCashUsd = calculateCash(settings, trades);
+  const cashUsdLocalMirror = calculateCash(settings, trades, { mirrorOnly: true });
+  const roi = settings.startingBalance > 0 ? (realizedPnlUsd + unrealizedPnlUsd) / settings.startingBalance : 0;
+  const settledFilled = trades.filter(filledForSettledPnl);
+  const winners = settledFilled.filter((t) => t.realizedPnlUsd > 0).length;
+  const losers = settledFilled.filter((t) => t.realizedPnlUsd < 0).length;
   const closed = winners + losers;
   const filled = trades.filter((t) => t.status === "simulated" || t.status === "copied");
   const totalFrictionUsd = filled.reduce((sum, t) => sum + (t.frictionUsd ?? 0), 0);
@@ -116,7 +146,6 @@ export function buildMetrics(
   const dailyStartEquityUsd = sameDay ? state.dailyStartEquityUsd : equityUsd;
   const peakEquityUsd = Math.max(state.peakEquityUsd || settings.startingBalance, equityUsd);
   const maxDrawdown = peakEquityUsd > 0 ? Math.max(0, (peakEquityUsd - equityUsd) / peakEquityUsd) : 0;
-  const availableBalanceUsd = Math.max(0, cashUsd);
   const totalExposurePercent = equityUsd > 0 ? totalExposureUsd / equityUsd : 0;
   const exposureCap = settings.maxTotalExposurePercent / 100;
   const buyExposurePaused = settings.mode === "simulation" && exposureCap > 0 && totalExposurePercent >= exposureCap - 1e-9;
@@ -139,7 +168,7 @@ export function buildMetrics(
   const pendingReservedUsd = unsafeRealOrders
     .filter((t) => t.side === "BUY")
     .reduce((sum, t) => sum + Math.abs(t.copyAmountUsd), 0);
-  const cashUsdAuthoritative = cashUsd; // calculateCash already prefers authoritative fills
+  const cashUsdAuthoritative = cashUsd;
   const hasBlocking = unsafeRealOrders.some(
     (t) => t.reconciliationStatus === "unmatched" || t.reconciliationStatus === "error",
   );
@@ -184,6 +213,7 @@ export function buildMetrics(
       failedTrades: trades.filter((t) => t.status === "failed").length,
       skippedTrades: trades.filter((t) => t.status === "skipped").length,
       openPositions: positions.length,
+      totalOpenCostBasisUsd,
       totalExposureUsd,
       totalExposurePercent,
       maxDrawdown,

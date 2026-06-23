@@ -1,5 +1,8 @@
 import type { BotSettings, RiskPresetId } from "./types";
 
+export const REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE = 2;
+export const REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT = 10;
+
 export interface RiskPreset {
   id: RiskPresetId;
   label: string;
@@ -68,10 +71,10 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
       traderRefreshIntervalMin: 5,
       // Fresher high-frequency copying: copy only very recent trades (the engine
       // hard-caps copy age at 5 min regardless), follow more recently-active
-      // wallets, and copy the same hot wallet more often.
+      // wallets, while keeping each hot wallet capped per poll cycle.
       maxTradeAgeSec: 300,
       maxTraderInactivityHours: 12,
-      maxCopiesPerWalletPerCycle: 10,
+      maxCopiesPerWalletPerCycle: 3,
       walletTradeCooldownSec: 15,
       // Lower conviction / order thresholds so more candidate trades qualify.
       minTraderWeeklyVolumeUsd: 25,
@@ -89,6 +92,10 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.05,
     maxBuyTokenPrice: 0.85,
+    extraSettings: {
+      maxCopiesPerWalletPerCycle: 1,
+      maxExposurePerWalletPercent: REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT,
+    },
   },
   custom: {
     id: "custom",
@@ -131,17 +138,44 @@ export function presetControlledKeys(preset: RiskPreset): (keyof BotSettings)[] 
   return Object.keys(presetControlledValues(preset)) as (keyof BotSettings)[];
 }
 
+export function applyRealModeSafetyCaps(settings: BotSettings): BotSettings {
+  if (settings.mode !== "real") return settings;
+
+  const maxCopies =
+    settings.maxCopiesPerWalletPerCycle <= 0
+      ? REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE
+      : Math.min(settings.maxCopiesPerWalletPerCycle, REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE);
+  const maxWalletExposure =
+    settings.maxExposurePerWalletPercent <= 0
+      ? REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT
+      : Math.min(settings.maxExposurePerWalletPercent, REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT);
+
+  if (
+    maxCopies === settings.maxCopiesPerWalletPerCycle &&
+    maxWalletExposure === settings.maxExposurePerWalletPercent
+  ) {
+    return settings;
+  }
+
+  return {
+    ...settings,
+    maxCopiesPerWalletPerCycle: maxCopies,
+    maxExposurePerWalletPercent: maxWalletExposure,
+  };
+}
+
 /**
  * Make risk presets server-authoritative: whenever `riskPreset` is a non-custom
  * preset, force every preset-controlled numeric field back to that preset's
  * value. This is pure and idempotent, so it is safe to apply on every load and
  * every update — stale `settings.json` that kept old numeric fields under a new
- * preset label is corrected here. Custom is left untouched.
+ * preset label is corrected here. Custom skips preset pinning, but real mode
+ * still receives non-negotiable safety caps.
  */
 export function applyRiskPreset(settings: BotSettings): BotSettings {
-  if (settings.riskPreset === "custom" || !isRiskPresetId(settings.riskPreset)) return settings;
+  if (settings.riskPreset === "custom" || !isRiskPresetId(settings.riskPreset)) return applyRealModeSafetyCaps(settings);
   const preset = RISK_PRESETS[settings.riskPreset];
-  return { ...settings, ...presetControlledValues(preset) };
+  return applyRealModeSafetyCaps({ ...settings, ...presetControlledValues(preset) });
 }
 
 /**
@@ -151,6 +185,6 @@ export function applyRiskPreset(settings: BotSettings): BotSettings {
 export function settingsDivergeFromPreset(settings: BotSettings): boolean {
   if (settings.riskPreset === "custom" || !isRiskPresetId(settings.riskPreset)) return false;
   const preset = RISK_PRESETS[settings.riskPreset];
-  const pinned = presetControlledValues(preset);
+  const pinned = applyRealModeSafetyCaps({ ...settings, ...presetControlledValues(preset) });
   return presetControlledKeys(preset).some((key) => settings[key] !== pinned[key]);
 }
