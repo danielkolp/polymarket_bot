@@ -111,6 +111,13 @@ export const config = {
   // `x-dashboard-token` header or `dashboard_token` cookie. Leave blank only for
   // trusted localhost dev. Same-origin (CSRF) checks apply regardless.
   dashboardAuthToken: process.env.DASHBOARD_AUTH_TOKEN ?? "",
+
+  // Optional public read token for the analytics export endpoint. When set, the
+  // export route can be fetched WITHOUT the dashboard login by presenting this
+  // token as `?token=` (so an external AI can pull the JSON on a schedule). The
+  // route refuses to serve token-less requests, so leaving this blank keeps the
+  // endpoint private even if its nginx Basic Auth is removed.
+  analyticsExportToken: process.env.ANALYTICS_EXPORT_TOKEN ?? "",
 } as const;
 
 export type AppConfig = typeof config;

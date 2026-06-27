@@ -37,7 +37,11 @@ export async function buildAnalyticsExport(
 ): Promise<AnalyticsExport> {
   const bundle = await loadAnalyticsBundle(positions, cashUsd);
   const includeDecisions = opts.includeDecisions !== false;
+  // The raw decision + exit logs are the only unbounded streams. When omitted
+  // (compact mode, e.g. the daily public digest) drop both — the aggregations,
+  // completed trades, and missed opportunities already summarize them.
   let decisions = includeDecisions ? bundle.decisions : [];
+  const exits = includeDecisions ? bundle.exits : [];
   if (opts.maxDecisions && decisions.length > opts.maxDecisions) {
     decisions = decisions.slice(decisions.length - opts.maxDecisions);
   }
@@ -54,6 +58,6 @@ export async function buildAnalyticsExport(
     completedTrades: bundle.completed,
     missedOpportunities: bundle.missed,
     decisions,
-    exits: bundle.exits,
+    exits,
   };
 }
