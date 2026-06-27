@@ -26,12 +26,27 @@ function constantTimeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+// Open CORS so any web client / scheduled fetcher can read the JSON cross-origin.
+// The token in the query string is the access control, not the origin.
+const CORS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Max-Age": "86400",
+};
+const NOINDEX = { "X-Robots-Tag": "noindex, nofollow" };
+
+/** CORS preflight. */
+export function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: { ...CORS, ...NOINDEX } });
+}
+
 export async function GET(req: Request) {
   const expected = config.analyticsExportToken.trim();
   if (!expected) {
     return NextResponse.json(
       { ok: false, error: "Public analytics export is disabled (ANALYTICS_EXPORT_TOKEN not set)." },
-      { status: 404, headers: { "X-Robots-Tag": "noindex, nofollow" } },
+      { status: 404, headers: { ...CORS, ...NOINDEX } },
     );
   }
 
@@ -40,7 +55,7 @@ export async function GET(req: Request) {
   if (!provided || !constantTimeEqual(provided, expected)) {
     return NextResponse.json(
       { ok: false, error: "Unauthorized: missing or invalid export token." },
-      { status: 401, headers: { "X-Robots-Tag": "noindex, nofollow" } },
+      { status: 401, headers: { ...CORS, ...NOINDEX } },
     );
   }
 
@@ -63,20 +78,21 @@ export async function GET(req: Request) {
     );
 
     const headers: Record<string, string> = {
-      "content-type": "application/json",
-      "cache-control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...CORS,
       // Belt-and-suspenders against search-engine indexing of the token URL.
-      "X-Robots-Tag": "noindex, nofollow",
+      ...NOINDEX,
     };
     if (download) {
       const stamp = new Date().toISOString().slice(0, 10);
-      headers["content-disposition"] = `attachment; filename="bonk-analytics-${stamp}.json"`;
+      headers["Content-Disposition"] = `attachment; filename="bonk-analytics-${stamp}.json"`;
     }
     return new NextResponse(JSON.stringify(data, null, 2), { status: 200, headers });
   } catch (err) {
     return NextResponse.json(
       { ok: false, error: err instanceof Error ? err.message : "Failed to build analytics export" },
-      { status: 500 },
+      { status: 500, headers: { ...CORS, ...NOINDEX } },
     );
   }
 }
