@@ -46,6 +46,7 @@ import { evaluateBuyReadiness } from "./liveReadiness";
 import { LIVE_SELL_DUST, formatLiveSellShares, resolveLiveSellSize } from "./liveSellSizing";
 import { applyCopyScores } from "./copyScore";
 import { discoverTraders } from "./discovery";
+import { analytics, type DecisionCapture } from "@/lib/analytics";
 import {
   appendLog,
   clearLogs,
@@ -629,6 +630,9 @@ export class CopyBotEngine {
   private inFlight = false;
   private lastHeartbeatLogAt = 0;
   private buyExposurePaused = false;
+  // Analytics-only cadence guards (observational; never gate trading).
+  private lastAnalyticsSnapshotAt = 0;
+  private lastAnalyticsMaintenanceAt = 0;
 
   async status(): Promise<BotStatus> {
     await ensureDataFiles();
@@ -1010,18 +1014,18 @@ export class CopyBotEngine {
       proceedsUsd += copyAmountUsd;
       realizedPnlUsd += pnl;
       closed += 1;
-      await prependTrade(
-        makeExitRecord(
-          position,
-          price,
-          shares,
-          copyAmountUsd,
-          pnl,
-          `Liquidated ${shares.toFixed(2)} ${position.outcome} @ ${(price * 100).toFixed(1)}c (${source}).`,
-          source,
-          now,
-        ),
+      const exitRecord = makeExitRecord(
+        position,
+        price,
+        shares,
+        copyAmountUsd,
+        pnl,
+        `Liquidated ${shares.toFixed(2)} ${position.outcome} @ ${(price * 100).toFixed(1)}c (${source}).`,
+        source,
+        now,
       );
+      await prependTrade(exitRecord);
+      await analytics.recordExit(exitRecord, source, position.sourceWallets);
     }
 
     await savePositions([]);
@@ -1167,6 +1171,7 @@ export class CopyBotEngine {
         record.txOrOrderId = res.orderId ?? "";
         record.reconciliationStatus = "pending";
         await prependTrade(record);
+        await analytics.recordExit(record, source, position.sourceWallets);
 
         // Keep any real unfilled remainder so the next session retries it.
         const remainder = Math.max(0, sellSize.bookSharesBeforeSell - res.filledShares);
@@ -1316,7 +1321,9 @@ export class CopyBotEngine {
         continue;
       }
       const realizedPnlUsd = (settlementValue - position.avgPrice) * position.shares;
-      await prependTrade(makeSettlementRecord(position, settlementValue, realizedPnlUsd, now));
+      const settlementRecord = makeSettlementRecord(position, settlementValue, realizedPnlUsd, now);
+      await prependTrade(settlementRecord);
+      await analytics.recordExit(settlementRecord, "settlement", position.sourceWallets);
       settled += 1;
       await appendLog(
         "info",
@@ -1672,7 +1679,9 @@ export class CopyBotEngine {
 
       // Record the on-chain redemption: ledger event + double-redeem guard.
       const costBasisUsd = costBasisOf.get(item.tokenId) ?? 0;
-      await prependTrade(makeRedeemRecord(item, payoutUsd, costBasisUsd, result.txHash));
+      const redeemRecord = makeRedeemRecord(item, payoutUsd, costBasisUsd, result.txHash);
+      await prependTrade(redeemRecord);
+      await analytics.recordExit(redeemRecord, "redeem");
       await recordRedeemed({
         tokenId: item.tokenId,
         conditionId: item.conditionId,
@@ -1830,9 +1839,21 @@ export class CopyBotEngine {
           continue;
         }
         const trader = traderByWallet.get(trade.wallet.toLowerCase()) ?? null;
-        const result = await this.processTrade(trade, settings, state, positions, walletCycleCopies, trader);
+        const capture: DecisionCapture = {};
+        const result = await this.processTrade(trade, settings, state, positions, walletCycleCopies, trader, capture);
         positions = result.positions;
         await prependTrade(result.record);
+        // Analytics (observational only — never affects the decision above).
+        await analytics.recordDecision({
+          record: result.record,
+          trade,
+          settings,
+          state,
+          trader,
+          market: capture.market ?? null,
+          capture,
+          positionsAfter: result.positions,
+        });
         processedCount += 1;
         if (
           result.record.side === "BUY" &&
@@ -1901,6 +1922,18 @@ export class CopyBotEngine {
 
       await savePositions(positions);
       await saveSeenTrades({ ids: [...seenIds] });
+
+      // Analytics (observational only): periodically snapshot the open-position
+      // timeline and run bounded background maintenance. Both are self-guarding
+      // (never throw) and rate-limited so they add negligible poll overhead.
+      if (now - this.lastAnalyticsSnapshotAt >= 60_000) {
+        this.lastAnalyticsSnapshotAt = now;
+        await analytics.recordPositionSnapshots(positions, settings.mode);
+      }
+      if (now - this.lastAnalyticsMaintenanceAt >= 10 * 60_000) {
+        this.lastAnalyticsMaintenanceAt = now;
+        await analytics.runMaintenance();
+      }
 
       // Reconcile any live orders placed this poll against authoritative CLOB
       // fills, and re-score followed wallets from the bot's own copied results.
@@ -2013,9 +2046,9 @@ export class CopyBotEngine {
 
         const shares = position.shares;
         const copyAmountUsd = shares * price;
-        await prependTrade(
-          makeExitRecord(position, price, shares, copyAmountUsd, pnl, `Auto-exit: ${exitReason}.`, "auto-exit", now),
-        );
+        const exitRecord = makeExitRecord(position, price, shares, copyAmountUsd, pnl, `Auto-exit: ${exitReason}.`, "auto-exit", now);
+        await prependTrade(exitRecord);
+        await analytics.recordExit(exitRecord, "auto-exit", position.sourceWallets);
         exits += 1;
       }
       if (exits > 0) await appendLog("info", `Auto-exit sold ${exits} position(s); ${remaining.length} remaining.`);
@@ -2274,6 +2307,7 @@ export class CopyBotEngine {
         record.txOrOrderId = res.orderId ?? "";
         record.reconciliationStatus = "pending";
         await prependTrade(record);
+        await analytics.recordExit(record, "auto-exit", position.sourceWallets);
         await appendLog("info", `Live auto-exit sold ${formatLiveSellShares(res.filledShares)} ${position.outcome}: ${exitReason}.`);
 
         const remainder = Math.max(0, sellSize.bookSharesBeforeSell - res.filledShares);
@@ -2346,18 +2380,18 @@ export class CopyBotEngine {
       const shares = position.shares;
       const copyAmountUsd = shares * price;
       const pnl = (price - position.avgPrice) * shares;
-      await prependTrade(
-        makeExitRecord(
-          position,
-          price,
-          shares,
-          copyAmountUsd,
-          pnl,
-          `Leader exited, flattening: sold ${shares.toFixed(2)} ${position.outcome} @ ${(price * 100).toFixed(1)}c (leader no longer holds).`,
-          "leader-exit",
-          now,
-        ),
+      const exitRecord = makeExitRecord(
+        position,
+        price,
+        shares,
+        copyAmountUsd,
+        pnl,
+        `Leader exited, flattening: sold ${shares.toFixed(2)} ${position.outcome} @ ${(price * 100).toFixed(1)}c (leader no longer holds).`,
+        "leader-exit",
+        now,
       );
+      await prependTrade(exitRecord);
+      await analytics.recordExit(exitRecord, "leader-exit", position.sourceWallets);
       await appendLog("info", `Leader exited ${position.outcome} (${position.marketTitle}); flattened copied position at mark.`);
     }
     return survivors;
@@ -2439,6 +2473,7 @@ export class CopyBotEngine {
         record.txOrOrderId = res.orderId ?? "";
         record.reconciliationStatus = "pending";
         await prependTrade(record);
+        await analytics.recordExit(record, "leader-exit", position.sourceWallets);
         await appendLog("info", `Leader exited ${position.outcome}; flattened copied position via live SELL.`);
 
         const remainder = Math.max(0, sellSize.bookSharesBeforeSell - res.filledShares);
@@ -2461,6 +2496,7 @@ export class CopyBotEngine {
     positions: BotPosition[],
     walletCycleCopies: Map<string, number>,
     trader: FollowedTrader | null = null,
+    capture?: DecisionCapture,
   ): Promise<{ record: CopyTradeRecord; positions: BotPosition[] }> {
     const now = Date.now();
     const tradeAgeSec = Math.max(0, Math.floor(now / 1000) - trade.timestamp);
@@ -2470,6 +2506,12 @@ export class CopyBotEngine {
     } catch {
       market = null;
     }
+    // Analytics capture (observational only — reads computed values; no effect on
+    // any decision below).
+    if (capture) {
+      capture.market = market;
+      capture.tradeAgeSec = tradeAgeSec;
+    }
 
     const priorTrades = await loadTrades();
     const localAvailableBalanceUsd = calculateAvailableBalance(settings, positions, priorTrades);
@@ -2477,6 +2519,12 @@ export class CopyBotEngine {
     const marketExposureUsd = positions
       .filter((position) => position.conditionId === trade.conditionId || position.tokenId === trade.tokenId)
       .reduce((sum, position) => sum + positionExposure(position), 0);
+    if (capture) {
+      capture.exposureBeforeUsd = exposureUsd;
+      capture.marketExposureBeforeUsd = marketExposureUsd;
+      capture.availableCashUsd = localAvailableBalanceUsd;
+      capture.equityUsd = localAvailableBalanceUsd + exposureUsd;
+    }
 
     // Edge metrics for copied BUYs ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â recorded on every BUY record (filled or
     // skipped) so the dashboard can show leader vs bot price and the adverse move.
@@ -2591,6 +2639,16 @@ export class CopyBotEngine {
       trade.side === "BUY"
         ? Math.min(strategyAmountUsd, availableBalanceUsd, config.liveMaxOrderUsd, remainingAllowedExposureUsd)
         : strategyAmountUsd;
+    if (capture) {
+      capture.availableCashUsd = availableBalanceUsd;
+      capture.equityUsd = equityUsd;
+      capture.liveBalanceUsd = liveBalance ? liveBalance.usdcBalance : null;
+      capture.strategyAmountUsd = strategyAmountUsd;
+      capture.requestedAmountUsd = requestedAmountUsd;
+      capture.perMarketCapUsd = perMarketCapUsd;
+      capture.totalCapUsd = totalCapUsd;
+      capture.dailyPnlUsd = dailyPnlUsd;
+    }
 
     // Hard daily-loss lockout and panic stop: block NEW BUYs only. Exits (SELLs)
     // and flattening always remain allowed so positions can still be unwound.
