@@ -153,38 +153,55 @@ export interface PortfolioAnalytics {
   totalExposureUsd: number;
   totalAccountValueUsd: number;
   openPositions: number;
+  /** Largest single-market exposure as a fraction of total exposure (0..1). */
+  maxConcentration: number;
   exposureByCategory: Array<{ category: MarketCategory; exposureUsd: number }>;
   exposureByTrader: Array<{ wallet: string; exposureUsd: number }>;
   exposureByResolutionDate: Array<{ date: string; exposureUsd: number }>;
+  exposureByEvent: Array<{ conditionId: string; title: string; exposureUsd: number }>;
   exposureByMarket: Array<{ tokenId: string; title: string; exposureUsd: number }>;
 }
 
 export function buildPortfolioAnalytics(
   positions: BotPosition[],
   cashUsd: number,
-  snapshots: PositionSnapshot[],
+  decisions: DecisionRecord[],
 ): PortfolioAnalytics {
-  // Latest snapshot per token carries category + resolution context for live
-  // positions; fall back to the position itself when no snapshot exists yet.
-  const latestSnap = new Map<string, PositionSnapshot>();
-  for (const s of snapshots) {
-    const prev = latestSnap.get(s.tokenId);
-    if (!prev || s.ts > prev.ts) latestSnap.set(s.tokenId, s);
+  // Latest decision per token carries category + resolution date for live
+  // positions; fall back to the position itself when no decision exists yet.
+  const latestDecision = new Map<string, DecisionRecord>();
+  for (const d of decisions) {
+    const prev = latestDecision.get(d.tokenId);
+    if (!prev || d.ts > prev.ts) latestDecision.set(d.tokenId, d);
   }
 
   const byCategory = new Map<MarketCategory, number>();
   const byTrader = new Map<string, number>();
   const byDate = new Map<string, number>();
+  const byEvent = new Map<string, { title: string; exposureUsd: number }>();
   const byMarket: PortfolioAnalytics["exposureByMarket"] = [];
   let totalExposureUsd = 0;
+  let maxMarketExposure = 0;
 
   for (const p of positions) {
     const exposure = positionExposure(p);
     totalExposureUsd += exposure;
-    const snap = latestSnap.get(p.tokenId);
-    const category = snap?.category ?? "other";
+    maxMarketExposure = Math.max(maxMarketExposure, exposure);
+    const d = latestDecision.get(p.tokenId);
+    const category = d?.market.category ?? "other";
     byCategory.set(category, (byCategory.get(category) ?? 0) + exposure);
     for (const w of p.sourceWallets) byTrader.set(w, (byTrader.get(w) ?? 0) + exposure);
+    const resolvesAt = d?.market.resolvesAt ?? null;
+    if (resolvesAt) {
+      const date = new Date(resolvesAt);
+      if (!Number.isNaN(date.getTime())) {
+        const key = date.toISOString().slice(0, 10);
+        byDate.set(key, (byDate.get(key) ?? 0) + exposure);
+      }
+    }
+    const ev = byEvent.get(p.conditionId) ?? { title: p.marketTitle, exposureUsd: 0 };
+    ev.exposureUsd += exposure;
+    byEvent.set(p.conditionId, ev);
     byMarket.push({ tokenId: p.tokenId, title: p.marketTitle, exposureUsd: exposure });
   }
 
@@ -195,12 +212,50 @@ export function buildPortfolioAnalytics(
     totalExposureUsd,
     totalAccountValueUsd: cashUsd + totalExposureUsd,
     openPositions: positions.length,
+    maxConcentration: totalExposureUsd > 0 ? maxMarketExposure / totalExposureUsd : 0,
     exposureByCategory: sortDesc([...byCategory.entries()].map(([category, exposureUsd]) => ({ category, exposureUsd }))),
     exposureByTrader: sortDesc([...byTrader.entries()].map(([wallet, exposureUsd]) => ({ wallet, exposureUsd }))),
     exposureByResolutionDate: sortDesc(
       [...byDate.entries()].map(([date, exposureUsd]) => ({ date, exposureUsd })),
     ),
+    exposureByEvent: sortDesc(
+      [...byEvent.entries()].map(([conditionId, v]) => ({ conditionId, title: v.title, exposureUsd: v.exposureUsd })),
+    ),
     exposureByMarket: sortDesc(byMarket),
+  };
+}
+
+// ── Execution quality (req: leader vs bot fill, slippage, partials, failures) ─
+export interface ExecutionQuality {
+  filledOrders: number;
+  partialFills: number;
+  failedOrders: number;
+  skippedBuys: number;
+  avgSlippageCents: number;
+  avgLeaderToBotCents: number;
+  avgFrictionUsd: number;
+  avgFeeUsd: number;
+  /** Mean age (s) of a leader trade when the bot acted — a copy-latency proxy. */
+  avgCopyLatencySec: number;
+}
+
+export function buildExecutionQuality(decisions: DecisionRecord[], exits: DecisionRecord[]): ExecutionQuality {
+  const all = [...decisions, ...exits];
+  const filled = all.filter((d) => d.status === "copied" || d.status === "simulated");
+  const filledBuys = decisions.filter((d) => d.action === "BUY" && (d.status === "copied" || d.status === "simulated"));
+  const leaderVsBot = filledBuys
+    .filter((d) => d.leaderFillPrice != null && d.ourFillPrice != null)
+    .map((d) => ((d.ourFillPrice as number) - (d.leaderFillPrice as number)) * 100);
+  return {
+    filledOrders: filled.length,
+    partialFills: filled.filter((d) => d.fillStatus === "partial").length,
+    failedOrders: decisions.filter((d) => d.action === "FAIL").length,
+    skippedBuys: decisions.filter((d) => d.action === "SKIP" && d.side === "BUY").length,
+    avgSlippageCents: mean(filledBuys.map((d) => d.slippageCents ?? 0)),
+    avgLeaderToBotCents: mean(leaderVsBot),
+    avgFrictionUsd: mean(filled.map((d) => d.frictionUsd ?? 0)),
+    avgFeeUsd: mean(filled.map((d) => d.feeUsd ?? 0)),
+    avgCopyLatencySec: mean(filledBuys.map((d) => d.tradeAgeSec ?? 0)),
   };
 }
 
@@ -482,8 +537,9 @@ export async function loadAnalyticsBundle(positions: BotPosition[], cashUsd: num
     snapshots,
     traders: buildTraderAnalytics(decisionsAndExits, completed),
     categories: buildCategoryAnalytics(decisionsAndExits, completed),
-    portfolio: buildPortfolioAnalytics(positions, cashUsd, snapshots),
+    portfolio: buildPortfolioAnalytics(positions, cashUsd, decisions),
     correlation: buildCorrelationClusters(positions, decisions),
+    executionQuality: buildExecutionQuality(decisions, exits),
     dashboard: buildDashboardSummary({ decisions, exits, completed, missed }),
   };
 }

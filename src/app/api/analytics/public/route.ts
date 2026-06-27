@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { loadPositions, loadSettings, loadTrades } from "@/lib/copybot/store";
-import { calculateAvailableBalance } from "@/lib/copybot/accounting";
+import { loadEquityCurve, loadPositions, loadSettings, loadTrades } from "@/lib/copybot/store";
 import { buildAnalyticsExport } from "@/lib/analytics";
 import { config } from "@/lib/config";
 
@@ -13,9 +12,10 @@ export const dynamic = "force-dynamic";
  * fetch the JSON on a schedule. Access requires `?token=` to match
  * ANALYTICS_EXPORT_TOKEN; when that env var is unset the endpoint is disabled.
  *
- * Defaults to a compact digest (aggregations + completed trades + missed
- * opportunities, no raw decision/exit logs). Pass `?decisions=1` for the full
- * log, or `?maxDecisions=N` to cap it.
+ * Returns the full bundle by default (account, config, equity curve, open
+ * positions, decisions, completed trades, missed opps, trader/market/execution/
+ * correlation analytics). Pass `?decisions=0` for a compact digest without the
+ * raw decision/exit logs, or `?maxDecisions=N` to cap them.
  *
  * The in-dashboard export stays at /api/analytics/export (behind login).
  */
@@ -45,13 +45,22 @@ export async function GET(req: Request) {
   }
 
   try {
-    const includeDecisions = url.searchParams.get("decisions") === "1";
+    // Full bundle by default (the daily AI digest wants every decision); callers
+    // can trim with ?decisions=0 or ?maxDecisions=N to bound payload size.
+    const includeDecisions = url.searchParams.get("decisions") !== "0";
     const maxDecisions = Number(url.searchParams.get("maxDecisions") ?? 0) || 0;
     const download = url.searchParams.get("download") === "1";
 
-    const [settings, positions, trades] = await Promise.all([loadSettings(), loadPositions(), loadTrades()]);
-    const cashUsd = calculateAvailableBalance(settings, positions, trades);
-    const data = await buildAnalyticsExport(positions, cashUsd, { includeDecisions, maxDecisions });
+    const settings = await loadSettings();
+    const [positions, trades, equityCurve] = await Promise.all([
+      loadPositions(),
+      loadTrades(),
+      loadEquityCurve(settings),
+    ]);
+    const data = await buildAnalyticsExport(
+      { settings, positions, trades, equityCurve },
+      { includeDecisions, maxDecisions },
+    );
 
     const headers: Record<string, string> = {
       "content-type": "application/json",

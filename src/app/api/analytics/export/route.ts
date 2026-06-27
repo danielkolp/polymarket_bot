@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { loadPositions, loadSettings, loadTrades } from "@/lib/copybot/store";
-import { calculateAvailableBalance } from "@/lib/copybot/accounting";
+import { loadEquityCurve, loadPositions, loadSettings, loadTrades } from "@/lib/copybot/store";
 import { buildAnalyticsExport } from "@/lib/analytics";
 
 export const runtime = "nodejs";
@@ -18,9 +17,16 @@ export async function GET(req: Request) {
     const includeDecisions = url.searchParams.get("decisions") !== "0";
     const download = url.searchParams.get("download") === "1";
 
-    const [settings, positions, trades] = await Promise.all([loadSettings(), loadPositions(), loadTrades()]);
-    const cashUsd = calculateAvailableBalance(settings, positions, trades);
-    const data = await buildAnalyticsExport(positions, cashUsd, { maxDecisions, includeDecisions });
+    const settings = await loadSettings();
+    const [positions, trades, equityCurve] = await Promise.all([
+      loadPositions(),
+      loadTrades(),
+      loadEquityCurve(settings),
+    ]);
+    const data = await buildAnalyticsExport(
+      { settings, positions, trades, equityCurve },
+      { maxDecisions, includeDecisions },
+    );
 
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (download) {

@@ -151,6 +151,8 @@ export interface DecisionRecord {
   effectivePrice: number | null;
   feeUsd: number | null;
   frictionUsd: number | null;
+  /** Fill quality when the realistic fill model ran ("partial" = thin book). */
+  fillStatus: "filled" | "partial" | "rejected" | null;
 
   sourceSizeShares: number;
   sourceAmountUsd: number;
