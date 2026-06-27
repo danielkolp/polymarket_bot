@@ -10,7 +10,7 @@
  * READ-ONLY against Polymarket — this fetches positions, it never trades.
  */
 import { getLiveAccountAddress } from "@/lib/execution/liveClob";
-import { fetchUserPositions } from "@/lib/polymarket/positions";
+import { fetchUserPositions, type AccountPosition } from "@/lib/polymarket/positions";
 import { clampPrice } from "./accounting";
 import type {
   BotPosition,
@@ -44,9 +44,9 @@ export function emptyLiveReconciliation(error: string | null, now = Date.now()):
 
 /**
  * Fetch the live account positions and reconcile against the local ledger.
- * Returns a classification snapshot plus authoritative BotPositions (local cost
- * basis / source-wallet attribution is preserved when a matching local position
- * exists; otherwise cost basis comes from the account and is flagged unknown).
+ * Returns a classification snapshot plus authoritative BotPositions. Account
+ * size/mark/cost basis come from Polymarket; local data is only used for
+ * metadata and source-wallet attribution when a matching position exists.
  */
 export async function reconcileLivePositions(
   localPositions: BotPosition[],
@@ -55,7 +55,15 @@ export async function reconcileLivePositions(
 ): Promise<LivePositionResult> {
   const address = getLiveAccountAddress();
   const account = await fetchUserPositions(address);
+  return reconcileAccountPositions(account, localPositions, traders, now);
+}
 
+export function reconcileAccountPositions(
+  account: AccountPosition[],
+  localPositions: BotPosition[],
+  traders: FollowedTrader[],
+  now = Date.now(),
+): LivePositionResult {
   const localByToken = new Map(localPositions.map((p) => [p.tokenId, p]));
   const followed = new Set(traders.map((t) => t.wallet.toLowerCase()));
   const accountTokens = new Set(account.map((p) => p.tokenId));
@@ -73,18 +81,29 @@ export async function reconcileLivePositions(
     const local = localByToken.get(accPos.tokenId);
     const attributionKnown = Boolean(local && local.sourceWallets.some((w) => followed.has(w.toLowerCase())));
 
+    // Resolved/redeemable positions are NOT open, tradeable risk: the market has
+    // settled, Polymarket auto-redeems winners to cash, and losers sit at ~$0.
+    // We still surface them in `entries` (and the redeemables plan), but never
+    // adopt them into the authoritative open-positions book or count them as open
+    // exposure — otherwise a resolved market lingers forever in "Open Positions".
+    const resolved = accPos.redeemable;
+
     let classification: LivePositionClassification;
     if (local && local.shares > DUST) classification = "known-bot-position";
     else classification = "unknown-existing-position";
-    if (classification === "unknown-existing-position") unknownPositionCount += 1;
-    if (accPos.redeemable) redeemableCount += 1;
+    // A resolved position is not an actionable "unknown live position", so it must
+    // not count toward the unknown-position BUY block.
+    if (classification === "unknown-existing-position" && !resolved) unknownPositionCount += 1;
+    if (resolved) redeemableCount += 1;
 
     // Mark price: prefer the account's current price, fall back to local mark or
-    // cost basis. Resolved/redeemable positions are still valued for exposure.
+    // cost basis.
     const markPrice = clampPrice(accPos.curPrice ?? local?.markPrice ?? accPos.avgPrice ?? 0);
     const exposureUsd = Math.max(0, accPos.size * markPrice);
-    totalLiveExposureUsd += exposureUsd;
-    if (!attributionKnown) unattributedExposureUsd += exposureUsd;
+    if (!resolved) {
+      totalLiveExposureUsd += exposureUsd;
+      if (!attributionKnown) unattributedExposureUsd += exposureUsd;
+    }
 
     entries.push({
       tokenId: accPos.tokenId,
@@ -101,9 +120,11 @@ export async function reconcileLivePositions(
       negativeRisk: accPos.negativeRisk,
     });
 
-    // Authoritative position: keep local cost basis / attribution when present,
-    // else adopt the account's avg price (flagged unknown via empty sourceWallets).
-    const avgPrice = clampPrice(local?.avgPrice ?? accPos.avgPrice ?? markPrice);
+    if (resolved) continue; // surfaced above; not an open position
+
+    // Authoritative position: account avg price is the source of truth for
+    // real-mode P&L; local cost basis is only a fallback when the API omits it.
+    const avgPrice = clampPrice(accPos.avgPrice ?? local?.avgPrice ?? markPrice);
     positions.push({
       tokenId: accPos.tokenId,
       conditionId: accPos.conditionId || local?.conditionId || "",

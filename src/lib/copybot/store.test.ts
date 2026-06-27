@@ -84,4 +84,24 @@ describe("copybot JSON store", () => {
     const files = await fs.readdir(path.dirname(file));
     expect(files.some((name) => name.endsWith(".tmp"))).toBe(false);
   });
+
+  it("migrates old daily-loss lockout state to the bot-P&L baseline", async () => {
+    const file = path.join(tempDir, "data", "bot-state.json");
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify({
+      dailyDate: "2026-06-01",
+      dailyStartEquityUsd: 100,
+      peakEquityUsd: 100,
+      dailyLossLockout: true,
+    }), "utf8");
+
+    const { loadBotState } = await importStore();
+    const state = await loadBotState();
+
+    expect(state.dailyStartBotPnlUsd).toBe(0);
+    expect(state.dailyLossLockout).toBe(false);
+    const raw = JSON.parse(await fs.readFile(file, "utf8"));
+    expect(raw.dailyStartBotPnlUsd).toBe(0);
+    expect(raw.dailyLossLockout).toBe(false);
+  });
 });

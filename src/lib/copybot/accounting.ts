@@ -1,6 +1,7 @@
+import type { TraderTrade } from "@/lib/polymarket/types";
 import { todayKey } from "./defaults";
 import { isFilled, tradeIsUnsafeForAccounting, tradeNotionalUsd } from "./ledger";
-import type { BotMetrics, BotPosition, BotSettings, BotState, CopyTradeRecord } from "./types";
+import type { BotMetrics, BotPosition, BotSettings, BotState, CopyTradeRecord, FollowedTrader } from "./types";
 
 export function clampPrice(price: number): number {
   if (!Number.isFinite(price)) return 0;
@@ -47,6 +48,10 @@ export function realizedPnlFromTrades(trades: CopyTradeRecord[]): number {
   return trades
     .filter(filledForSettledPnl)
     .reduce((sum, trade) => sum + trade.realizedPnlUsd, 0);
+}
+
+export function cumulativeBotPnlUsd(positions: BotPosition[], trades: CopyTradeRecord[]): number {
+  return realizedPnlFromTrades(trades) + positions.reduce((sum, pos) => sum + positionUnrealizedPnl(pos), 0);
 }
 
 /**
@@ -116,19 +121,82 @@ export function isBelowTradeMinimum(settings: BotSettings, amountUsd: number): b
   return amountUsd + 1e-9 < settings.minTradeAmountUsd;
 }
 
+// ── Leader-conviction sizing (optional signal) ────────────────────────────────
+// Scale the copy amount by how big the leader's trade is relative to their own
+// typical recent trade size. A bigger-than-usual bet is a stronger signal. The
+// factor is clamped to a tight band so a single outsized trade can't blow past
+// risk caps, and the result is hard-clamped to maxTradeAmountUsd. All other caps
+// (live max order, exposure, available balance) are still applied downstream.
+export const CONVICTION_MIN_FACTOR = 0.5;
+export const CONVICTION_MAX_FACTOR = 2;
+
+/** USD notional of the leader's trade (0 when unusable). */
+export function leaderTradeUsd(trade: Pick<TraderTrade, "price" | "size">): number {
+  const usd = trade.price * trade.size;
+  return Number.isFinite(usd) && usd > 0 ? usd : 0;
+}
+
+/** The leader's typical recent trade size in USD, derived from weekly stats. */
+export function leaderTypicalTradeUsd(
+  trader: Pick<FollowedTrader, "weeklyVolumeUsd" | "weeklyTradeCount"> | null | undefined,
+): number {
+  if (!trader) return 0;
+  const { weeklyVolumeUsd, weeklyTradeCount } = trader;
+  if (!(weeklyVolumeUsd > 0) || !(weeklyTradeCount > 0)) return 0;
+  return weeklyVolumeUsd / weeklyTradeCount;
+}
+
+/** Conviction multiplier in [CONVICTION_MIN_FACTOR, CONVICTION_MAX_FACTOR]; 1 = no signal. */
+export function leaderConvictionFactor(
+  trade: Pick<TraderTrade, "price" | "size">,
+  trader: Pick<FollowedTrader, "weeklyVolumeUsd" | "weeklyTradeCount"> | null | undefined,
+): number {
+  const tradeUsd = leaderTradeUsd(trade);
+  const typicalUsd = leaderTypicalTradeUsd(trader);
+  if (!(tradeUsd > 0) || !(typicalUsd > 0)) return 1;
+  const factor = tradeUsd / typicalUsd;
+  if (!Number.isFinite(factor) || factor <= 0) return 1;
+  return Math.min(CONVICTION_MAX_FACTOR, Math.max(CONVICTION_MIN_FACTOR, factor));
+}
+
+/**
+ * Apply leader-conviction scaling to a base copy amount, then hard-clamp to the
+ * per-trade maximum. Returns the base unchanged for "local-fixed" mode or when
+ * there is no usable signal. NEVER raises the amount above maxTradeAmountUsd; all
+ * other risk caps are enforced by the caller downstream.
+ */
+export function applyConvictionSizing(
+  baseUsd: number,
+  trade: Pick<TraderTrade, "price" | "size">,
+  trader: Pick<FollowedTrader, "weeklyVolumeUsd" | "weeklyTradeCount"> | null | undefined,
+  settings: Pick<BotSettings, "sizingSignalMode" | "maxTradeAmountUsd">,
+): number {
+  if (settings.sizingSignalMode !== "leader-size-weighted") return baseUsd;
+  const factor = leaderConvictionFactor(trade, trader);
+  const scaled = baseUsd * factor;
+  if (!Number.isFinite(scaled) || scaled <= 0) return Math.min(baseUsd, settings.maxTradeAmountUsd);
+  return Math.min(scaled, settings.maxTradeAmountUsd);
+}
+
 export function buildMetrics(
   settings: BotSettings,
   state: BotState,
   positions: BotPosition[],
   trades: CopyTradeRecord[],
   now = Date.now(),
+  liveUsdcBalanceUsd?: number,
 ): { metrics: BotMetrics; state: BotState } {
   const realizedPnlUsd = realizedPnlFromTrades(trades);
   const totalOpenCostBasisUsd = totalOpenCostBasis(positions);
   const totalExposureUsd = totalExposure(positions);
   const unrealizedPnlUsd = totalExposureUsd - totalOpenCostBasisUsd;
-  const equityUsd = settings.startingBalance + realizedPnlUsd + unrealizedPnlUsd;
-  const cashUsd = equityUsd - totalExposureUsd;
+  const botPnlUsd = realizedPnlUsd + unrealizedPnlUsd;
+  const localEquityUsd = settings.startingBalance + realizedPnlUsd + unrealizedPnlUsd;
+  // When a live wallet balance is available (real mode or sim-mode preview),
+  // use live cash as the spendable balance. Keep local equity separate so the
+  // dashboard can surface drift instead of hiding it.
+  const equityUsd = liveUsdcBalanceUsd != null ? liveUsdcBalanceUsd + totalExposureUsd : localEquityUsd;
+  const cashUsd = liveUsdcBalanceUsd != null ? liveUsdcBalanceUsd : localEquityUsd - totalExposureUsd;
   const availableBalanceUsd = Math.max(0, cashUsd);
 
   const retainedTradeCashUsd = calculateCash(settings, trades);
@@ -144,21 +212,27 @@ export function buildMetrics(
   const dailyDate = todayKey(now);
   const sameDay = state.dailyDate === dailyDate;
   const dailyStartEquityUsd = sameDay ? state.dailyStartEquityUsd : equityUsd;
-  const peakEquityUsd = Math.max(state.peakEquityUsd || settings.startingBalance, equityUsd);
+  const stateHasBotPnlBaseline = Number.isFinite(state.dailyStartBotPnlUsd);
+  const dailyStartBotPnlUsd = sameDay && stateHasBotPnlBaseline ? state.dailyStartBotPnlUsd : botPnlUsd;
+  const peakBaseEquityUsd = state.peakEquityUsd || (liveUsdcBalanceUsd != null ? equityUsd : settings.startingBalance);
+  const peakEquityUsd = Math.max(peakBaseEquityUsd, equityUsd);
   const maxDrawdown = peakEquityUsd > 0 ? Math.max(0, (peakEquityUsd - equityUsd) / peakEquityUsd) : 0;
   const totalExposurePercent = equityUsd > 0 ? totalExposureUsd / equityUsd : 0;
   const exposureCap = settings.maxTotalExposurePercent / 100;
   const buyExposurePaused = settings.mode === "simulation" && exposureCap > 0 && totalExposurePercent >= exposureCap - 1e-9;
 
-  const dailyPnlUsd = equityUsd - dailyStartEquityUsd;
+  const dailyPnlUsd = botPnlUsd - dailyStartBotPnlUsd;
   // Hard daily-loss lockout. Latches once breached and stays latched for the rest
   // of the local day (cleared only at the day boundary or on reset), so a brief
-  // equity bounce can't silently re-enable BUYs after a bad day.
+  // bot-P&L bounce can't silently re-enable BUYs after a bad day.
   const dailyLossCapUsd = dollarCapFromPercent(dailyStartEquityUsd, settings.maxDailyLossPercent);
   const lossBreachedNow = settings.maxDailyLossPercent > 0 && dailyLossCapUsd > 0 && dailyPnlUsd <= -dailyLossCapUsd;
-  const dailyLossLockout = sameDay ? Boolean(state.dailyLossLockout) || lossBreachedNow : false;
+  // Older persisted states latched this on whole-wallet equity drift. When the
+  // bot-P&L baseline is absent, migrate by letting the new calculation decide.
+  const priorLockout = sameDay && stateHasBotPnlBaseline ? Boolean(state.dailyLossLockout) : false;
+  const dailyLossLockout = (settings.maxDailyLossPercent > 0 && sameDay) ? priorLockout || lossBreachedNow : false;
   const dailyLossLockoutReason = dailyLossLockout
-    ? `Daily loss ${dailyPnlUsd.toFixed(2)} USD reached the ${settings.maxDailyLossPercent}% cap (-${dailyLossCapUsd.toFixed(2)} USD). New BUYs disabled until the next day.`
+    ? `Bot daily loss ${dailyPnlUsd.toFixed(2)} USD reached the ${settings.maxDailyLossPercent}% cap (-${dailyLossCapUsd.toFixed(2)} USD). New BUYs disabled until the next day.`
     : null;
 
   // Live orders awaiting authoritative CLOB reconciliation.
@@ -182,6 +256,7 @@ export function buildMetrics(
     ...state,
     dailyDate,
     dailyStartEquityUsd,
+    dailyStartBotPnlUsd,
     peakEquityUsd,
     dailyLossLockout,
   };
@@ -193,7 +268,7 @@ export function buildMetrics(
       availableBalanceUsd,
       equityUsd,
       liveUsdcBalance: null,
-      localTrackedEquity: equityUsd,
+      localTrackedEquity: localEquityUsd,
       balanceDifference: null,
       lastLiveBalanceCheck: null,
       liveBalanceStatus: "unknown",

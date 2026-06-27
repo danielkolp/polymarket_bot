@@ -2,6 +2,19 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Punto — display face for big numeric readouts (cash, equity, exposure). */
+@font-face {
+  font-family: "Punto";
+  src: url("/Punto-Regular.otf") format("opentype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+.font-punto {
+  font-family: "Punto", var(--font-space-mono), ui-monospace, monospace;
+}
+
 @layer base {
   :root {
     /* Dark mossy console. Solid surfaces, no gradients. Lime is the single
@@ -106,47 +119,69 @@
 }
 
 
+/* ── Card-level flash (background + edge glow) ── */
 .value-blink-up {
-  animation: value-blink-up 900ms ease-out;
+  animation: value-blink-up 1100ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
-
 .value-blink-down {
-  animation: value-blink-down 900ms ease-out;
+  animation: value-blink-down 1100ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
 @keyframes value-blink-up {
-  0% { background: hsl(var(--success) / 0.28); box-shadow: 0 0 0 0 hsl(var(--success) / 0.3); }
-  70% { background: hsl(var(--success) / 0.14); box-shadow: 0 0 0 6px hsl(var(--success) / 0); }
+  0%   { background: hsl(var(--success) / 0.5); box-shadow: 0 0 0 1px hsl(var(--success) / 0.4), inset 0 0 12px hsl(var(--success) / 0.08); }
+  18%  { background: hsl(var(--success) / 0.22); box-shadow: 0 0 0 2px hsl(var(--success) / 0.15); }
   100% { background: transparent; box-shadow: none; }
 }
 
 @keyframes value-blink-down {
-  0% { background: hsl(var(--destructive) / 0.28); box-shadow: 0 0 0 0 hsl(var(--destructive) / 0.3); }
-  70% { background: hsl(var(--destructive) / 0.14); box-shadow: 0 0 0 6px hsl(var(--destructive) / 0); }
+  0%   { background: hsl(var(--destructive) / 0.5); box-shadow: 0 0 0 1px hsl(var(--destructive) / 0.4), inset 0 0 12px hsl(var(--destructive) / 0.08); }
+  18%  { background: hsl(var(--destructive) / 0.22); box-shadow: 0 0 0 2px hsl(var(--destructive) / 0.15); }
   100% { background: transparent; box-shadow: none; }
 }
 
-
+/* ── Contained variant (table cells, spans) ── */
 .value-blink-contained.value-blink-up {
   animation-name: value-blink-contained-up;
+  animation-duration: 900ms;
 }
-
 .value-blink-contained.value-blink-down {
   animation-name: value-blink-contained-down;
+  animation-duration: 900ms;
 }
 
 @keyframes value-blink-contained-up {
-  0% { background: hsl(var(--success) / 0.22); }
+  0%   { background: hsl(var(--success) / 0.3); }
+  100% { background: transparent; }
+}
+@keyframes value-blink-contained-down {
+  0%   { background: hsl(var(--destructive) / 0.3); }
   100% { background: transparent; }
 }
 
-@keyframes value-blink-contained-down {
-  0% { background: hsl(var(--destructive) / 0.22); }
-  100% { background: transparent; }
+/* ── Text glow: applied to the number element itself ── */
+.value-glow-up {
+  animation: value-glow-up 1000ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
+.value-glow-down {
+  animation: value-glow-down 1000ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes value-glow-up {
+  0%   { text-shadow: 0 0 14px hsl(var(--success) / 0.95), 0 0 4px hsl(var(--success) / 0.6); }
+  40%  { text-shadow: 0 0 8px hsl(var(--success) / 0.4); }
+  100% { text-shadow: none; }
+}
+@keyframes value-glow-down {
+  0%   { text-shadow: 0 0 14px hsl(var(--destructive) / 0.95), 0 0 4px hsl(var(--destructive) / 0.6); }
+  40%  { text-shadow: 0 0 8px hsl(var(--destructive) / 0.4); }
+  100% { text-shadow: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .value-blink-up,
-  .value-blink-down {
+  .value-blink-down,
+  .value-glow-up,
+  .value-glow-down {
     animation: none;
   }
 }

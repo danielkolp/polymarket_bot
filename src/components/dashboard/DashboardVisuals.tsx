@@ -104,11 +104,11 @@ function Meter({
   );
 }
 
-function EquityChartCard({ points, startingBalance }: { points: EquityPoint[]; startingBalance: number }) {
+function EquityChartCard({ points, baselineBalance }: { points: EquityPoint[]; baselineBalance: number }) {
   const data = useMemo(() => {
-    const seeded = points.length > 0 ? points : [{ ts: Date.now(), equityUsd: startingBalance, cashUsd: startingBalance, exposureUsd: 0 }];
-    return seeded.map((point) => ({ ...point, time: chartTime(point.ts), pnlUsd: point.equityUsd - startingBalance }));
-  }, [points, startingBalance]);
+    const seeded = points.length > 0 ? points : [{ ts: Date.now(), equityUsd: baselineBalance, cashUsd: baselineBalance, exposureUsd: 0 }];
+    return seeded.map((point) => ({ ...point, time: chartTime(point.ts), pnlUsd: point.equityUsd - baselineBalance }));
+  }, [points, baselineBalance]);
 
   return (
     <Card className="animate-in fade-in-0 slide-in-from-bottom-2 duration-500">
@@ -116,7 +116,7 @@ function EquityChartCard({ points, startingBalance }: { points: EquityPoint[]; s
         <CardTitle className="flex items-center gap-2">
           <TrendingUp className="size-4 text-primary" /> Equity Curve
         </CardTitle>
-        <CardDescription>Paper equity and exposure over server-side bot ticks.</CardDescription>
+        <CardDescription>Equity and exposure over server-side bot ticks.</CardDescription>
       </CardHeader>
       <CardContent>
         <div className="h-[280px]">
@@ -240,7 +240,7 @@ function RiskAndSizing({ status }: { status: BotStatus }) {
         <div className="space-y-4">
           <Meter label="Largest market" value={perMarketUsed} capLabel={`of ${status.settings.maxExposurePerMarketPercent}% cap`} tone={perMarketUsed > 0.85 ? "neg" : "neutral"} />
           <Meter label="Total exposure" value={totalUsed} capLabel={`of ${status.settings.maxTotalExposurePercent}% cap`} tone={totalUsed > 0.85 ? "neg" : "neutral"} />
-          <Meter label="Daily loss" value={lossUsed} capLabel={`of ${status.settings.maxDailyLossPercent}% cap`} tone={lossUsed > 0.7 ? "neg" : "pos"} />
+          <Meter label="Bot daily loss" value={lossUsed} capLabel={`of ${status.settings.maxDailyLossPercent}% cap`} tone={lossUsed > 0.7 ? "neg" : "pos"} />
         </div>
         <div className="rounded-md border border-border bg-background/60 p-3 text-sm">
           <div className="text-xs text-muted-foreground">Current sizing mode</div>
@@ -313,10 +313,11 @@ function PollProgress({ status }: { status: BotStatus }) {
 }
 
 export function DashboardVisuals({ status }: { status: BotStatus; totalPnl: number }) {
+  const chartBaseline = status.settings.mode === "real" ? status.state.dailyStartEquityUsd : status.settings.startingBalance;
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(360px,1fr)]">
-        <EquityChartCard points={status.equityCurve} startingBalance={status.settings.startingBalance} />
+        <EquityChartCard points={status.equityCurve} baselineBalance={chartBaseline} />
         <div className="space-y-4">
           <PollProgress status={status} />
           <RiskAndSizing status={status} />

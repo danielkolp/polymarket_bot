@@ -5,7 +5,9 @@ import { fetchTradesForWallets, fetchUserTrades } from "@/lib/polymarket/traderT
 import type { Market, OrderBook, TraderTrade } from "@/lib/polymarket/types";
 import { simulateFill, type FillCostSettings, type FillResult } from "./fillModel";
 import {
+  applyConvictionSizing,
   buildMetrics,
+  cumulativeBotPnlUsd,
   calculateAvailableBalance,
   calculateNextTradeSize,
   clampPrice,
@@ -15,6 +17,14 @@ import {
   totalExposure,
   walletExposure,
 } from "./accounting";
+import { effectiveMaxCopyAgeSec, evaluateAdverseEntry, type AdverseEntry } from "./entryGuards";
+import {
+  buildLeaderHoldings,
+  reconcileLeaderHoldings,
+  selectLeaderExitedPositions,
+  sourceWalletsOf,
+} from "./leaderPositions";
+import { fetchUserPositions } from "@/lib/polymarket/positions";
 import { inspectBullpenCli } from "./bullpen";
 import {
   applyRiskPreset,
@@ -23,9 +33,9 @@ import {
   presetControlledValues,
   RISK_PRESETS,
 } from "./riskPresets";
-import { assertLiveTradingAllowed, placeLiveMarketOrder, type LiveUsdcBalance } from "@/lib/execution/liveClob";
+import { assertLiveTradingAllowed, CLOB_MIN_MARKET_BUY_USD, placeLiveMarketOrder, PusdBalanceUnavailableError, type LiveUsdcBalance } from "@/lib/execution/liveClob";
 import { clearLiveBalanceCache, getLiveUsdcBalance } from "@/lib/execution/liveBalance";
-import { createInitialBotState } from "./defaults";
+import { createInitialBotState, todayKey } from "./defaults";
 import { recordId } from "./ids";
 import { buildRedeemablePlan, makeRedeemRecord } from "./redeemables";
 import { assertLiveRedeemAllowed, redeemConditionOnChain } from "@/lib/execution/liveRedeem";
@@ -33,6 +43,7 @@ import { buildScoreboard, normalizeSkipReason } from "./scoreboard";
 import { reconcileLiveTrades } from "./reconciliation";
 import { emptyLiveReconciliation, reconcileLivePositions } from "./livePositions";
 import { evaluateBuyReadiness } from "./liveReadiness";
+import { LIVE_SELL_DUST, formatLiveSellShares, resolveLiveSellSize } from "./liveSellSizing";
 import { applyCopyScores } from "./copyScore";
 import { discoverTraders } from "./discovery";
 import {
@@ -78,17 +89,14 @@ import type {
 
 const MAX_TRADERS_TO_FOLLOW = 100;
 const MAX_WALLETS_PER_POLL = 100;
-/**
- * Hard ceiling on how old a source trade may be and still be copied. The spec is
- * explicit — "only copy trades less than 5 minutes old" — so this is enforced in
- * code regardless of what a preset or custom setting requests. A higher
- * `maxTradeAgeSec` only ever tightens this, never loosens it.
- */
-const MAX_COPY_TRADE_AGE_SEC = 300;
+/** Cap on how many leader wallets we fetch positions for per leader-holdings pass. */
+const MAX_LEADER_HOLDINGS_WALLETS = 40;
+// The hard 5-minute absolute copy-age ceiling lives in entryGuards
+// (MAX_COPY_TRADE_AGE_SEC) and is enforced via effectiveMaxCopyAgeSec().
 
 /**
  * A market we positively know is resolved/closed (or no longer accepting orders)
- * must never be copied into — the leader's trade is on a market that's already
+ * must never be copied into ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the leader's trade is on a market that's already
  * settling. Unknown (null) markets are NOT treated as resolved here; other gates
  * (liquidity/spread/time-to-resolution) handle the can't-verify case.
  */
@@ -104,7 +112,7 @@ function isMarketResolved(market: Market | null): boolean {
  * Deliberately stricter than {@link isMarketResolved}: it requires `closed` (a
  * paused or not-accepting market is not necessarily resolved) AND an unambiguous
  * near-binary outcome price. This avoids ever crystallizing a loss against a
- * position whose market is merely halted — when in doubt we return null and the
+ * position whose market is merely halted ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â when in doubt we return null and the
  * position is retried on a later poll.
  */
 export function marketSettlementValue(market: Market | null, tokenId: string): number | null {
@@ -196,6 +204,10 @@ function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): Bo
         : current.sizingMode,
     riskPreset: resolvedPreset,
     sellBehavior: patch.sellBehavior === "all" ? "all" : patch.sellBehavior === "proportional" ? "proportional" : current.sellBehavior,
+    sizingSignalMode:
+      patch.sizingSignalMode === "leader-size-weighted" || patch.sizingSignalMode === "local-fixed"
+        ? patch.sizingSignalMode
+        : current.sizingSignalMode,
   };
 
   // Re-pin preset-controlled fields after numeric sanitation so a non-custom
@@ -230,6 +242,10 @@ function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): Bo
     maxMarketSpread: sanitizeNumber(next.maxMarketSpread, current.maxMarketSpread, 0, 1),
     minTimeToResolutionMinutes: sanitizeNumber(next.minTimeToResolutionMinutes, current.minTimeToResolutionMinutes, 0, 525600),
     maxTradeAgeSec: sanitizeNumber(next.maxTradeAgeSec, current.maxTradeAgeSec, 5, 86400),
+    maxAdverseEntryMoveCents: sanitizeNumber(next.maxAdverseEntryMoveCents, current.maxAdverseEntryMoveCents, 0, 100),
+    liveMaxCopyTradeAgeSec: sanitizeNumber(next.liveMaxCopyTradeAgeSec, current.liveMaxCopyTradeAgeSec, 5, 300),
+    exitWhenLeaderNoLongerHolds:
+      typeof next.exitWhenLeaderNoLongerHolds === "boolean" ? next.exitWhenLeaderNoLongerHolds : current.exitWhenLeaderNoLongerHolds,
     traderRefreshIntervalMin: sanitizeNumber(next.traderRefreshIntervalMin, current.traderRefreshIntervalMin, 1, 1440),
     maxCopiesPerWalletPerCycle: Math.round(sanitizeNumber(next.maxCopiesPerWalletPerCycle, current.maxCopiesPerWalletPerCycle, 0, 1000)),
     maxExposurePerWalletPercent: sanitizeNumber(next.maxExposurePerWalletPercent, current.maxExposurePerWalletPercent, 0, 100),
@@ -281,25 +297,67 @@ type CostExtra = Pick<
   "effectivePrice" | "referencePrice" | "feeUsd" | "frictionUsd" | "fillStatus" | "costSource"
 >;
 
-/** Source of a non-copy exit (session liquidation, auto-exit rule, or panic). */
-type ExitSource = "session-close" | "auto-exit" | "panic-flatten" | "manual-flatten";
+/** Source of a non-copy exit (session liquidation, auto-exit rule, leader-exit, or panic). */
+type ExitSource = "session-close" | "auto-exit" | "panic-flatten" | "manual-flatten" | "leader-exit";
+
+/**
+ * Outcome of a flatten / sell-all pass.
+ *  - `closed`: positions fully (or partially) sold this pass;
+ *  - `failed`: positions whose live SELL was rejected/errored and were kept;
+ *  - `skipped`: positions intentionally left (manual/unknown or resolved/auto-redeeming).
+ */
+interface FlattenResult {
+  closed: number;
+  proceedsUsd: number;
+  realizedPnlUsd: number;
+  failed: number;
+  skipped: number;
+}
 
 function messageFromUnknown(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Live-data integrity gate for a leader-exit SELL. Selling is allowed during
+ * panic / daily-loss lockout (those block BUYs, not exits), but NOT while live
+ * data is untrustworthy: no/failed live-position snapshot, a stale snapshot, or
+ * any unmatched/errored live order. Returns ok:false with a reason otherwise.
+ */
+function liveExitHealth(
+  snapshot: LivePositionReconciliation | null,
+  trades: CopyTradeRecord[],
+  now: number,
+): { ok: boolean; reason: string } {
+  if (!snapshot || !snapshot.ok) return { ok: false, reason: "live positions not reconciled" };
+  if (now - snapshot.fetchedAt > config.livePositionsStaleSeconds * 1000) {
+    return { ok: false, reason: "live position snapshot is stale" };
+  }
+  const blocked = trades.some(
+    (t) =>
+      t.mode === "real" &&
+      t.status === "copied" &&
+      (t.reconciliationStatus === "unmatched" || t.reconciliationStatus === "error"),
+  );
+  if (blocked) return { ok: false, reason: "unmatched/errored live orders present" };
+  return { ok: true, reason: "" };
+}
+
 function reconcileLiveBalanceMetrics(settings: BotSettings, metrics: BotMetrics, liveBalance: LiveUsdcBalance): BotMetrics {
-  const localTrackedEquity = metrics.equityUsd;
-  const balanceDifference = liveBalance.usdcBalance - localTrackedEquity;
-  const liveStrategySize = calculateNextTradeSize(settings, liveBalance.usdcBalance);
-  const liveNextTradeSizeUsd = Math.min(liveStrategySize, config.liveMaxOrderUsd, liveBalance.usdcBalance);
+  const liveCashUsd = liveBalance.usdcBalance;
+  const liveEquityUsd = liveCashUsd + metrics.totalExposureUsd;
+  const balanceDifference = liveEquityUsd - metrics.localTrackedEquity;
+  const liveStrategySize = calculateNextTradeSize(settings, liveCashUsd);
+  const liveNextTradeSizeUsd = Math.min(liveStrategySize, config.liveMaxOrderUsd, Math.max(0, liveCashUsd));
 
   return {
     ...metrics,
-    availableBalanceUsd: liveBalance.usdcBalance,
+    cashUsd: liveCashUsd,
+    availableBalanceUsd: Math.max(0, liveCashUsd),
+    equityUsd: liveEquityUsd,
+    cashUsdAuthoritative: liveCashUsd,
     nextTradeSizeUsd: liveNextTradeSizeUsd,
-    liveUsdcBalance: liveBalance.usdcBalance,
-    localTrackedEquity,
+    liveUsdcBalance: liveCashUsd,
     balanceDifference,
     lastLiveBalanceCheck: liveBalance.updatedAt,
     liveBalanceStatus: Math.abs(balanceDifference) > config.liveBalanceWarningThresholdUsd ? "warning" : "ok",
@@ -307,30 +365,48 @@ function reconcileLiveBalanceMetrics(settings: BotSettings, metrics: BotMetrics,
   };
 }
 
-async function buildStatusMetrics(settings: BotSettings, metrics: BotMetrics): Promise<BotMetrics> {
-  if (settings.mode !== "real") return metrics;
+async function buildStatusMetrics(settings: BotSettings, metrics: BotMetrics, knownBalance?: LiveUsdcBalance | null): Promise<BotMetrics> {
+  // Show live balance info in both real and simulation mode so sim acts as a
+  // live-mode preview. A funder address is enough for read-only pUSD balance.
+  if (!config.livePrivateKey.trim() && !config.liveFunderAddress.trim()) {
+    return settings.mode === "real"
+      ? {
+          ...metrics,
+          liveBalanceStatus: "error",
+          liveBalanceError: "Live balance unavailable: set POLYMARKET_PRIVATE_KEY or POLYMARKET_FUNDER_ADDRESS.",
+        }
+      : metrics;
+  }
 
-  if (!config.enableRealTrading || !config.livePrivateKey.trim()) {
+  if (settings.mode === "real" && !config.enableRealTrading) {
     return {
       ...metrics,
-      localTrackedEquity: metrics.equityUsd,
       liveBalanceStatus: "error",
       liveBalanceError: "Live balance unavailable: real trading is not fully configured.",
     };
   }
 
   try {
-    return reconcileLiveBalanceMetrics(settings, metrics, await getLiveUsdcBalance());
+    const lb = knownBalance ?? await getLiveUsdcBalance();
+    return reconcileLiveBalanceMetrics(settings, metrics, lb);
   } catch (err) {
+    if (err instanceof PusdBalanceUnavailableError) {
+      return {
+        ...metrics,
+        liveBalanceStatus: settings.mode === "real" ? "error" : "unknown",
+        liveBalanceError:
+          settings.mode === "real"
+            ? "Live pUSD balance is unreadable; real trading is blocked until cash balance can be fetched."
+            : "pUSD live balance unavailable; simulation is using paper/local accounting.",
+      };
+    }
     return {
       ...metrics,
-      localTrackedEquity: metrics.equityUsd,
       liveBalanceStatus: "error",
       liveBalanceError: "Live balance unavailable: " + messageFromUnknown(err),
     };
   }
 }
-
 function fillToExtra(fill: FillResult): CostExtra {
   return {
     effectivePrice: fill.filledShares > 0 ? (fill.notionalUsd + fill.feeUsd) / fill.filledShares : undefined,
@@ -352,7 +428,7 @@ function makeRecord(
   reason: string,
   market: Market | null,
   now: number,
-  extra?: Partial<CostExtra>,
+  extra?: Partial<CopyTradeRecord>,
 ): CopyTradeRecord {
   return {
     id: recordId(now),
@@ -383,7 +459,7 @@ function makeRecord(
 
 /**
  * Build a simulated SELL record for an exit that is not driven by a followed
- * trader's trade — i.e. a session-close liquidation or an auto-exit rule firing.
+ * trader's trade ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â i.e. a session-close liquidation or an auto-exit rule firing.
  */
 function makeExitRecord(
   position: BotPosition,
@@ -422,9 +498,9 @@ function makeExitRecord(
 }
 
 /**
- * Build a simulated SELL record that realizes a position at market resolution —
+ * Build a simulated SELL record that realizes a position at market resolution ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
  * the winning outcome pays $1/share and the loser $0. Unlike a mark-priced exit
- * the settlement price is exact (not clamped to the 0.01–0.99 trading band), so
+ * the settlement price is exact (not clamped to the 0.01ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ0.99 trading band), so
  * cash credited and realized P&L reflect the true payout.
  */
 function makeSettlementRecord(
@@ -568,12 +644,24 @@ export class CopyBotEngine {
       loadLivePositions(),
       loadRedeemBook(),
     ]);
-    const built = buildMetrics(settings, state, positions, trades);
-    const statusMetrics = await buildStatusMetrics(settings, built.metrics);
+    // Fetch live balance so buildMetrics anchors equity to the real wallet in
+    // both real and sim mode (sim acts as a live-mode preview when key is set).
+    let statusLiveBalance: LiveUsdcBalance | null = null;
+    if (config.livePrivateKey.trim() || config.liveFunderAddress.trim()) {
+      try { statusLiveBalance = await getLiveUsdcBalance(); } catch (err) {
+        if (!(err instanceof PusdBalanceUnavailableError)) {
+          await appendLog("error", "Live balance fetch failed: " + messageFromUnknown(err));
+        }
+      }
+    }
+    const built = buildMetrics(settings, state, positions, trades, Date.now(), statusLiveBalance?.usdcBalance);
+    const statusMetrics = await buildStatusMetrics(settings, built.metrics, statusLiveBalance);
     let statusState = built.state;
     if (
       statusState.peakEquityUsd !== state.peakEquityUsd ||
       statusState.dailyDate !== state.dailyDate ||
+      statusState.dailyStartEquityUsd !== state.dailyStartEquityUsd ||
+      statusState.dailyStartBotPnlUsd !== state.dailyStartBotPnlUsd ||
       statusState.dailyLossLockout !== state.dailyLossLockout
     ) {
       await saveBotState(statusState);
@@ -619,7 +707,7 @@ export class CopyBotEngine {
   }
 
   async start(): Promise<BotStatus> {
-    const settings = await loadSettings();
+    let settings = await loadSettings();
 
     // Refuse to start while a panic stop is latched. By default the operator must
     // explicitly clear it (manual resume); only when that guard is disabled do we
@@ -635,10 +723,11 @@ export class CopyBotEngine {
       await appendLog("warning", "Panic stop auto-cleared on Start (LIVE_REQUIRE_MANUAL_RESUME_AFTER_PANIC=false).");
     }
 
+    let startupLiveBalance: LiveUsdcBalance | null = null;
     if (settings.mode === "real") {
       try {
         assertLiveTradingAllowed();
-        await getLiveUsdcBalance({ forceRefresh: true });
+        startupLiveBalance = await getLiveUsdcBalance({ forceRefresh: true });
       } catch (err) {
         const reason = "Real trading start blocked: " + messageFromUnknown(err);
         await appendLog("error", reason);
@@ -652,6 +741,37 @@ export class CopyBotEngine {
 
     let state = await loadBotState(settings);
     const now = Date.now();
+    if (settings.mode === "real" && startupLiveBalance) {
+      const [positions, trades] = await Promise.all([loadPositions(), loadTrades()]);
+      const liveEquityUsd = startupLiveBalance.usdcBalance + totalExposure(positions);
+      const dailyStartBotPnlUsd = cumulativeBotPnlUsd(positions, trades);
+      // Tie the local startingBalance baseline to the live wallet so the operator
+      // never has to hand-edit it. Trade sizing is already driven off live cash;
+      // startingBalance only feeds the real-mode reserve floor (25% of it) and the
+      // ROI denominator, both of which are wrong if the seed default lingers while
+      // real cash differs. Resync here, consistent with the equity baselines below.
+      if (Math.abs(settings.startingBalance - liveEquityUsd) > 0.01) {
+        const prev = settings.startingBalance;
+        settings = sanitizeSettings(settings, { startingBalance: liveEquityUsd });
+        await saveSettings(settings);
+        await appendLog(
+          "info",
+          `Starting balance auto-synced to live wallet: $${prev.toFixed(2)} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ $${settings.startingBalance.toFixed(2)}.`,
+        );
+      }
+      state = {
+        ...state,
+        dailyDate: todayKey(now),
+        dailyStartEquityUsd: liveEquityUsd,
+        dailyStartBotPnlUsd,
+        peakEquityUsd: liveEquityUsd,
+        dailyLossLockout: false,
+      };
+      await appendLog(
+        "info",
+        `Real bankroll synced from live balance: cash $${startupLiveBalance.usdcBalance.toFixed(2)}, equity $${liveEquityUsd.toFixed(2)}.`,
+      );
+    }
     state = {
       ...state,
       runState: "running",
@@ -671,6 +791,11 @@ export class CopyBotEngine {
     return this.status();
   }
 
+  async forceDiscover(): Promise<BotStatus> {
+    await this.discover(true);
+    return this.status();
+  }
+
   async pause(): Promise<BotStatus> {
     this.clearTimer();
     const settings = await loadSettings();
@@ -683,12 +808,21 @@ export class CopyBotEngine {
   async stop(opts: { liquidate?: boolean; source?: ExitSource } = {}): Promise<BotStatus> {
     this.clearTimer();
     const settings = await loadSettings();
+    let liq: FlattenResult | null = null;
     if (opts.liquidate) {
-      await this.flatten(opts.source ?? "session-close");
+      liq = await this.flatten(opts.source ?? "session-close");
     }
     const state = await loadBotState(settings);
     await saveBotState({ ...state, runState: "stopped", stoppedAt: Date.now(), pausedAt: null, nextPollAt: null });
-    await appendLog("info", opts.liquidate ? "Bot stopped and open positions liquidated." : "Bot stopped.");
+    await appendLog(
+      "info",
+      liq
+        ? `Bot stopped. Sell-all: ${liq.closed} closed` +
+            (liq.failed ? `, ${liq.failed} failed (kept for retry)` : "") +
+            (liq.skipped ? `, ${liq.skipped} left (manual/resolved)` : "") +
+            "."
+        : "Bot stopped.",
+    );
     return this.status();
   }
 
@@ -734,7 +868,7 @@ export class CopyBotEngine {
   }
 
   /**
-   * Clear a latched panic stop. Leaves the bot stopped — the operator must Start
+   * Clear a latched panic stop. Leaves the bot stopped ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the operator must Start
    * again deliberately. Does not place any order.
    */
   async resumeFromPanic(): Promise<BotStatus> {
@@ -755,18 +889,45 @@ export class CopyBotEngine {
    * the bot is stopped or paused.
    */
   async refreshMarks(): Promise<BotStatus> {
+    const settings = await loadSettings();
+
+    // Real mode: re-sync against the authoritative live account FIRST, so any
+    // position closed manually on Polymarket (or settled / redeemed) is dropped
+    // from the local ledger and exposure reflects reality. This is the on-demand
+    // counterpart of the per-poll reconciliation, so the book stays correct even
+    // while the bot is stopped. Read-only ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â it never places an order, and it logs
+    // (rather than throws) on a live-data error so stale positions aren't wiped on
+    // a transient blip.
+    if (settings.mode === "real") {
+      await this.reconcileLivePositionsState("refresh-marks");
+    }
+
     let positions = await loadPositions();
     if (positions.length > 0) {
-      const settings = await loadSettings();
       positions = await this.refreshMarkPrices(positions);
       // Settle any market that resolved since the last refresh (simulation only).
       if (settings.mode === "simulation") {
         positions = (await this.settleResolvedPositions(positions)).positions;
       }
       await savePositions(positions);
+    }
+
+    // Recompute equity/metrics ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â also when reconciliation just emptied the book ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
+    // so a flat account shows zero exposure and the freed cash immediately.
+    if (settings.mode === "real" || positions.length > 0) {
       const state = await loadBotState(settings);
       const trades = await loadTrades();
-      const metrics = buildMetrics(settings, state, positions, trades);
+      let liveBalance: LiveUsdcBalance | null = null;
+      if (settings.mode === "real") {
+        try {
+          liveBalance = await getLiveUsdcBalance({ forceRefresh: true });
+        } catch (err) {
+          const reason = "Refresh marks blocked: could not fetch live balance: " + messageFromUnknown(err);
+          await appendLog("error", reason);
+          throw new Error(reason);
+        }
+      }
+      const metrics = buildMetrics(settings, state, positions, trades, Date.now(), liveBalance?.usdcBalance);
       await saveBotState({ ...metrics.state, lastError: null });
       await appendEquityPoint({
         ts: Date.now(),
@@ -790,30 +951,49 @@ export class CopyBotEngine {
     this.lastHeartbeatLogAt = 0;
     const settings = await loadSettings();
     const now = Date.now();
+    let resetCashUsd = settings.startingBalance;
+    let resetMessage = `Simulation reset: bankroll back to $${settings.startingBalance.toFixed(2)}; positions, trades, and equity curve cleared.`;
+    if (settings.mode === "real") {
+      try {
+        const liveBalance = await getLiveUsdcBalance({ forceRefresh: true });
+        resetCashUsd = liveBalance.usdcBalance;
+        resetMessage = `Real-mode local ledger reset: bankroll synced to live cash $${resetCashUsd.toFixed(2)}; local positions, trades, and equity curve cleared.`;
+      } catch (err) {
+        const reason = "Real-mode reset blocked: could not fetch live balance: " + messageFromUnknown(err);
+        await appendLog("error", reason);
+        throw new Error(reason);
+      }
+    }
     await savePositions([]);
     await saveTrades([]);
     await saveSeenTrades({ ids: [] });
     await saveLivePositions(null);
     await saveEquityCurve([
-      { ts: now, equityUsd: settings.startingBalance, cashUsd: settings.startingBalance, exposureUsd: 0 },
+      { ts: now, equityUsd: resetCashUsd, cashUsd: resetCashUsd, exposureUsd: 0 },
     ]);
-    await saveBotState(createInitialBotState(settings.startingBalance, now));
+    await saveBotState(createInitialBotState(resetCashUsd, now));
     await clearLogs();
-    await appendLog(
-      "info",
-      `Simulation reset: bankroll back to ${settings.startingBalance.toFixed(2)} USD; positions, trades, and equity curve cleared.`,
-    );
+    await appendLog("info", resetMessage);
     return this.status();
   }
 
   /**
-   * Sell every open position at its current (refreshed) mark price, recording a
-   * simulated SELL per position and clearing the book. Used by session-only
-   * liquidation and the "Sell all now" stop option. Does not change runState.
+   * Sell every open position. Used by session-only liquidation, the Stop modal,
+   * panic-flatten, and the "Sell all now" option. Does not change runState.
+   *
+   * Real mode places live CLOB market SELL orders and only drops positions that
+   * actually fill (see {@link flattenLive}); simulation books a mark-priced SELL
+   * per position and clears the book ({@link flattenSimulated}).
    */
-  async flatten(source: ExitSource = "session-close"): Promise<{ closed: number; proceedsUsd: number; realizedPnlUsd: number }> {
+  async flatten(source: ExitSource = "session-close"): Promise<FlattenResult> {
+    const settings = await loadSettings();
+    return settings.mode === "real" ? this.flattenLive(source) : this.flattenSimulated(source);
+  }
+
+  /** Paper liquidation: mark-priced simulated SELL per position, then clear the book. */
+  private async flattenSimulated(source: ExitSource): Promise<FlattenResult> {
     let positions = await loadPositions();
-    if (positions.length === 0) return { closed: 0, proceedsUsd: 0, realizedPnlUsd: 0 };
+    if (positions.length === 0) return { closed: 0, proceedsUsd: 0, realizedPnlUsd: 0, failed: 0, skipped: 0 };
 
     positions = await this.refreshMarkPrices(positions);
     const now = Date.now();
@@ -861,7 +1041,179 @@ export class CopyBotEngine {
       "info",
       `Liquidated ${closed} position(s) for ${proceedsUsd.toFixed(2)} USD (realized ${realizedPnlUsd >= 0 ? "+" : ""}${realizedPnlUsd.toFixed(2)}).`,
     );
-    return { closed, proceedsUsd, realizedPnlUsd };
+    return { closed, proceedsUsd, realizedPnlUsd, failed: 0, skipped: 0 };
+  }
+
+  /**
+   * Real-money liquidation. Places live CLOB market SELL orders for every
+   * bot-opened, still-tradeable position and only removes the ones that actually
+   * fill. A position is LEFT in the book (and logged) when:
+   *   - it is a manual/unknown live position (no source attribution) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â not the
+   *     bot's to close;
+   *   - its market has already resolved ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â resolved positions have no order book
+   *     and Polymarket auto-redeems them to cash on settlement, so we never fake
+   *     a CLOB sale for them;
+   *   - the live SELL fails or only partially fills ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the remainder is kept so the
+   *     next start/poll retries it instead of being silently dropped.
+   *
+   * Crucially, this never clears the book blindly: only confirmed fills reduce a
+   * position, so a failed sell can never make an open on-chain position vanish
+   * from local tracking.
+   */
+  private async flattenLive(source: ExitSource): Promise<FlattenResult> {
+    const empty: FlattenResult = { closed: 0, proceedsUsd: 0, realizedPnlUsd: 0, failed: 0, skipped: 0 };
+    try {
+      assertLiveTradingAllowed();
+    } catch (err) {
+      await appendLog("error", `Sell-all blocked: live trading is not allowed: ${messageFromUnknown(err)}. Positions left untouched.`);
+      return empty;
+    }
+
+    // Reconcile against authoritative on-chain positions so we sell what is really
+    // held (not a stale local book), then snapshot which positions are resolved /
+    // redeemable (no order book ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â they auto-redeem and must not be CLOB-sold).
+    await this.reconcileLivePositionsState("flatten");
+    let positions = await loadPositions();
+    if (positions.length === 0) return empty;
+
+    const snapshot = await loadLivePositions();
+    const redeemableTokens = new Set((snapshot?.entries ?? []).filter((e) => e.redeemable).map((e) => e.tokenId));
+
+    positions = await this.refreshMarkPrices(positions);
+    const now = Date.now();
+    const DUST = 1e-6;
+    const survivors: BotPosition[] = [];
+    let proceedsUsd = 0;
+    let realizedPnlUsd = 0;
+    let closed = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    for (const position of positions) {
+      if (position.shares <= DUST) continue;
+
+      // Only the bot closes positions it opened. Manual / pre-existing live
+      // positions (no source wallet) are left for the operator to manage.
+      if (position.sourceWallets.length === 0) {
+        survivors.push(position);
+        skipped += 1;
+        continue;
+      }
+      // Resolved markets auto-redeem to cash ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â don't try (and fail) to sell them.
+      if (redeemableTokens.has(position.tokenId)) {
+        survivors.push(position);
+        skipped += 1;
+        await appendLog(
+          "info",
+          `Sell-all: ${position.outcome} (${position.marketTitle}) is resolved; leaving it to auto-redeem to cash.`,
+        );
+        continue;
+      }
+
+      const price = clampPrice(position.markPrice);
+      const sellSize = resolveLiveSellSize({
+        position,
+        requestedShares: position.shares,
+        snapshot,
+        now,
+        maxSnapshotAgeMs: config.livePositionsStaleSeconds * 1000,
+      });
+      if (!sellSize.ok) {
+        failed += 1;
+        survivors.push(position);
+        await appendLog(
+          "error",
+          `Sell-all SELL blocked for ${position.outcome} (${position.marketTitle}): ${sellSize.reason}. Position kept for retry.`,
+        );
+        continue;
+      }
+      if (sellSize.note) {
+        await appendLog("warning", `Sell-all adjusted ${position.outcome}: ${sellSize.note}.`);
+      }
+      const bookPosition = { ...position, shares: sellSize.bookSharesBeforeSell };
+      try {
+        const res = await placeLiveMarketOrder({
+          tokenId: position.tokenId,
+          side: "SELL",
+          shares: sellSize.shares,
+          referencePrice: price,
+        });
+        clearLiveBalanceCache();
+        if (!res.success || res.filledShares <= 0) {
+          failed += 1;
+          survivors.push(bookPosition);
+          await appendLog(
+            "error",
+            `Sell-all SELL rejected for ${position.outcome} (${position.marketTitle}): ${res.error ?? "unknown error"}. Position kept for retry.`,
+          );
+          continue;
+        }
+        const realized = (res.effectivePrice - bookPosition.avgPrice) * res.filledShares;
+        proceedsUsd += res.notionalUsd;
+        realizedPnlUsd += realized;
+        closed += 1;
+        const record = makeExitRecord(
+          bookPosition,
+          res.effectivePrice,
+          res.filledShares,
+          res.notionalUsd,
+          realized,
+          `LIVE sell-all: ${res.filledShares.toFixed(2)} ${position.outcome} @ ${(res.effectivePrice * 100).toFixed(1)}c (${source}) - order ${res.orderId ?? "?"}.`,
+          source,
+          now,
+        );
+        record.mode = "real";
+        record.status = "copied";
+        record.txOrOrderId = res.orderId ?? "";
+        record.reconciliationStatus = "pending";
+        await prependTrade(record);
+
+        // Keep any real unfilled remainder so the next session retries it.
+        const remainder = Math.max(0, sellSize.bookSharesBeforeSell - res.filledShares);
+        if (remainder > LIVE_SELL_DUST) {
+          survivors.push({ ...bookPosition, shares: remainder, markPrice: clampPrice(res.effectivePrice), updatedAt: now });
+          await appendLog(
+            "warning",
+            `Sell-all only partially filled ${position.outcome}: sold ${formatLiveSellShares(res.filledShares)} of ${formatLiveSellShares(sellSize.bookSharesBeforeSell)}; ${formatLiveSellShares(remainder)} kept.`,
+          );
+        }
+      } catch (err) {
+        clearLiveBalanceCache();
+        failed += 1;
+        survivors.push(bookPosition);
+        await appendLog(
+          "error",
+          `Sell-all SELL failed for ${position.outcome} (${position.marketTitle}): ${messageFromUnknown(err)}. Position kept for retry.`,
+        );
+      }
+    }
+
+    await savePositions(survivors);
+
+    // Recompute equity/cash from the authoritative live balance after selling.
+    const settings = await loadSettings();
+    const state = await loadBotState(settings);
+    const trades = await loadTrades();
+    let liveBalance: LiveUsdcBalance | null = null;
+    try {
+      liveBalance = await getLiveUsdcBalance({ forceRefresh: true });
+    } catch (err) {
+      await appendLog("warning", `Sell-all completed but live balance refresh failed: ${messageFromUnknown(err)}.`);
+    }
+    const metrics = buildMetrics(settings, state, survivors, trades, Date.now(), liveBalance?.usdcBalance);
+    await saveBotState({ ...metrics.state, lastError: null });
+    await appendEquityPoint({
+      ts: Date.now(),
+      equityUsd: metrics.metrics.equityUsd,
+      cashUsd: metrics.metrics.cashUsd,
+      exposureUsd: metrics.metrics.totalExposureUsd,
+    });
+    await appendLog(
+      failed > 0 ? "warning" : "info",
+      `LIVE sell-all (${source}): sold ${closed} position(s) for $${proceedsUsd.toFixed(2)} ` +
+        `(realized ${realizedPnlUsd >= 0 ? "+" : ""}${realizedPnlUsd.toFixed(2)}); ${failed} failed (kept), ${skipped} left (manual/resolved).`,
+    );
+    return { closed, proceedsUsd, realizedPnlUsd, failed, skipped };
   }
 
   /**
@@ -935,7 +1287,7 @@ export class CopyBotEngine {
 
   /**
    * Simulation settlement: realize any open position whose market has resolved.
-   * The winning outcome pays $1/share and the loser $0 — we book a settlement
+   * The winning outcome pays $1/share and the loser $0 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â we book a settlement
    * SELL (crediting cash with the payout and realizing P&L against cost basis)
    * and drop the position from the book. Positions whose markets are not yet
    * resolved, or whose payout can't be determined this poll, are left untouched
@@ -1212,7 +1564,7 @@ export class CopyBotEngine {
 
   /**
    * Read-only redeemable plan for the dashboard/API. Uses the last persisted live
-   * snapshot (reconciled on poll/startup) — never trades and never hits the chain.
+   * snapshot (reconciled on poll/startup) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â never trades and never hits the chain.
    * Empty (no error) in simulation, where resolved positions settle automatically.
    */
   async redeemablePlan(): Promise<RedeemablePlan> {
@@ -1288,7 +1640,7 @@ export class CopyBotEngine {
     const redeemedTokens: string[] = [];
 
     for (const item of plan.items) {
-      // Skip positions the bot can't redeem itself (proxy/safe/neg-risk) — they
+      // Skip positions the bot can't redeem itself (proxy/safe/neg-risk) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â they
       // stay surfaced for manual redemption on Polymarket.
       if (item.blockedReason) {
         skipped += 1;
@@ -1334,7 +1686,7 @@ export class CopyBotEngine {
       totalPayoutUsd += payoutUsd;
       await appendLog(
         "info",
-        `Redeemed ${item.outcome} (${item.marketTitle}): ${item.shares.toFixed(2)} share(s) → $${payoutUsd.toFixed(2)}${result.txHash ? ` [tx ${result.txHash.slice(0, 10)}…]` : ""}.`,
+        `Redeemed ${item.outcome} (${item.marketTitle}): ${item.shares.toFixed(2)} share(s) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ $${payoutUsd.toFixed(2)}${result.txHash ? ` [tx ${result.txHash.slice(0, 10)}ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦]` : ""}.`,
       );
     }
 
@@ -1428,6 +1780,7 @@ export class CopyBotEngine {
       state = await loadBotState(settings);
       if (state.runState !== "running") return;
       const traders = await loadTraders();
+      const traderByWallet = new Map(traders.map((t) => [t.wallet.toLowerCase(), t]));
       const wallets = enabledWallets(traders, MAX_WALLETS_PER_POLL);
       const now = Date.now();
       state = {
@@ -1476,7 +1829,8 @@ export class CopyBotEngine {
           pausedBuyCount += 1;
           continue;
         }
-        const result = await this.processTrade(trade, settings, state, positions, walletCycleCopies);
+        const trader = traderByWallet.get(trade.wallet.toLowerCase()) ?? null;
+        const result = await this.processTrade(trade, settings, state, positions, walletCycleCopies, trader);
         positions = result.positions;
         await prependTrade(result.record);
         processedCount += 1;
@@ -1502,7 +1856,7 @@ export class CopyBotEngine {
       for (const bucket of skipBuckets.values()) {
         await appendLog(
           bucket.level,
-          bucket.count > 1 ? `${bucket.reason} (×${bucket.count} this cycle)` : bucket.reason,
+          bucket.count > 1 ? `${bucket.reason} (ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â${bucket.count} this cycle)` : bucket.reason,
         );
       }
 
@@ -1532,6 +1886,13 @@ export class CopyBotEngine {
         positions = (await this.settleResolvedPositions(positions)).positions;
       }
 
+      // Leader-holdings reconciliation: annotate whether each copied position's
+      // source leader still holds it, and (when enabled) exit positions the leader
+      // has left. Runs in both modes; the real-mode sale is safety-gated.
+      if (positions.length > 0) {
+        positions = await this.reconcileAndExitLeaders(settings, positions);
+      }
+
       // Fully-automatic live exits: in real mode, sell any position that has hit
       // the configured take-profit / stop-loss / max-hold on this poll.
       if (settings.mode === "real" && positions.length > 0) {
@@ -1559,10 +1920,20 @@ export class CopyBotEngine {
       await this.refreshCopyScores();
 
       const trades = await loadTrades();
-      const metrics = buildMetrics(settings, state, positions, trades);
+      let loopLiveBalance: LiveUsdcBalance | null = null;
+      if (config.livePrivateKey.trim() || config.liveFunderAddress.trim()) {
+        try {
+          loopLiveBalance = await getLiveUsdcBalance({ forceRefresh: settings.mode === "real" });
+        } catch (err) {
+          if (settings.mode === "real") {
+            throw new Error("Live balance fetch failed during poll metrics: " + messageFromUnknown(err));
+          }
+        }
+      }
+      const metrics = buildMetrics(settings, state, positions, trades, Date.now(), loopLiveBalance?.usdcBalance);
       await saveBotState({ ...metrics.state, lastError: null });
       if (!state.dailyLossLockout && metrics.state.dailyLossLockout) {
-        await appendLog("warning", "Daily loss limit hit. BUYs disabled until next session/day.");
+        await appendLog("warning", "Bot daily loss limit hit. BUYs disabled until next session/day.");
       }
       await appendEquityPoint({
         ts: Date.now(),
@@ -1600,44 +1971,61 @@ export class CopyBotEngine {
       return;
     }
 
-    positions = await this.refreshMarkPrices(positions);
-    const tp = settings.autoExitTakeProfitPercent;
-    const sl = settings.autoExitStopLossPercent;
-    const maxHoldMs = settings.autoExitMaxHoldMinutes * 60 * 1000;
-
-    const remaining: BotPosition[] = [];
-    let exits = 0;
-    for (const position of positions) {
-      const price = clampPrice(position.markPrice);
-      const costBasis = position.avgPrice * position.shares;
-      const pnl = (price - position.avgPrice) * position.shares;
-      const pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
-      const heldMs = now - position.openedAt;
-
-      let exitReason: string | null = null;
-      if (tp > 0 && pnlPct >= tp) exitReason = `take-profit ${pnlPct.toFixed(1)}% >= ${tp}%`;
-      else if (sl > 0 && pnlPct <= -sl) exitReason = `stop-loss ${pnlPct.toFixed(1)}% <= -${sl}%`;
-      else if (maxHoldMs > 0 && heldMs >= maxHoldMs)
-        exitReason = `max-hold ${Math.floor(heldMs / 60000)}m >= ${settings.autoExitMaxHoldMinutes}m`;
-
-      if (!exitReason) {
-        remaining.push(position);
-        continue;
+    let remaining: BotPosition[];
+    let liveBalance: LiveUsdcBalance | null = null;
+    if (settings.mode === "real") {
+      // Real-mode drain: reconcile authoritative positions, then place LIVE SELL
+      // orders for any that breach a rule. liveAutoExit logs per position and
+      // keeps a position whose sell fails so the next drain tick retries it.
+      await this.reconcileLivePositionsState("drain");
+      positions = await this.refreshMarkPrices(await loadPositions());
+      remaining = await this.liveAutoExit(settings, positions);
+      try {
+        liveBalance = await getLiveUsdcBalance({ forceRefresh: true });
+      } catch {
+        // Keep prior accounting if the balance read fails.
       }
+    } else {
+      positions = await this.refreshMarkPrices(positions);
+      const tp = settings.autoExitTakeProfitPercent;
+      const sl = settings.autoExitStopLossPercent;
+      const maxHoldMs = settings.autoExitMaxHoldMinutes * 60 * 1000;
 
-      const shares = position.shares;
-      const copyAmountUsd = shares * price;
-      await prependTrade(
-        makeExitRecord(position, price, shares, copyAmountUsd, pnl, `Auto-exit: ${exitReason}.`, "auto-exit", now),
-      );
-      exits += 1;
+      remaining = [];
+      let exits = 0;
+      for (const position of positions) {
+        const price = clampPrice(position.markPrice);
+        const costBasis = position.avgPrice * position.shares;
+        const pnl = (price - position.avgPrice) * position.shares;
+        const pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+        const heldMs = now - position.openedAt;
+
+        let exitReason: string | null = null;
+        if (tp > 0 && pnlPct >= tp) exitReason = `take-profit ${pnlPct.toFixed(1)}% >= ${tp}%`;
+        else if (sl > 0 && pnlPct <= -sl) exitReason = `stop-loss ${pnlPct.toFixed(1)}% <= -${sl}%`;
+        else if (maxHoldMs > 0 && heldMs >= maxHoldMs)
+          exitReason = `max-hold ${Math.floor(heldMs / 60000)}m >= ${settings.autoExitMaxHoldMinutes}m`;
+
+        if (!exitReason) {
+          remaining.push(position);
+          continue;
+        }
+
+        const shares = position.shares;
+        const copyAmountUsd = shares * price;
+        await prependTrade(
+          makeExitRecord(position, price, shares, copyAmountUsd, pnl, `Auto-exit: ${exitReason}.`, "auto-exit", now),
+        );
+        exits += 1;
+      }
+      if (exits > 0) await appendLog("info", `Auto-exit sold ${exits} position(s); ${remaining.length} remaining.`);
     }
 
     await savePositions(remaining);
 
     const allClosed = remaining.length === 0;
     const trades = await loadTrades();
-    const metrics = buildMetrics(settings, state, remaining, trades);
+    const metrics = buildMetrics(settings, state, remaining, trades, Date.now(), liveBalance?.usdcBalance);
     await saveBotState({
       ...metrics.state,
       runState: allClosed ? "stopped" : "draining",
@@ -1653,7 +2041,6 @@ export class CopyBotEngine {
       exposureUsd: metrics.metrics.totalExposureUsd,
     });
 
-    if (exits > 0) await appendLog("info", `Auto-exit sold ${exits} position(s); ${remaining.length} remaining.`);
     if (allClosed) await appendLog("info", "Auto-exit complete: all positions closed. Bot stopped.");
   }
 
@@ -1671,9 +2058,10 @@ export class CopyBotEngine {
     market: Market | null,
     positions: BotPosition[],
     now: number,
+    buyEdge: Partial<CopyTradeRecord> = {},
   ): Promise<{ record: CopyTradeRecord; positions: BotPosition[] }> {
     const fail = (reason: string): { record: CopyTradeRecord; positions: BotPosition[] } => ({
-      record: makeRecord(trade, "failed", "real", requestedAmountUsd, 0, 0, reason, market, now),
+      record: makeRecord(trade, "failed", "real", requestedAmountUsd, 0, 0, reason, market, now, buyEdge),
       positions,
     });
 
@@ -1684,7 +2072,7 @@ export class CopyBotEngine {
     }
 
     if (trade.side === "BUY") {
-      const usd = Math.min(requestedAmountUsd, config.liveMaxOrderUsd);
+      const usd = Math.max(CLOB_MIN_MARKET_BUY_USD, Math.min(requestedAmountUsd, config.liveMaxOrderUsd));
       if (!(usd > 0)) return fail("Real BUY skipped: order size resolved to zero.");
       const refPrice = clampPrice(market?.bestAsk ?? market?.midpoint ?? trade.price);
       try {
@@ -1704,9 +2092,10 @@ export class CopyBotEngine {
           res.notionalUsd,
           res.filledShares,
           0,
-          `LIVE BUY $${res.notionalUsd.toFixed(2)} (~${res.filledShares.toFixed(2)} sh @ ${(res.effectivePrice * 100).toFixed(1)}c) following ${trade.traderName} — order ${res.orderId ?? "?"} [${res.status ?? "posted"}].`,
+          `LIVE BUY $${res.notionalUsd.toFixed(2)} (~${res.filledShares.toFixed(2)} sh @ ${(res.effectivePrice * 100).toFixed(1)}c) following ${trade.traderName} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â order ${res.orderId ?? "?"} [${res.status ?? "posted"}].`,
           market,
           now,
+          buyEdge,
         );
         record.txOrOrderId = res.orderId ?? "";
         record.reconciliationStatus = "pending";
@@ -1717,11 +2106,11 @@ export class CopyBotEngine {
       }
     }
 
-    // SELL — only if we actually hold the token.
+    // SELL ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â only if we actually hold the token.
     const existing = positions.find((position) => position.tokenId === trade.tokenId);
     if (!existing || existing.shares <= 0) {
       return {
-        record: makeRecord(trade, "skipped", "real", 0, 0, 0, "Observed trader SELL, but no local copied position exists.", market, now),
+        record: makeRecord(trade, "skipped", "real", 0, 0, 0, `Observed trader SELL from ${trade.traderName}, but the bot never copied the original BUY (missed entry); nothing to sell.`, market, now),
         positions,
       };
     }
@@ -1744,19 +2133,33 @@ export class CopyBotEngine {
       };
     }
     const refPrice = clampPrice(market?.bestBid ?? market?.midpoint ?? trade.price);
-    const sharesToSell =
+    const requestedSellShares =
       settings.sellBehavior === "all" ? existing.shares : Math.min(existing.shares, requestedAmountUsd / refPrice);
-    if (!(sharesToSell > 0)) return fail("Skipped LIVE SELL: calculated sell size was zero.");
+    const snapshot = await loadLivePositions();
+    const sellSize = resolveLiveSellSize({
+      position: existing,
+      requestedShares: requestedSellShares,
+      snapshot,
+      now,
+      maxSnapshotAgeMs: config.livePositionsStaleSeconds * 1000,
+    });
+    if (!sellSize.ok) return fail(`Skipped LIVE SELL: ${sellSize.reason}.`);
+    if (sellSize.note) {
+      await appendLog("warning", `LIVE SELL adjusted for ${existing.outcome}: ${sellSize.note}.`);
+    }
+    const sellPositions = positions.map((position) =>
+      position.tokenId === existing.tokenId ? { ...position, shares: sellSize.bookSharesBeforeSell } : position,
+    );
     try {
       const res = await placeLiveMarketOrder({
         tokenId: trade.tokenId,
         side: "SELL",
-        shares: sharesToSell,
+        shares: sellSize.shares,
         referencePrice: refPrice,
       });
       clearLiveBalanceCache();
       if (!res.success) return fail(`Live SELL rejected: ${res.error ?? "unknown error"}.`);
-      const sold = applySell(positions, trade, res.filledShares, res.effectivePrice, 0, refPrice, now);
+      const sold = applySell(sellPositions, trade, res.filledShares, res.effectivePrice, 0, refPrice, now);
       const record = makeRecord(
         trade,
         "copied",
@@ -1764,7 +2167,7 @@ export class CopyBotEngine {
         sold.copyAmountUsd,
         sold.copiedShares,
         sold.realizedPnlUsd,
-        `LIVE SELL $${sold.copyAmountUsd.toFixed(2)} (${sold.copiedShares.toFixed(2)} sh @ ${(res.effectivePrice * 100).toFixed(1)}c) following ${trade.traderName} — order ${res.orderId ?? "?"} [${res.status ?? "posted"}].`,
+        `LIVE SELL $${sold.copyAmountUsd.toFixed(2)} (${formatLiveSellShares(sold.copiedShares)} sh @ ${(res.effectivePrice * 100).toFixed(1)}c) following ${trade.traderName} - order ${res.orderId ?? "?"} [${res.status ?? "posted"}].`,
         market,
         now,
       );
@@ -1797,6 +2200,7 @@ export class CopyBotEngine {
     }
 
     const now = Date.now();
+    const snapshot = await loadLivePositions();
     const remaining: BotPosition[] = [];
     for (const position of positions) {
       if (position.shares <= 0) continue;
@@ -1824,27 +2228,44 @@ export class CopyBotEngine {
         continue;
       }
 
+      const sellSize = resolveLiveSellSize({
+        position,
+        requestedShares: position.shares,
+        snapshot,
+        now,
+        maxSnapshotAgeMs: config.livePositionsStaleSeconds * 1000,
+      });
+      if (!sellSize.ok) {
+        await appendLog("error", `Live auto-exit SELL blocked for ${position.outcome}: ${sellSize.reason}. Keeping position.`);
+        remaining.push(position);
+        continue;
+      }
+      if (sellSize.note) {
+        await appendLog("warning", `Live auto-exit adjusted ${position.outcome}: ${sellSize.note}.`);
+      }
+      const bookPosition = { ...position, shares: sellSize.bookSharesBeforeSell };
+
       try {
         const res = await placeLiveMarketOrder({
           tokenId: position.tokenId,
           side: "SELL",
-          shares: position.shares,
+          shares: sellSize.shares,
           referencePrice: price,
         });
         clearLiveBalanceCache();
         if (!res.success) {
           await appendLog("error", `Live auto-exit SELL rejected for ${position.outcome}: ${res.error ?? "unknown"}. Keeping position.`);
-          remaining.push(position);
+          remaining.push(bookPosition);
           continue;
         }
-        const realized = (res.effectivePrice - position.avgPrice) * res.filledShares;
+        const realized = (res.effectivePrice - bookPosition.avgPrice) * res.filledShares;
         const record = makeExitRecord(
-          position,
+          bookPosition,
           res.effectivePrice,
           res.filledShares,
           res.notionalUsd,
           realized,
-          `LIVE auto-exit: ${exitReason} — order ${res.orderId ?? "?"}.`,
+          `LIVE auto-exit: ${exitReason} - order ${res.orderId ?? "?"}.`,
           "auto-exit",
           now,
         );
@@ -1853,14 +2274,184 @@ export class CopyBotEngine {
         record.txOrOrderId = res.orderId ?? "";
         record.reconciliationStatus = "pending";
         await prependTrade(record);
-        await appendLog("info", `Live auto-exit sold ${position.outcome}: ${exitReason}.`);
+        await appendLog("info", `Live auto-exit sold ${formatLiveSellShares(res.filledShares)} ${position.outcome}: ${exitReason}.`);
+
+        const remainder = Math.max(0, sellSize.bookSharesBeforeSell - res.filledShares);
+        if (remainder > LIVE_SELL_DUST) {
+          remaining.push({ ...bookPosition, shares: remainder, markPrice: clampPrice(res.effectivePrice), updatedAt: now });
+          await appendLog("warning", `Live auto-exit kept ${formatLiveSellShares(remainder)} ${position.outcome} after a partial fill.`);
+        }
       } catch (err) {
         clearLiveBalanceCache();
         await appendLog("error", `Live auto-exit SELL failed for ${position.outcome}: ${messageFromUnknown(err)}. Keeping position.`);
-        remaining.push(position);
+        remaining.push(bookPosition);
       }
     }
     return remaining;
+  }
+
+  /**
+   * Annotate copied positions with whether their source leader still holds the
+   * token, and ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â when exitWhenLeaderNoLongerHolds is on ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â exit positions the
+   * leader has clearly left. Bounded: only fetches positions for the source
+   * wallets of currently-open bot positions. Returns the surviving positions.
+   */
+  private async reconcileAndExitLeaders(settings: BotSettings, positions: BotPosition[]): Promise<BotPosition[]> {
+    const botOpened = positions.filter((p) => p.sourceWallets.length > 0 && p.shares > 0);
+    if (botOpened.length === 0) return positions;
+
+    const wallets = sourceWalletsOf(botOpened).slice(0, MAX_LEADER_HOLDINGS_WALLETS);
+    if (wallets.length === 0) return positions;
+
+    // Read-only fetch of each leader's current positions. A failed fetch becomes
+    // "no data" (ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ unknown), never a false "exited" that could trigger a sale.
+    const results = await Promise.all(
+      wallets.map(async (wallet) => {
+        try {
+          return { wallet, positions: await fetchUserPositions(wallet) };
+        } catch {
+          return { wallet, positions: null };
+        }
+      }),
+    );
+    const holdings = buildLeaderHoldings(results);
+    const now = Date.now();
+    let annotated = reconcileLeaderHoldings(positions, holdings, now);
+
+    if (!settings.exitWhenLeaderNoLongerHolds) return annotated;
+    const toExit = selectLeaderExitedPositions(annotated);
+    if (toExit.length === 0) return annotated;
+
+    annotated =
+      settings.mode === "real"
+        ? await this.exitLeaderExitedLive(annotated, toExit, now)
+        : await this.exitLeaderExitedSim(annotated, toExit, now);
+    return annotated;
+  }
+
+  /** Simulation leader-exit: sell each leader-exited position at its current mark. */
+  private async exitLeaderExitedSim(
+    positions: BotPosition[],
+    toExit: BotPosition[],
+    now: number,
+  ): Promise<BotPosition[]> {
+    const exitTokens = new Set(toExit.map((p) => p.tokenId));
+    const survivors: BotPosition[] = [];
+    for (const position of positions) {
+      if (!exitTokens.has(position.tokenId) || position.shares <= 0) {
+        survivors.push(position);
+        continue;
+      }
+      const price = clampPrice(position.markPrice);
+      const shares = position.shares;
+      const copyAmountUsd = shares * price;
+      const pnl = (price - position.avgPrice) * shares;
+      await prependTrade(
+        makeExitRecord(
+          position,
+          price,
+          shares,
+          copyAmountUsd,
+          pnl,
+          `Leader exited, flattening: sold ${shares.toFixed(2)} ${position.outcome} @ ${(price * 100).toFixed(1)}c (leader no longer holds).`,
+          "leader-exit",
+          now,
+        ),
+      );
+      await appendLog("info", `Leader exited ${position.outcome} (${position.marketTitle}); flattened copied position at mark.`);
+    }
+    return survivors;
+  }
+
+  /**
+   * Real-mode leader-exit: sell each leader-exited (bot-opened) position via a
+   * live CLOB SELL, but ONLY when live data is healthy (see liveExitHealth). A
+   * blocked or failed sell keeps the position and logs a distinct reason so the
+   * dashboard can show "leader exited but live sell blocked".
+   */
+  private async exitLeaderExitedLive(
+    positions: BotPosition[],
+    toExit: BotPosition[],
+    now: number,
+  ): Promise<BotPosition[]> {
+    const [snapshot, trades] = await Promise.all([loadLivePositions(), loadTrades()]);
+    const health = liveExitHealth(snapshot, trades, now);
+    const exitTokens = new Set(toExit.map((p) => p.tokenId));
+    const DUST = 1e-6;
+    const survivors: BotPosition[] = [];
+
+    for (const position of positions) {
+      if (!exitTokens.has(position.tokenId) || position.shares <= DUST) {
+        survivors.push(position);
+        continue;
+      }
+      if (!health.ok) {
+        survivors.push(position);
+        await appendLog(
+          "warning",
+          `Leader exited ${position.outcome} (${position.marketTitle}), but live sell is blocked: ${health.reason}. Keeping position.`,
+        );
+        continue;
+      }
+      const price = clampPrice(position.markPrice);
+      const sellSize = resolveLiveSellSize({
+        position,
+        requestedShares: position.shares,
+        snapshot,
+        now,
+        maxSnapshotAgeMs: config.livePositionsStaleSeconds * 1000,
+      });
+      if (!sellSize.ok) {
+        survivors.push(position);
+        await appendLog("error", `Leader-exit SELL blocked for ${position.outcome}: ${sellSize.reason}. Keeping position.`);
+        continue;
+      }
+      if (sellSize.note) {
+        await appendLog("warning", `Leader-exit adjusted ${position.outcome}: ${sellSize.note}.`);
+      }
+      const bookPosition = { ...position, shares: sellSize.bookSharesBeforeSell };
+      try {
+        const res = await placeLiveMarketOrder({
+          tokenId: position.tokenId,
+          side: "SELL",
+          shares: sellSize.shares,
+          referencePrice: price,
+        });
+        clearLiveBalanceCache();
+        if (!res.success || res.filledShares <= 0) {
+          survivors.push(bookPosition);
+          await appendLog("error", `Leader-exit SELL rejected for ${position.outcome}: ${res.error ?? "unknown"}. Keeping position.`);
+          continue;
+        }
+        const realized = (res.effectivePrice - bookPosition.avgPrice) * res.filledShares;
+        const record = makeExitRecord(
+          bookPosition,
+          res.effectivePrice,
+          res.filledShares,
+          res.notionalUsd,
+          realized,
+          `LIVE leader-exit: sold ${formatLiveSellShares(res.filledShares)} ${position.outcome} @ ${(res.effectivePrice * 100).toFixed(1)}c (leader no longer holds) - order ${res.orderId ?? "?"}.`,
+          "leader-exit",
+          now,
+        );
+        record.mode = "real";
+        record.status = "copied";
+        record.txOrOrderId = res.orderId ?? "";
+        record.reconciliationStatus = "pending";
+        await prependTrade(record);
+        await appendLog("info", `Leader exited ${position.outcome}; flattened copied position via live SELL.`);
+
+        const remainder = Math.max(0, sellSize.bookSharesBeforeSell - res.filledShares);
+        if (remainder > LIVE_SELL_DUST) {
+          survivors.push({ ...bookPosition, shares: remainder, markPrice: clampPrice(res.effectivePrice), updatedAt: now });
+        }
+      } catch (err) {
+        clearLiveBalanceCache();
+        survivors.push(bookPosition);
+        await appendLog("error", `Leader-exit SELL failed for ${position.outcome}: ${messageFromUnknown(err)}. Keeping position.`);
+      }
+    }
+    return survivors;
   }
 
   private async processTrade(
@@ -1869,6 +2460,7 @@ export class CopyBotEngine {
     state: BotState,
     positions: BotPosition[],
     walletCycleCopies: Map<string, number>,
+    trader: FollowedTrader | null = null,
   ): Promise<{ record: CopyTradeRecord; positions: BotPosition[] }> {
     const now = Date.now();
     const tradeAgeSec = Math.max(0, Math.floor(now / 1000) - trade.timestamp);
@@ -1886,20 +2478,34 @@ export class CopyBotEngine {
       .filter((position) => position.conditionId === trade.conditionId || position.tokenId === trade.tokenId)
       .reduce((sum, position) => sum + positionExposure(position), 0);
 
-    const skip = (reason: string) => ({
-      record: makeRecord(trade, "skipped", settings.mode, 0, 0, 0, reason, market, now),
+    // Edge metrics for copied BUYs ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â recorded on every BUY record (filled or
+    // skipped) so the dashboard can show leader vs bot price and the adverse move.
+    const adverse: AdverseEntry | null = trade.side === "BUY" ? evaluateAdverseEntry(settings, trade, market) : null;
+    const buyEdge: Partial<CopyTradeRecord> = adverse
+      ? {
+          leaderPrice: adverse.leaderPrice ?? undefined,
+          botExecPrice: adverse.botExecPrice ?? undefined,
+          adverseMoveCents: adverse.adverseMoveCents ?? undefined,
+        }
+      : {};
+
+    const skip = (reason: string, extra?: Partial<CopyTradeRecord>) => ({
+      record: makeRecord(trade, "skipped", settings.mode, 0, 0, 0, reason, market, now, { ...buyEdge, ...extra }),
       positions,
     });
-    const fail = (reason: string) => ({
-      record: makeRecord(trade, "failed", settings.mode, 0, 0, 0, reason, market, now),
+    const fail = (reason: string, extra?: Partial<CopyTradeRecord>) => ({
+      record: makeRecord(trade, "failed", settings.mode, 0, 0, 0, reason, market, now, { ...buyEdge, ...extra }),
       positions,
     });
 
-    const maxAgeSec = Math.min(settings.maxTradeAgeSec, MAX_COPY_TRADE_AGE_SEC);
+    // Freshness: hard 5-min absolute cap for all sides; real-mode BUYs honour the
+    // stricter live freshness window (effectiveMaxCopyAgeSec).
+    const maxAgeSec = effectiveMaxCopyAgeSec(settings, trade.side);
     if (tradeAgeSec > maxAgeSec) {
-      return skip(
-        "Skipped stale trade from " + trade.traderName + ": " + tradeAgeSec + "s old (max " + maxAgeSec + "s).",
-      );
+      if (settings.mode === "real" && trade.side === "BUY") {
+        return skip(`Skipped LIVE BUY: trade is ${tradeAgeSec}s old (live freshness max ${maxAgeSec}s).`);
+      }
+      return skip(`Skipped stale trade from ${trade.traderName}: ${tradeAgeSec}s old (max ${maxAgeSec}s).`);
     }
     if (trade.price <= 0 || trade.price >= 1 || trade.size <= 0) {
       return skip("Skipped malformed trade from " + trade.traderName + ".");
@@ -1912,7 +2518,11 @@ export class CopyBotEngine {
     const filterReason = buyMarketFilterReason(settings, trade, market);
     if (filterReason) return skip(filterReason);
 
-    // Per-copied-wallet controls (entries only — never block exits). These keep a
+    // Adverse-entry gate: don't chase a BUY whose price already ran past the
+    // leader's fill. Pure; missing/invalid prices don't trip it.
+    if (adverse?.reason) return skip(adverse.reason);
+
+    // Per-copied-wallet controls (entries only ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â never block exits). These keep a
     // single hot wallet from dominating the session regardless of global caps.
     if (trade.side === "BUY") {
       if (settings.maxCopiesPerWalletPerCycle > 0) {
@@ -1945,37 +2555,60 @@ export class CopyBotEngine {
     let availableBalanceUsd = localAvailableBalanceUsd;
     let equityUsd = localAvailableBalanceUsd + exposureUsd;
     let liveBalance: LiveUsdcBalance | null = null;
-    if (settings.mode === "real") {
+    if (config.livePrivateKey.trim() || config.liveFunderAddress.trim()) {
       try {
-        liveBalance = await getLiveUsdcBalance({ forceRefresh: true });
+        // Force-refresh in real mode; use cached value in sim to avoid extra network hits.
+        liveBalance = await getLiveUsdcBalance({ forceRefresh: settings.mode === "real" });
         availableBalanceUsd = liveBalance.usdcBalance;
         equityUsd = liveBalance.usdcBalance + exposureUsd;
       } catch (err) {
-        return fail("Real trade blocked: could not fetch live USDC balance: " + messageFromUnknown(err) + ".");
+        if (settings.mode === "real") {
+          return fail("Real trade blocked: could not fetch live USDC balance: " + messageFromUnknown(err) + ".");
+        }
+        // Sim mode: non-fatal, fall back to accounting model balance.
       }
+    } else if (settings.mode === "real") {
+      return fail("Real trade blocked: no live private key configured.");
     }
 
-    const strategyAmountUsd = calculateNextTradeSize(settings, availableBalanceUsd);
+    // Base sizing, then optional leader-conviction scaling for BUYs. Conviction
+    // only scales the base and is hard-clamped to maxTradeAmountUsd inside
+    // applyConvictionSizing; every other cap (live max order, exposure, available
+    // balance) is still enforced by the requestedAmountUsd clamp below.
+    const baseStrategyAmountUsd = calculateNextTradeSize(settings, availableBalanceUsd);
+    const strategyAmountUsd =
+      trade.side === "BUY" ? applyConvictionSizing(baseStrategyAmountUsd, trade, trader, settings) : baseStrategyAmountUsd;
     const perMarketCapUsd = dollarCapFromPercent(equityUsd, settings.maxExposurePerMarketPercent);
     const totalCapUsd = dollarCapFromPercent(equityUsd, settings.maxTotalExposurePercent);
     const dailyLossCapUsd = dollarCapFromPercent(state.dailyStartEquityUsd, settings.maxDailyLossPercent);
-    const dailyPnlUsd = equityUsd - state.dailyStartEquityUsd;
+    const dailyStartBotPnlUsd = Number.isFinite(state.dailyStartBotPnlUsd) ? state.dailyStartBotPnlUsd : 0;
+    const dailyPnlUsd = cumulativeBotPnlUsd(positions, priorTrades) - dailyStartBotPnlUsd;
     const remainingPerMarketUsd = Math.max(0, perMarketCapUsd - marketExposureUsd);
     const remainingTotalExposureUsd = Math.max(0, totalCapUsd - exposureUsd);
     const remainingAllowedExposureUsd = Math.min(remainingPerMarketUsd, remainingTotalExposureUsd);
+    // Apply the same order-size constraints in both modes so sim sizing matches live.
     const requestedAmountUsd =
-      settings.mode === "real" && trade.side === "BUY"
+      trade.side === "BUY"
         ? Math.min(strategyAmountUsd, availableBalanceUsd, config.liveMaxOrderUsd, remainingAllowedExposureUsd)
         : strategyAmountUsd;
 
     // Hard daily-loss lockout and panic stop: block NEW BUYs only. Exits (SELLs)
     // and flattening always remain allowed so positions can still be unwound.
-    if (trade.side === "BUY" && (state.panic || state.dailyLossLockout || dailyPnlUsd <= -dailyLossCapUsd)) {
+    const dailyLossCapInvalid = !Number.isFinite(settings.maxDailyLossPercent) || settings.maxDailyLossPercent <= 0;
+    const dailyLossBreached = !dailyLossCapInvalid && dailyLossCapUsd > 0 && dailyPnlUsd <= -dailyLossCapUsd;
+    if (trade.side === "BUY" && (state.panic || dailyLossCapInvalid || state.dailyLossLockout || dailyLossBreached)) {
       if (state.panic) {
         return skip("Skipped BUY: panic stop is engaged. New entries are disabled until panic is cleared.");
       }
+      if (dailyLossCapInvalid) {
+        return skip(
+          "Skipped BUY: daily loss cap is invalid (" +
+            settings.maxDailyLossPercent +
+            "% of bankroll). Set Daily loss cap above 0% to resume BUYs.",
+        );
+      }
       return skip(
-        "Skipped BUY: daily loss limit hit (" +
+        "Skipped BUY: bot daily loss limit hit (" +
           settings.maxDailyLossPercent +
           "% of bankroll). BUYs disabled until next session/day.",
       );
@@ -2013,23 +2646,10 @@ export class CopyBotEngine {
       return skip("Skipped LIVE BUY: total exposure cap " + settings.maxTotalExposurePercent + "% is already reached.");
     }
     if (trade.side === "BUY" && isBelowTradeMinimum(settings, requestedAmountUsd)) {
-      const reason =
-        settings.mode === "real" && liveBalance
-          ? "Skipped LIVE BUY: live-sized order $" +
-            requestedAmountUsd.toFixed(2) +
-            " is below min trade amount $" +
-            settings.minTradeAmountUsd.toFixed(2) +
-            " (live USDC $" +
-            liveBalance.usdcBalance.toFixed(2) +
-            ", LIVE_MAX_ORDER_USD $" +
-            config.liveMaxOrderUsd.toFixed(2) +
-            ")."
-          : "Skipped BUY: calculated " +
-            requestedAmountUsd.toFixed(2) +
-            " is below min trade amount " +
-            settings.minTradeAmountUsd.toFixed(2) +
-            ".";
-      return skip(reason);
+      return skip(
+        "Skipped BUY: order $" + requestedAmountUsd.toFixed(2) +
+        " is below the configured minimum $" + settings.minTradeAmountUsd.toFixed(2) + ".",
+      );
     }
     if (trade.side === "BUY" && availableBalanceUsd - requestedAmountUsd < settings.minAvailableBalanceUsd) {
       return skip(
@@ -2059,7 +2679,7 @@ export class CopyBotEngine {
 
 
     if (settings.mode === "real") {
-      return this.executeRealTrade(trade, settings, requestedAmountUsd, market, positions, now);
+      return this.executeRealTrade(trade, settings, requestedAmountUsd, market, positions, now, buyEdge);
     }
 
     const refPrice = clampPrice(trade.price);
@@ -2091,6 +2711,7 @@ export class CopyBotEngine {
             `Simulated BUY ${requestedAmountUsd.toFixed(2)} USD following ${trade.traderName} (idealized fill).`,
             market,
             now,
+            buyEdge,
           ),
         };
       }
@@ -2122,14 +2743,16 @@ export class CopyBotEngine {
           `Simulated BUY $${cashOut.toFixed(2)} (${fill.filledShares.toFixed(2)} sh @ ${(effPrice * 100).toFixed(1)}c, ${fill.note}, fee $${fill.feeUsd.toFixed(2)})${fill.status === "partial" ? " [partial]" : ""} following ${trade.traderName}.`,
           market,
           now,
-          fillToExtra(fill),
+          { ...fillToExtra(fill), ...buyEdge },
         ),
       };
     }
 
     // SELL
     const existing = positions.find((position) => position.tokenId === trade.tokenId);
-    if (!existing || existing.shares <= 0) return skip("Observed trader SELL, but no local copied position exists.");
+    if (!existing || existing.shares <= 0) {
+      return skip(`Observed trader SELL from ${trade.traderName}, but the bot never copied the original BUY (missed entry); nothing to sell.`);
+    }
     const sharesToSell =
       settings.sellBehavior === "all" ? existing.shares : Math.min(existing.shares, requestedAmountUsd / refPrice);
     if (sharesToSell <= 0) return skip("Skipped SELL: calculated sell size was zero.");

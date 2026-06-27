@@ -28,7 +28,143 @@ import {
   COLLATERAL_TOKEN_DECIMALS,
   type ApiKeyCreds,
 } from "@polymarket/clob-client";
+import {
+  ClobClient as ClobClientV2,
+  SignatureTypeV2,
+  Chain as ChainV2,
+  type ApiKeyCreds as ApiKeyCredsV2,
+} from "@polymarket/clob-client-v2";
 import { config } from "@/lib/config";
+
+// Polymarket USD (pUSD) collateral for Deposit Wallet accounts. The v5 CLOB
+// client still reports the legacy USDC.e collateral balance through
+// balance-allowance; pUSD accounts are read from cash-only public/on-chain
+// sources so sizing never treats portfolio value as spendable balance.
+const PUSD_TOKEN_ADDRESS = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+const PUSD_DECIMALS = 6;
+const FALLBACK_POLYGON_RPCS = [
+  "https://polygon-bor-rpc.publicnode.com",
+  "https://polygon.llamarpc.com",
+  "https://1rpc.io/matic",
+  "https://polygon.drpc.org",
+  "https://polygon-rpc.com",
+  "https://rpc.ankr.com/polygon",
+];
+
+const BALANCE_OF_SELECTOR = "0x70a08231";
+
+function encodeBalanceOf(ownerAddress: string): string {
+  const clean = ownerAddress.toLowerCase().replace(/^0x/, "");
+  if (!/^[0-9a-f]{40}$/.test(clean)) {
+    throw new LiveTradingError("Invalid ERC20 balance owner address.");
+  }
+  return BALANCE_OF_SELECTOR + clean.padStart(64, "0");
+}
+
+async function ethCall(rpcUrl: string, to: string, data: string): Promise<string> {
+  const res = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to, data }, "latest"] }),
+    signal: AbortSignal.timeout(6000),
+  });
+  const text = await res.text();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("non-json RPC response: " + text.slice(0, 160));
+  }
+  const body = parsed as { result?: unknown; error?: { message?: string; code?: number } };
+  if (body.error) throw new Error(body.error.message ?? "RPC error " + String(body.error.code ?? "unknown"));
+  if (typeof body.result !== "string" || !/^0x[0-9a-fA-F]*$/.test(body.result)) {
+    throw new Error("invalid RPC result: " + JSON.stringify(body.result));
+  }
+  return body.result;
+}
+
+function normalizeErc20Balance(rawHex: string, decimals: number): number {
+  const units = BigInt(rawHex === "0x" ? "0x0" : rawHex);
+  const divisor = 10n ** BigInt(decimals);
+  const whole = units / divisor;
+  const fraction = (units % divisor).toString().padStart(decimals, "0");
+  const normalized = Number(whole.toString() + "." + fraction);
+  if (!Number.isFinite(normalized) || normalized > Number.MAX_SAFE_INTEGER) {
+    throw new LiveTradingError("ERC20 balance is too large to normalize safely.");
+  }
+  return normalized;
+}
+
+async function fetchErc20Balance(rpcUrl: string, tokenAddress: string, walletAddress: string, decimals: number): Promise<number> {
+  const rawHex = await ethCall(rpcUrl, tokenAddress, encodeBalanceOf(walletAddress));
+  return normalizeErc20Balance(rawHex, decimals);
+}
+
+const CASH_BALANCE_FIELDS = ["cashBalance", "cash", "availableBalance", "availableCash", "balance"];
+
+function numericField(obj: Record<string, unknown>, field: string): number | null {
+  const val = obj[field];
+  if (typeof val === "number" && Number.isFinite(val) && val >= 0) return val;
+  if (typeof val === "string") {
+    const n = Number(val);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return null;
+}
+
+function readCashBalance(obj: Record<string, unknown>): number | null {
+  for (const field of CASH_BALANCE_FIELDS) {
+    const balance = numericField(obj, field);
+    if (balance !== null) return balance;
+  }
+
+  return null;
+}
+
+/** Try Polymarket's public REST APIs for the user's cash/pUSD balance. */
+async function fetchPusdBalanceFromApi(funderAddress: string): Promise<number | null> {
+  const candidates = [
+    `${config.dataApiUrl}/value?user=${funderAddress}`,
+    `${config.gammaUrl}/profiles?id=${funderAddress}`,
+    `${config.lbApiUrl}/portfolio?user=${funderAddress}`,
+    `${config.lbApiUrl}/value?user=${funderAddress}`,
+  ];
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) continue;
+      const data: unknown = await res.json();
+      const rows = Array.isArray(data) ? data : [data];
+      for (const row of rows) {
+        if (!row || typeof row !== "object") continue;
+        const balance = readCashBalance(row as Record<string, unknown>);
+        if (balance !== null) return balance;
+      }
+    } catch {
+      // try next endpoint
+    }
+  }
+  return null;
+}
+
+/** Try on-chain ERC20 balanceOf via public Polygon RPCs. */
+async function fetchPusdBalance(walletAddress: string): Promise<number | null> {
+  const rpcs = config.liveRpcUrl
+    ? [config.liveRpcUrl, ...FALLBACK_POLYGON_RPCS]
+    : FALLBACK_POLYGON_RPCS;
+  for (const rpcUrl of rpcs) {
+    try {
+      const balance = await fetchErc20Balance(rpcUrl, PUSD_TOKEN_ADDRESS, walletAddress, PUSD_DECIMALS);
+      if (Number.isFinite(balance) && balance >= 0) return balance;
+    } catch {
+      // try next RPC
+    }
+  }
+  return null;
+}
+
+/** Polymarket CLOB rejects market BUY orders below this notional (USD). */
+export const CLOB_MIN_MARKET_BUY_USD = 1;
 
 export class LiveTradingError extends Error {
   constructor(message: string) {
@@ -37,6 +173,20 @@ export class LiveTradingError extends Error {
   }
 }
 
+/**
+ * Thrown when the account uses pUSD and no server-accessible source can return
+ * the cash balance. Real mode treats this as a hard stop; simulation may still
+ * use paper/local accounting.
+ */
+export class PusdBalanceUnavailableError extends LiveTradingError {
+  constructor() {
+    super(
+      "pUSD cash balance is not readable via CLOB, Polymarket cash APIs, or on-chain RPC. " +
+      "Configure POLYMARKET_FUNDER_ADDRESS and POLYMARKET_RPC_URL, then retry before real trading.",
+    );
+    this.name = "PusdBalanceUnavailableError";
+  }
+}
 export interface LiveOrderResult {
   success: boolean;
   orderId: string | null;
@@ -75,6 +225,7 @@ export function assertLiveTradingAllowed(): void {
   if (!config.livePrivateKey.trim()) {
     throw new LiveTradingError("POLYMARKET_PRIVATE_KEY is not set. Cannot sign live orders.");
   }
+  // sig type 3 (POLY_1271) is routed through @polymarket/clob-client-v2 — allowed here
 }
 
 /**
@@ -92,10 +243,12 @@ export function getLiveAccountAddress(): string {
 let clientPromise: Promise<ClobClient> | null = null;
 
 async function buildClient(): Promise<ClobClient> {
-  assertLiveTradingAllowed();
+  if (!config.livePrivateKey.trim()) {
+    throw new LiveTradingError("POLYMARKET_PRIVATE_KEY is not set.");
+  }
   const host = config.clobUrl;
   const chainId = config.liveChainId;
-  const signatureType = config.liveSignatureType;
+  const signatureType = config.liveSignatureType as ConstructorParameters<typeof ClobClient>[4];
   const funder = config.liveFunderAddress.trim() || undefined;
 
   // ethers v5 Wallet — satisfies the client's EthersSigner interface
@@ -131,6 +284,47 @@ export async function getLiveClobClient(): Promise<ClobClient> {
 /** Drop the cached client (e.g. after changing credentials). */
 export function resetLiveClobClient(): void {
   clientPromise = null;
+}
+
+// ── v2 client (POLYMARKET_SIGNATURE_TYPE=3 / POLY_1271) ──────────────────────
+
+let clientV2Promise: Promise<ClobClientV2> | null = null;
+
+async function buildClientV2(): Promise<ClobClientV2> {
+  if (!config.livePrivateKey.trim()) {
+    throw new LiveTradingError("POLYMARKET_PRIVATE_KEY is not set.");
+  }
+  const host = config.clobUrl;
+  // ChainV2 is a numeric enum (137 / 80002) that matches config.liveChainId.
+  const chain = config.liveChainId as ChainV2;
+  const funder = config.liveFunderAddress.trim() || undefined;
+  const signer = new Wallet(config.livePrivateKey.trim());
+
+  const l1 = new ClobClientV2({ host, chain, signer, signatureType: SignatureTypeV2.POLY_1271, funderAddress: funder });
+  let creds: ApiKeyCredsV2;
+  try {
+    creds = await l1.createOrDeriveApiKey();
+  } catch (err) {
+    throw new LiveTradingError(
+      `Failed to derive Polymarket API credentials (v2): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  return new ClobClientV2({ host, chain, signer, creds, signatureType: SignatureTypeV2.POLY_1271, funderAddress: funder });
+}
+
+export async function getLiveV2ClobClient(): Promise<ClobClientV2> {
+  if (!clientV2Promise) {
+    clientV2Promise = buildClientV2().catch((err) => {
+      clientV2Promise = null;
+      throw err;
+    });
+  }
+  return clientV2Promise;
+}
+
+export function resetLiveV2ClobClient(): void {
+  clientV2Promise = null;
 }
 
 function errorMessage(err: unknown): string {
@@ -179,25 +373,108 @@ function normalizeOptionalCollateralAmount(value: unknown, field: string): numbe
   }
 }
 
+async function syncClobBalanceAllowance(client: ClobClient): Promise<unknown> {
+  try {
+    return await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+  } catch (err) {
+    return { error: errorMessage(err) };
+  }
+}
+
+async function fetchPusdBalanceSnapshot(
+  funderAddress: string,
+  rawContext: Record<string, unknown> = {},
+): Promise<LiveUsdcBalance> {
+  const apiBalance = await fetchPusdBalanceFromApi(funderAddress);
+  if (apiBalance !== null) {
+    return {
+      usdcBalance: apiBalance,
+      usdcAllowance: undefined,
+      raw: { ...rawContext, balanceSource: "pusd-api", pusdApiBalance: apiBalance },
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  const onChainBalance = await fetchPusdBalance(funderAddress);
+  if (onChainBalance !== null) {
+    return {
+      usdcBalance: onChainBalance,
+      usdcAllowance: undefined,
+      raw: { ...rawContext, balanceSource: "pusd-on-chain", pusdOnChainBalance: onChainBalance },
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  throw new PusdBalanceUnavailableError();
+}
 /**
- * Fetch the authoritative USDC collateral balance/allowance from the live CLOB.
- * Values are normalized from collateral base units (6 decimals) into USD.
+ * Fetch the authoritative live cash balance. For EOA/proxy/safe accounts this
+ * uses authenticated CLOB balance-allowance; for deposit-wallet pUSD accounts it
+ * reads cash-only public/on-chain sources by funder address.
  */
-export async function fetchLiveUsdcBalance(): Promise<LiveUsdcBalance> {
-  assertLiveTradingAllowed();
+export async function fetchLiveUsdcBalance(options: { syncAllowance?: boolean } = {}): Promise<LiveUsdcBalance> {
+  const privateKey = config.livePrivateKey.trim();
+  const funder = config.liveFunderAddress.trim();
+
+  if (config.liveSignatureType === 3) {
+    if (!funder) {
+      throw new LiveTradingError("POLYMARKET_FUNDER_ADDRESS is required for deposit-wallet balance reads.");
+    }
+    return fetchPusdBalanceSnapshot(funder, { signatureType: 3, skippedClob: "deposit-wallet pUSD cash path" });
+  }
+
+  if (!privateKey) {
+    if (funder) {
+      return fetchPusdBalanceSnapshot(funder, { skippedClob: "POLYMARKET_PRIVATE_KEY not set" });
+    }
+    throw new LiveTradingError("POLYMARKET_PRIVATE_KEY is not set. Cannot fetch live balance.");
+  }
 
   try {
     const client = await getLiveClobClient();
+    let syncResult: unknown = null;
+    if (options.syncAllowance) {
+      syncResult = await syncClobBalanceAllowance(client);
+    }
+
     const resp = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
     const raw = (resp ?? {}) as unknown as Record<string, unknown>;
     if (raw.error) {
       throw new LiveTradingError("Polymarket balance endpoint returned an error: " + String(raw.error));
     }
 
+    const clobBalance = normalizeCollateralAmount(raw.balance, "balance");
+
+    if (clobBalance === 0 && funder) {
+      if (!options.syncAllowance) {
+        syncResult = await syncClobBalanceAllowance(client);
+        const refreshed = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        const refreshedRaw = (refreshed ?? {}) as unknown as Record<string, unknown>;
+        if (refreshedRaw.error) {
+          throw new LiveTradingError("Polymarket balance endpoint returned an error: " + String(refreshedRaw.error));
+        }
+        const refreshedBalance = normalizeCollateralAmount(refreshedRaw.balance, "balance");
+        if (refreshedBalance > 0) {
+          return {
+            usdcBalance: refreshedBalance,
+            usdcAllowance: normalizeOptionalCollateralAmount(refreshedRaw.allowance, "allowance"),
+            raw: { balanceSource: "clob-after-sync", balanceSync: syncResult, balanceAllowance: refreshed },
+            updatedAt: new Date().toISOString(),
+          };
+        }
+      }
+
+      return fetchPusdBalanceSnapshot(funder, {
+        balanceSource: "clob-zero-fallback",
+        balanceSync: syncResult,
+        balanceAllowance: resp,
+      });
+    }
+
     return {
-      usdcBalance: normalizeCollateralAmount(raw.balance, "balance"),
+      usdcBalance: clobBalance,
       usdcAllowance: normalizeOptionalCollateralAmount(raw.allowance, "allowance"),
-      raw: resp,
+      raw: syncResult ? { balanceSource: "clob", balanceSync: syncResult, balanceAllowance: resp } : resp,
       updatedAt: new Date().toISOString(),
     };
   } catch (err) {
@@ -205,16 +482,22 @@ export async function fetchLiveUsdcBalance(): Promise<LiveUsdcBalance> {
     throw new LiveTradingError("Failed to fetch live USDC balance from Polymarket CLOB: " + errorMessage(err));
   }
 }
-
 /**
  * Best-effort: make sure the CLOB has a USDC (collateral) allowance. Proxy/safe
  * wallets are handled by Polymarket; an EOA may need a one-time on-chain
  * approval that this call cannot perform — failures are swallowed.
  */
 export async function ensureUsdcAllowance(): Promise<void> {
-  const client = await getLiveClobClient();
   try {
-    await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    if (config.liveSignatureType === 3) {
+      const client = await getLiveV2ClobClient();
+      // AssetType string value is identical between v1 and v2 ("COLLATERAL").
+      await (client as unknown as { updateBalanceAllowance: (p: { asset_type: string }) => Promise<void> })
+        .updateBalanceAllowance({ asset_type: "COLLATERAL" });
+    } else {
+      const client = await getLiveClobClient();
+      await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    }
   } catch {
     // ignore — surfaced elsewhere if an order later fails on allowance
   }
@@ -316,11 +599,14 @@ function extractTradePage(resp: unknown): { rows: unknown[]; nextCursor: string 
  */
 export async function fetchLiveTrades(): Promise<LiveTradeFill[]> {
   assertLiveTradingAllowed();
-  const client = await getLiveClobClient();
-  const getTrades = (client as unknown as { getTrades: (...args: unknown[]) => Promise<unknown> }).getTrades;
+  const rawClient = config.liveSignatureType === 3
+    ? await getLiveV2ClobClient()
+    : await getLiveClobClient();
+  const getTrades = (rawClient as unknown as { getTrades: (...args: unknown[]) => Promise<unknown> }).getTrades;
   if (typeof getTrades !== "function") {
     throw new LiveTradingError("Polymarket CLOB client does not expose getTrades(); cannot reconcile fills.");
   }
+  const client = rawClient;
 
   const out: LiveTradeFill[] = [];
   const seen = new Set<string>();
@@ -370,7 +656,6 @@ export interface LiveMarketOrderParams {
  */
 export async function placeLiveMarketOrder(params: LiveMarketOrderParams): Promise<LiveOrderResult> {
   assertLiveTradingAllowed();
-  const client = await getLiveClobClient();
 
   const side = params.side === "BUY" ? Side.BUY : Side.SELL;
   const amount = params.side === "BUY" ? params.usdAmount ?? 0 : params.shares ?? 0;
@@ -378,19 +663,56 @@ export async function placeLiveMarketOrder(params: LiveMarketOrderParams): Promi
     throw new LiveTradingError(`Live ${params.side} amount must be positive (got ${amount}).`);
   }
 
-  // Let the client resolve tick size, neg-risk, and the marketable price from the
-  // live book (options omitted). FAK allows partial fills instead of rejecting.
-  const resp = await client.createAndPostMarketOrder(
-    { tokenID: params.tokenId, amount, side, orderType: OrderType.FAK },
-    undefined,
-    OrderType.FAK,
-  );
+  // We compute the marketable price ourselves and clamp it into the market's
+  // valid [tick, 1-tick] band before posting. Left to the library, deep books
+  // near 0/1 (a best bid of 0.999 with a reported 0.01 tick) make it derive a
+  // price its own validator then rejects ("invalid price (0.999)…"), which would
+  // strand a position the leader has already exited. A clamped SELL limit still
+  // crosses (a 0.99 limit fills against a 0.999 bid); FAK kills any remainder.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const client: any =
+    config.liveSignatureType === 3 ? await getLiveV2ClobClient() : await getLiveClobClient();
+
+  let tick = 0.01;
+  try {
+    tick = Number.parseFloat(await client.getTickSize(params.tokenId)) || 0.01;
+  } catch {
+    // Fall back to a conservative 0.01 tick; the clamp below still applies.
+  }
+
+  let marketPrice: number | undefined;
+  try {
+    marketPrice = await client.calculateMarketPrice(params.tokenId, side, amount, OrderType.FAK);
+  } catch {
+    // No book / no match — let the library try (and surface its own error).
+    marketPrice = undefined;
+  }
+  if (marketPrice != null && Number.isFinite(marketPrice)) {
+    const lo = tick;
+    const hi = 1 - tick;
+    marketPrice = Math.round(marketPrice / tick) * tick;
+    marketPrice = Math.min(hi, Math.max(lo, marketPrice));
+  } else {
+    marketPrice = undefined;
+  }
+
+  // Side and OrderType string values ("BUY"/"SELL", "FAK") are identical in v1 and v2.
+  const order = {
+    tokenID: params.tokenId,
+    amount,
+    side,
+    orderType: OrderType.FAK,
+    ...(marketPrice != null ? { price: marketPrice } : {}),
+  };
+  const options = { tickSize: String(tick) };
+  const resp: unknown = await client.createAndPostMarketOrder(order, options, OrderType.FAK);
 
   const r = (resp ?? {}) as Record<string, unknown>;
   const orderIdRaw = r.orderID ?? r.orderId ?? null;
   const orderId = orderIdRaw ? String(orderIdRaw) : null;
   const status = r.status != null ? String(r.status) : null;
-  const errorMsg = r.errorMsg ? String(r.errorMsg) : null;
+  // v1 uses errorMsg; v2 client returns { error: string, status: number } on rejection
+  const errorMsg = r.errorMsg ? String(r.errorMsg) : r.error ? String(r.error) : null;
   const success = r.success === true || (r.success == null && orderId != null && !errorMsg);
   const rawHashes = (r.transactionsHashes ?? r.transactionHashes) as unknown;
   const txHashes = Array.isArray(rawHashes) ? rawHashes.map(String) : [];

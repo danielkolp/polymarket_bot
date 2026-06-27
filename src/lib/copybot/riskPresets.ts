@@ -1,7 +1,20 @@
 import type { BotSettings, RiskPresetId } from "./types";
 
-export const REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE = 2;
+// ── Non-negotiable real-money clamps ──────────────────────────────────────────
+// These are applied to live settings on every load regardless of the selected
+// preset (so Action Mode etc. can stay loose for simulation but can never loosen
+// real-money risk). They only ever TIGHTEN — never loosen — a configured value.
+export const REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE = 1;
 export const REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT = 10;
+export const REAL_MODE_MAX_TOTAL_EXPOSURE_PERCENT = 30;
+export const REAL_MODE_MAX_PER_MARKET_EXPOSURE_PERCENT = 4;
+export const REAL_MODE_MAX_MARKET_SPREAD = 0.05;
+/** Live floor on minimum available balance, as a fraction of configured bankroll. */
+export const REAL_MODE_MIN_AVAILABLE_BALANCE_FRACTION = 0.25;
+/** Adverse-entry gate is forced on in real mode and capped at this many cents. */
+export const REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS = 2;
+/** Real-mode BUY freshness ceiling (seconds). */
+export const REAL_MODE_MAX_COPY_TRADE_AGE_SEC = 90;
 
 export interface RiskPreset {
   id: RiskPresetId;
@@ -87,14 +100,19 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
   "live-default": {
     id: "live-default",
     label: "Live Default",
-    totalExposurePercent: 45,
-    perMarketExposurePercent: 10,
+    description:
+      "Conservative real-money defaults: tight exposure caps, one copy per wallet per cycle, narrow spread tolerance, strict entry-edge and freshness gates. Real mode clamps to these regardless of preset.",
+    totalExposurePercent: REAL_MODE_MAX_TOTAL_EXPOSURE_PERCENT,
+    perMarketExposurePercent: REAL_MODE_MAX_PER_MARKET_EXPOSURE_PERCENT,
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.05,
     maxBuyTokenPrice: 0.85,
     extraSettings: {
-      maxCopiesPerWalletPerCycle: 1,
+      maxCopiesPerWalletPerCycle: REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE,
       maxExposurePerWalletPercent: REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT,
+      maxMarketSpread: REAL_MODE_MAX_MARKET_SPREAD,
+      maxAdverseEntryMoveCents: REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS,
+      liveMaxCopyTradeAgeSec: 60,
     },
   },
   custom: {
@@ -149,19 +167,41 @@ export function applyRealModeSafetyCaps(settings: BotSettings): BotSettings {
     settings.maxExposurePerWalletPercent <= 0
       ? REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT
       : Math.min(settings.maxExposurePerWalletPercent, REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT);
+  const maxTotalExposure = Math.min(settings.maxTotalExposurePercent, REAL_MODE_MAX_TOTAL_EXPOSURE_PERCENT);
+  const maxPerMarketExposure = Math.min(settings.maxExposurePerMarketPercent, REAL_MODE_MAX_PER_MARKET_EXPOSURE_PERCENT);
+  // maxMarketSpread: 0 means "no spread filter" — never let that through in real
+  // mode; force it to the real-mode ceiling.
+  const maxSpread =
+    settings.maxMarketSpread <= 0
+      ? REAL_MODE_MAX_MARKET_SPREAD
+      : Math.min(settings.maxMarketSpread, REAL_MODE_MAX_MARKET_SPREAD);
+  const minAvailableFloor = REAL_MODE_MIN_AVAILABLE_BALANCE_FRACTION * Math.max(0, settings.startingBalance);
+  const minAvailable = Math.max(settings.minAvailableBalanceUsd, minAvailableFloor);
+  // Adverse-entry gate is forced ON in real mode (0 = disabled is not allowed).
+  const maxAdverse =
+    settings.maxAdverseEntryMoveCents <= 0
+      ? REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS
+      : Math.min(settings.maxAdverseEntryMoveCents, REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS);
+  const liveMaxAge =
+    settings.liveMaxCopyTradeAgeSec <= 0
+      ? REAL_MODE_MAX_COPY_TRADE_AGE_SEC
+      : Math.min(settings.liveMaxCopyTradeAgeSec, REAL_MODE_MAX_COPY_TRADE_AGE_SEC);
 
-  if (
-    maxCopies === settings.maxCopiesPerWalletPerCycle &&
-    maxWalletExposure === settings.maxExposurePerWalletPercent
-  ) {
-    return settings;
-  }
-
-  return {
+  const next: BotSettings = {
     ...settings,
     maxCopiesPerWalletPerCycle: maxCopies,
     maxExposurePerWalletPercent: maxWalletExposure,
+    maxTotalExposurePercent: maxTotalExposure,
+    maxExposurePerMarketPercent: maxPerMarketExposure,
+    maxMarketSpread: maxSpread,
+    minAvailableBalanceUsd: minAvailable,
+    maxAdverseEntryMoveCents: maxAdverse,
+    liveMaxCopyTradeAgeSec: liveMaxAge,
   };
+
+  // Avoid allocating a new object when nothing actually changed.
+  const unchanged = (Object.keys(next) as (keyof BotSettings)[]).every((k) => next[k] === settings[k]);
+  return unchanged ? settings : next;
 }
 
 /**

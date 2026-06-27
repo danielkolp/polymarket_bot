@@ -4,6 +4,15 @@ export type BotMode = "simulation" | "real";
 export type BotRunState = "stopped" | "running" | "paused" | "draining";
 export type SellBehavior = "proportional" | "all";
 export type SizingMode = "fixed" | "percentage" | "hybrid";
+/**
+ * How the copy amount is scaled.
+ *  - "local-fixed": the bot's own fixed/percentage/hybrid sizing (default).
+ *  - "leader-size-weighted": scale by the leader's trade size relative to their
+ *    typical recent trade size (conviction). Never bypasses any risk cap.
+ */
+export type SizingSignalMode = "local-fixed" | "leader-size-weighted";
+/** Whether the source leader of a copied position still appears to hold it. */
+export type LeaderHoldStatus = "yes" | "no" | "unknown";
 export type RiskPresetId = "conservative" | "balanced" | "aggressive-simulation" | "action" | "live-default" | "custom";
 
 /**
@@ -58,6 +67,30 @@ export interface BotSettings {
   minTimeToResolutionMinutes: number;
   maxTradeAgeSec: number;
   traderRefreshIntervalMin: number;
+
+  /**
+   * Adverse-entry gate (edge protection). Skip a copied BUY when the current
+   * executable ask is more than this many cents above the leader's original
+   * trade price — i.e. the price already ran away and we'd be buying the move
+   * after the leader. 0 disables the gate (real mode forces it on). Real mode is
+   * additionally clamped to a tighter ceiling than simulation.
+   */
+  maxAdverseEntryMoveCents: number;
+  /**
+   * Stricter real-mode freshness window (seconds) for copied BUYs, on top of the
+   * hard 5-minute absolute cap. In real mode a BUY older than this is skipped.
+   * Simulation ignores this (it uses the looser maxTradeAgeSec) for stress tests.
+   */
+  liveMaxCopyTradeAgeSec: number;
+  /**
+   * When true, a copied position whose source leader no longer appears to hold
+   * the token is exited (sim: sold at mark; real: sold only if bot-opened, live
+   * data is healthy, and safety gates pass). Manual/unknown positions are never
+   * touched by this rule.
+   */
+  exitWhenLeaderNoLongerHolds: boolean;
+  /** Copy-amount signal: own sizing ("local-fixed") or leader conviction. */
+  sizingSignalMode: SizingSignalMode;
 
   /**
    * Per-copied-wallet risk controls. These stop any single followed wallet from
@@ -182,6 +215,16 @@ export interface BotPosition {
   openedAt: number;
   updatedAt: number;
   sourceWallets: string[];
+
+  /**
+   * Whether the source leader(s) still appear to hold this token, from the last
+   * leader-holdings reconciliation. "no" means every queried source wallet has
+   * exited; "unknown" means we could not fetch (or the position is manual). Only
+   * "no" on a bot-opened position can trigger a leader-exit sale.
+   */
+  leaderHolds?: LeaderHoldStatus;
+  /** When leaderHolds was last evaluated (ms epoch). */
+  leaderCheckedAt?: number;
 }
 
 export interface CopyTradeRecord {
@@ -218,6 +261,14 @@ export interface CopyTradeRecord {
   frictionUsd?: number;
   fillStatus?: "filled" | "partial" | "rejected";
   costSource?: "book" | "quote" | "assumed";
+
+  // ── Edge / adverse-entry visibility (copied BUYs) ───────────────────────────
+  /** The leader's original trade price (0..1) this record was sourced from. */
+  leaderPrice?: number;
+  /** The bot's current executable BUY price (current ask, 0..1) at copy time. */
+  botExecPrice?: number;
+  /** botExecPrice − leaderPrice, in cents (positive = bot paying up vs leader). */
+  adverseMoveCents?: number;
 
   // â”€â”€ Authoritative live-fill reconciliation (real mode only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   /** When this record was last reconciled against CLOB trade history (ms epoch). */
@@ -276,6 +327,7 @@ export interface BotMetrics {
   totalExposureUsd: number;
   totalExposurePercent: number;
   maxDrawdown: number;
+  /** Bot-attributed P&L since the local day baseline; live wallet drift is reported separately. */
   dailyPnlUsd: number;
   /** Total spread/slippage + fees paid across simulated fills (the cost drag). */
   totalFrictionUsd: number;
@@ -318,7 +370,10 @@ export interface BotState {
   lastDiscoveryAt: number | null;
   lastError: string | null;
   dailyDate: string;
+  /** Whole-wallet equity at the local day baseline; used as the bankroll denominator for caps. */
   dailyStartEquityUsd: number;
+  /** Bot-attributed cumulative P&L at the local day baseline. */
+  dailyStartBotPnlUsd: number;
   peakEquityUsd: number;
   firstRunBootstrappedAt: number | null;
   /** Cumulative wallet checks since the current session was started (reset on Start). */

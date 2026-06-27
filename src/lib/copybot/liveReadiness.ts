@@ -53,10 +53,22 @@ export function evaluateBuyReadiness(input: ReadinessInput): BuyReadiness {
   const t = { ...defaultReadinessThresholds(), ...input.thresholds };
   const real = settings.mode === "real";
   const gates: ReadinessGate[] = [];
+  const dailyLossCapValid = Number.isFinite(settings.maxDailyLossPercent) && settings.maxDailyLossPercent > 0;
 
   // ── Apply to every mode ─────────────────────────────────────────────────────
   gates.push(
     gate("panic", "Panic stop", !state.panic, "block", state.panic ? state.panicReason ?? "Panic stop is engaged." : "Not engaged."),
+  );
+  gates.push(
+    gate(
+      "daily-loss-cap-configured",
+      "Daily-loss cap configured",
+      dailyLossCapValid,
+      "block",
+      dailyLossCapValid
+        ? `${settings.maxDailyLossPercent}% daily-loss cap configured.`
+        : `Daily-loss cap is ${settings.maxDailyLossPercent}%; set it above 0% before opening new BUYs.`,
+    ),
   );
   gates.push(
     gate(
@@ -67,7 +79,6 @@ export function evaluateBuyReadiness(input: ReadinessInput): BuyReadiness {
       state.dailyLossLockout ? "Daily-loss lockout active; new BUYs disabled until the next day." : "Within daily loss cap.",
     ),
   );
-
   // ── Real-mode-only live-state gates ─────────────────────────────────────────
   if (real) {
     const realCopied = trades.filter((r) => r.mode === "real" && r.status === "copied");
@@ -169,13 +180,17 @@ export function evaluateBuyReadiness(input: ReadinessInput): BuyReadiness {
         ),
       );
       if (livePositions!.redeemableCount > 0) {
+        // Resolved/won positions are NOT a problem and need no operator action:
+        // Polymarket auto-redeems winning positions to cash when the market
+        // closes. Surface it as a satisfied, informational gate — never a warning
+        // or a block on new BUYs.
         gates.push(
           gate(
             "redeemable-positions",
             "Redeemable positions",
-            false,
+            true,
             "warn",
-            `${livePositions!.redeemableCount} resolved/redeemable position(s) need manual action.`,
+            `${livePositions!.redeemableCount} resolved position(s) will auto-redeem to cash on settlement; no action needed.`,
           ),
         );
       }

@@ -45,6 +45,17 @@ describe("evaluateBuyReadiness — universal gates", () => {
     expect(r.blockers.map((b) => b.code)).toContain("daily-loss-lockout");
   });
 
+  it("blocks BUYs when the daily-loss cap is zero", () => {
+    const r = evaluateBuyReadiness({
+      settings: makeSettings({ mode: "simulation", maxDailyLossPercent: 0 }),
+      state: makeState(),
+      trades: [],
+      livePositions: null,
+      now: NOW,
+    });
+    expect(r.buysAllowed).toBe(false);
+    expect(r.blockers.map((b) => b.code)).toContain("daily-loss-cap-configured");
+  });
   it("allows BUYs in a clean simulation", () => {
     const r = evaluateBuyReadiness({
       settings: makeSettings({ mode: "simulation" }),
@@ -136,7 +147,7 @@ describe("evaluateBuyReadiness — real-mode live state", () => {
     expect(r.blockers.map((b) => b.code)).toContain("live-positions-fresh");
   });
 
-  it("treats redeemable positions as a warning, not a hard block", () => {
+  it("does not flag redeemable positions as a warning or a block (Polymarket auto-redeems)", () => {
     const r = evaluateBuyReadiness({
       settings,
       state: makeState(),
@@ -145,6 +156,10 @@ describe("evaluateBuyReadiness — real-mode live state", () => {
       now: NOW,
     });
     expect(r.buysAllowed).toBe(true);
-    expect(r.warnings.map((w) => w.code)).toContain("redeemable-positions");
+    expect(r.blockers.map((b) => b.code)).not.toContain("redeemable-positions");
+    expect(r.warnings.map((w) => w.code)).not.toContain("redeemable-positions");
+    const g = r.gates.find((x) => x.code === "redeemable-positions");
+    expect(g?.ok).toBe(true);
+    expect(g?.detail).toMatch(/auto-redeem/i);
   });
 });

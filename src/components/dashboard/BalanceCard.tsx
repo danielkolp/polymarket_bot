@@ -21,7 +21,7 @@ function Stat({
       <div className="text-xs text-muted-foreground">{label}</div>
       <div
         className={cn(
-          "mt-1 text-xl font-semibold tabular-nums",
+          "mt-1 whitespace-nowrap font-punto text-2xl tabular-nums sm:text-3xl",
           tone === "pos" && "text-success",
           tone === "neg" && "text-destructive",
         )}

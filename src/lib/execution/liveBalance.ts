@@ -14,7 +14,7 @@ export async function getLiveUsdcBalance(options: { forceRefresh?: boolean } = {
     return cachedBalance.balance;
   }
 
-  const balance = await fetchLiveUsdcBalance();
+  const balance = await fetchLiveUsdcBalance({ syncAllowance: options.forceRefresh });
   cachedBalance = { balance, cachedAt: now };
   return balance;
 }

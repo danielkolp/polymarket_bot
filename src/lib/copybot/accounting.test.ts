@@ -87,6 +87,17 @@ describe("buildMetrics accounting invariant", () => {
     expect(metrics.totalExposurePercent).toBeCloseTo(38 / 102);
     expectAccountingInvariant(settings, metrics);
   });
+  it("anchors cash/equity to live balance while preserving local mirror equity", () => {
+    const settings = makeSettings({ startingBalance: 100 });
+    const positions = [makePosition({ shares: 20, avgPrice: 0.5, markPrice: 0.45 })];
+    const { metrics } = buildMetrics(settings, makeState(), positions, [], DAY1, 12.5);
+
+    expect(metrics.cashUsd).toBeCloseTo(12.5);
+    expect(metrics.availableBalanceUsd).toBeCloseTo(12.5);
+    expect(metrics.totalExposureUsd).toBeCloseTo(9);
+    expect(metrics.equityUsd).toBeCloseTo(21.5);
+    expect(metrics.localTrackedEquity).toBeCloseTo(99);
+  });
 });
 
 describe("buildMetrics accounting confidence", () => {
@@ -123,7 +134,7 @@ describe("buildMetrics accounting confidence", () => {
 });
 
 describe("daily-loss lockout", () => {
-  const settings = makeSettings({ maxDailyLossPercent: 10 });
+  const settings = makeSettings({ maxDailyLossPercent: 10, startingBalance: 100 });
 
   it("latches once the daily-loss cap is breached and blocks via metrics flag", () => {
     // Start of day equity 100; a 12 USD settled loss exceeds the 10% cap.
@@ -135,6 +146,29 @@ describe("daily-loss lockout", () => {
     expectAccountingInvariant(settings, metrics);
   });
 
+  it("does not count live-wallet drift as bot daily loss", () => {
+    const liveDriftSettings = makeSettings({ maxDailyLossPercent: 10, startingBalance: 100 });
+    const state = makeState({ dailyDate: "2026-06-01", dailyStartEquityUsd: 100, dailyStartBotPnlUsd: 0, peakEquityUsd: 100 });
+    const positions = [makePosition({ shares: 100, avgPrice: 0.2808, markPrice: 0.2652 })];
+    const { metrics, state: next } = buildMetrics(liveDriftSettings, state, positions, [], DAY1, 63.1);
+
+    expect(metrics.equityUsd).toBeCloseTo(89.62); // live cash + marked exposure
+    expect(metrics.localTrackedEquity).toBeCloseTo(98.44); // starting balance + bot P&L
+    expect(metrics.dailyPnlUsd).toBeCloseTo(-1.56);
+    expect(metrics.dailyLossLockout).toBe(false);
+    expect(next.dailyLossLockout).toBe(false);
+  });
+
+  it("latches when open bot P&L breaches the daily-loss cap", () => {
+    const state = makeState({ dailyDate: "2026-06-01", dailyStartEquityUsd: 100, dailyStartBotPnlUsd: 0, peakEquityUsd: 100 });
+    const positions = [makePosition({ shares: 100, avgPrice: 0.5, markPrice: 0.38 })];
+    const { metrics, state: next } = buildMetrics(settings, state, positions, [], DAY1);
+
+    expect(metrics.dailyPnlUsd).toBeCloseTo(-12);
+    expect(metrics.dailyLossLockout).toBe(true);
+    expect(next.dailyLossLockout).toBe(true);
+    expectAccountingInvariant(settings, metrics);
+  });
   it("stays latched even if equity recovers later the same day", () => {
     const latched = makeState({ dailyDate: "2026-06-01", dailyStartEquityUsd: 100, dailyLossLockout: true });
     // No losing trades now; equity is fine, but the latch persists.

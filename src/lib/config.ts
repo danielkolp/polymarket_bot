@@ -49,16 +49,18 @@ export const config = {
   // signer). For a Polymarket proxy/email wallet or Gnosis safe, set the proxy
   // address here and the matching signature type below.
   liveFunderAddress: process.env.POLYMARKET_FUNDER_ADDRESS ?? "",
-  // 0 = EOA, 1 = Polymarket proxy wallet, 2 = Polymarket Gnosis safe.
-  liveSignatureType: ((): 0 | 1 | 2 => {
+  // 0 = EOA, 1 = Polymarket proxy wallet, 2 = Polymarket Gnosis safe,
+  // 3 = Polymarket deposit wallet / POLY_1271 — routed through @polymarket/clob-client-v2.
+  liveSignatureType: ((): 0 | 1 | 2 | 3 => {
     const n = Number(process.env.POLYMARKET_SIGNATURE_TYPE);
-    return n === 1 || n === 2 ? n : 0;
+    return n === 1 || n === 2 || n === 3 ? n : 0;
   })(),
   // Polygon mainnet = 137, Amoy testnet = 80002.
   liveChainId: num(process.env.POLYMARKET_CHAIN_ID, 137),
   // Hard per-order USD backstop. Every live BUY is clamped to this regardless of
-  // the percentage sizing / exposure caps. Start tiny; raise deliberately.
-  liveMaxOrderUsd: num(process.env.LIVE_MAX_ORDER_USD, 5),
+  // the percentage sizing / exposure caps. Defaults to $1 — start tiny; raise
+  // deliberately via LIVE_MAX_ORDER_USD.
+  liveMaxOrderUsd: num(process.env.LIVE_MAX_ORDER_USD, 1),
 
   /**
    * On-chain redemption of resolved (won) positions. Redeeming is NOT part of the
@@ -74,7 +76,7 @@ export const config = {
    * redeemed via an explicit, confirmed operator action. Requires enableRealTrading.
    */
   enableAutoRedeem: bool(process.env.ENABLE_AUTO_REDEEM, false),
-  // Warn when locally tracked equity and authoritative live USDC diverge by more
+  // Warn when locally tracked equity and live cash-plus-exposure diverge by more
   // than this amount. This does not mutate local PnL/accounting history.
   liveBalanceWarningThresholdUsd: num(process.env.LIVE_BALANCE_WARNING_THRESHOLD_USD, 5),
 

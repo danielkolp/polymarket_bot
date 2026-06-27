@@ -101,7 +101,19 @@ async function writeJson<T>(file: string, value: T): Promise<void> {
   );
   try {
     await fs.writeFile(tmpFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await fs.rename(tmpFile, file);
+    try {
+      await fs.rename(tmpFile, file);
+    } catch (renameErr) {
+      // Windows: rename fails with EPERM when something holds the destination open.
+      // Fall back to copy-over so the write still lands atomically enough.
+      const code = (renameErr as NodeJS.ErrnoException).code;
+      if (code === "EPERM" || code === "EBUSY") {
+        await fs.copyFile(tmpFile, file);
+        await fs.unlink(tmpFile).catch(() => {});
+      } else {
+        throw renameErr;
+      }
+    }
     lastGoodJson.set(file, clone(value));
   } catch (err) {
     try {
@@ -209,8 +221,15 @@ export async function appendEquityPoint(point: EquityPoint): Promise<void> {
 
 export async function loadBotState(settings?: BotSettings): Promise<BotState> {
   const s = settings ?? (await loadSettings());
-  const state = await readJson<Partial<BotState>>(STATE_FILE, createInitialBotState(s.startingBalance));
-  return { ...createInitialBotState(s.startingBalance), ...state };
+  const initial = createInitialBotState(s.startingBalance);
+  const state = await readJson<Partial<BotState>>(STATE_FILE, initial);
+  const migrated: BotState = { ...initial, ...state };
+  if (!Number.isFinite(state.dailyStartBotPnlUsd)) {
+    migrated.dailyStartBotPnlUsd = 0;
+    migrated.dailyLossLockout = false;
+    await enqueueWrite(() => writeJson(STATE_FILE, migrated));
+  }
+  return migrated;
 }
 
 export async function saveBotState(state: BotState): Promise<void> {

@@ -4,6 +4,8 @@
   "private": true,
   "description": "Bonk — private dashboard for monitoring and simulating Polymarket trading strategies",
   "scripts": {
+    "predev": "rimraf next-dev.out.log next-dev.err.log data/errors.log",
+    "prestart": "rimraf next-start.out.log next-start.err.log data/errors.log",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
@@ -13,6 +15,7 @@
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.1",
+    "@polymarket/clob-client-v2": "^1.0.6",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "ethers": "^5.8.0",
@@ -25,6 +28,7 @@
     "swr": "^2.4.1",
     "tailwind-merge": "^3.6.0",
     "tailwindcss-animate": "^1.0.7",
+    "viem": "^2.53.1",
     "zustand": "^5.0.14"
   },
   "devDependencies": {
