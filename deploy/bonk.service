@@ -1,0 +1,31 @@
+# Bonk Polymarket copy bot — production service (installed by scripts/vps/deploy-release.sh)
+[Unit]
+Description=Bonk Polymarket copy bot
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# /opt/bonk/current -> /opt/bonk/releases/<sha>; each release links
+# .env.local and data/ to /opt/bonk/shared, which survive deploys.
+WorkingDirectory=/opt/bonk/current
+EnvironmentFile=-/opt/bonk/shared/runtime.env
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=NODE_OPTIONS=--max-old-space-size=320
+ExecStart=/usr/bin/env node server.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+# Memory guard rails: throttle above 450 MB, hard stop (then auto-restart) at 700 MB.
+MemoryHigh=450M
+MemoryMax=700M
+Nice=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bonk
+
+[Install]
+WantedBy=multi-user.target

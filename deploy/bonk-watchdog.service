@@ -1,0 +1,7 @@
+[Unit]
+Description=Bonk health watchdog (restarts a stuck bot)
+After=bonk.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/bonk/current/scripts/vps/watchdog.sh

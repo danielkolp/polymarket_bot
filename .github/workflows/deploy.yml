@@ -1,0 +1,96 @@
+name: Deploy to VPS
+
+# Builds the self-contained server bundle on GitHub's runner (the VPS never runs
+# npm install or next build), uploads it over SSH, switches the release
+# atomically and health-checks it — rolling back automatically on failure.
+#
+# Output is filtered through scripts/vps/redact.sh because the repo is public.
+
+on:
+  push:
+    branches: [main, claude/affectionate-keller-63b6b2]
+    paths-ignore:
+      - "ops/**"
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: vps
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck and test
+        run: |
+          npx tsc --noEmit -p .
+          npx vitest run
+
+      - name: Build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build
+
+      - name: Package release
+        run: |
+          set -euo pipefail
+          rel=release
+          rm -rf "$rel" && mkdir -p "$rel/.next"
+          cp -r .next/standalone/. "$rel/"
+          cp -r .next/static "$rel/.next/static"
+          cp -r public "$rel/public"
+          mkdir -p "$rel/deploy" "$rel/scripts/vps"
+          cp deploy/* "$rel/deploy/"
+          cp scripts/vps/*.sh "$rel/scripts/vps/"
+          # Never ship local runtime state or env files.
+          rm -rf "$rel/data" "$rel"/.env*
+          tar -czf bonk-release.tgz -C "$rel" .
+          ls -lh bonk-release.tgz
+
+      - name: Check secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          missing=""
+          [ -n "$VPS_HOST" ] || missing="$missing VPS_HOST"
+          [ -n "$VPS_USER" ] || missing="$missing VPS_USER"
+          [ -n "$VPS_PASSWORD" ] || missing="$missing VPS_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings -> Secrets and variables -> Actions)"
+            exit 1
+          fi
+
+      - name: Install sshpass
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Upload and switch release
+        env:
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=25 -o ServerAliveInterval=15 -o LogLevel=ERROR"
+          short="${SHA:0:12}"
+          sshpass -e scp $SSH_OPTS bonk-release.tgz "$VPS_USER@$VPS_HOST:/tmp/bonk-$short.tgz"
+          { printf 'export RELEASE_SHA=%q RELEASE_TARBALL=%q\n' "$short" "/tmp/bonk-$short.tgz"; cat scripts/vps/lib.sh scripts/vps/deploy-release.sh; } \
+            | sshpass -e ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" 'bash -s' 2>&1 \
+            | bash scripts/vps/redact.sh "$VPS_HOST"

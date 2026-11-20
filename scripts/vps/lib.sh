@@ -89,10 +89,15 @@ status_summary() {
       const out = {
         runState: st.runState, desiredRunState: st.desiredRunState, mode: set.mode,
         riskPreset: set.riskPreset, panic: st.panic, dailyLossLockout: st.dailyLossLockout,
-        lastPollAt: st.lastPollAt, nextPollAt: st.nextPollAt, lastHeartbeatAt: st.lastHeartbeatAt,
-        followed: Array.isArray(j.traders) ? j.traders.filter(t => t.enabled).length : undefined,
+        lastPollAt: st.lastPollAt ? new Date(st.lastPollAt).toISOString() : null,
+        lastHeartbeatAt: st.lastHeartbeatAt ? new Date(st.lastHeartbeatAt).toISOString() : null,
+        followed: Array.isArray(j.traders) ? j.traders.filter(t => t.enabled && !t.exitOnly).length : undefined,
+        recentDecisions: (j.recentTrades || []).slice(0, 8).map(t => `${t.status} ${t.side}: ${String(t.reason).slice(0, 140)}`),
         openPositions: Array.isArray(j.positions) ? j.positions.length : undefined,
-        buyBlockers: (br.blockers || br.reasons || []).slice(0, 8),
+        buyBlockers: (br.blockers || []).map((b) => b.detail || b.code).slice(0, 8),
+        buyWarnings: (br.warnings || []).map((b) => b.detail || b.code).slice(0, 5),
+        liveBalanceStatus: (j.metrics || {}).liveBalanceStatus,
+        liveBalanceError: (j.metrics || {}).liveBalanceError || null,
         lastError: st.lastError ? String(st.lastError).slice(0, 300) : null,
         realTradingEnabled: j.realTradingEnabled ?? j.enableRealTrading,
       };

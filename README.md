@@ -1,8 +1,64 @@
-# Polymarket Copy Bot
+# Bonk — Polymarket copy-trading bot
 
-Private local Next.js dashboard/bot for discovering active Polymarket traders, tracking their recent trades, simulating copy trades, and keeping real-money execution disabled unless explicitly enabled server-side.
+Bonk follows a small set of consistently profitable Polymarket traders and copies their trades with strict, small-account risk limits. It runs as one Node process on a VPS, with a simple phone-friendly dashboard.
 
-Simulation mode is the default. No private keys are used by the frontend and no secrets are stored in localStorage. Real-money execution is implemented against the Polymarket CLOB but stays **off unless explicitly enabled server-side** (`ENABLE_REAL_TRADING=true` plus a configured signing key).
+> Copy trading can lose money. The bot limits *how much* can be lost (per trade, total invested, daily loss, drawdown pause, cash cushion) — it cannot guarantee profit.
+
+## Quick start (operator)
+
+1. Open the dashboard. **Home** shows account value, today's and all-time P&L, open positions and what the bot did.
+2. Pick a **risk level**: **Safe** (default, built for ~$50 accounts), **Balanced** or **Growth**.
+3. Press **Start**. Switch **Paper → Real** when you are ready to use real money (confirmation required).
+4. **Pause** stops new trades and keeps positions. **Emergency stop** blocks buying until cleared. **Sell everything** is in *More options → Danger zone* and needs typing `SELL`.
+
+The bot restarts itself after crashes, deploys and reboots, and resumes if it was running.
+
+## Strategy in one page
+
+- **Who it copies:** Polymarket's 7-day and 30-day P&L leaderboards (Data API v2), filtered to traders who are profitable on both windows, earn ≥2% on volume (skips market makers), trade at a human pace (≤150 trades/day, skips bots), use normal trade sizes ($20–$5,000, skips whales), and mostly trade prices the bot can copy. About 12 are followed; the roster refreshes every 30 minutes with hysteresis. Wallets whose copies lose money are benched.
+- **When it buys:** a followed trader's new BUY (including their limit-order fills), within 2 minutes, only if:
+  - the price hasn't run more than 2¢ past the trader's;
+  - entry cost (half the spread plus Polymarket's taker fee) is ≤4%;
+  - the market resolves in 1 hour to 14 days;
+  - the price is 20–80¢;
+  - liquidity is enough.
+- **How much:** Safe = ~6% of account value per trade (max $4), always at least the market's minimum of 5 shares so it can be sold. Up to 60% invested, 10% per market, 8 positions, 25% cash kept.
+- **Orders:** price-capped fill-and-kill orders on Polymarket CLOB V2. A buy never pays more than the cap, and fills are read back from the exchange.
+- **Exits:**
+  - mirrors the trader's sells, proportionally;
+  - exits when the trader no longer holds the position;
+  - take-profit +30%, stop-loss −25%, max hold 10 days.
+- **Brakes:** daily loss −8% pauses buying until the next UTC day; a 20% drop from peak pauses buying for 24h. Emergency stop survives restarts.
+
+## Deploying to the VPS
+
+Pushes to `main` (and the working branch) run `.github/workflows/deploy.yml`:
+
+1. GitHub builds a self-contained server bundle (`output: "standalone"`, ~8 MB compressed), runs typecheck and tests.
+2. It uploads the bundle over SSH to `/opt/bonk/releases/<sha>`, links `/opt/bonk/shared/{.env.local,data}`, installs the `bonk` systemd service, the health watchdog timer and a journald size cap, and restarts.
+3. It waits for `/api/health` to report a fresh heartbeat and **rolls back automatically** if the new release is unhealthy. Two releases are kept.
+
+The first deploy migrates `.env.local` and the bot's JSON state from the old checkout, stops the old process, and deletes the old checkout's `node_modules`/`.next`.
+
+Required repository secrets: `VPS_HOST`, `VPS_USER`, `VPS_PASSWORD`.
+
+### Maintenance tasks
+
+Run from the Actions tab (**VPS ops → Run workflow**), or by editing the first word of `ops/task` and pushing. All output is redacted because the repository is public.
+
+| Task | What it does |
+| --- | --- |
+| `diagnose` | Disk, RAM, processes, app layout, env *names*, Polymarket reachability |
+| `status` | Service + bot health summary |
+| `logs` | Recent bot log and service journal |
+| `restart` | Restart and wait for health (tests auto-resume) |
+| `pause` | Stop opening new positions |
+| `cleanup` | Clear apt/npm/journal caches and old build output |
+| `go-live` | Check env, set Safe + real money, start |
+
+On the server: `systemctl status bonk`, `journalctl -u bonk -f`, `curl localhost:3000/api/health`.
+
+## Reference (original notes)
 
 ## What it does
 
@@ -219,5 +275,6 @@ The legacy `bullpen --help` probe still runs and is shown in the dashboard for r
 - Public Polymarket APIs can change; skipped/failed trades are logged and the loop continues.
 
 
-#   p o l y m a r k e t _ b o t  
+#   p o l y m a r k e t _ b o t 
+ 
  
