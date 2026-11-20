@@ -58,6 +58,9 @@ export async function reconcileLivePositions(
   return reconcileAccountPositions(account, localPositions, traders, now);
 }
 
+/** How long a freshly opened/updated bot position survives a lagging positions API. */
+export const FRESH_POSITION_GRACE_MS = 5 * 60 * 1000;
+
 export function reconcileAccountPositions(
   account: AccountPosition[],
   localPositions: BotPosition[],
@@ -143,10 +146,18 @@ export function reconcileAccountPositions(
 
   // Local positions the account no longer reports are stale (resolved, redeemed,
   // or manually closed). They are surfaced but dropped from authoritative state.
+  // EXCEPTION: Polymarket's positions API lags a fresh fill by up to a few
+  // minutes, so a position the bot opened within the grace window is KEPT
+  // (otherwise it would be dropped now and re-adopted later as an unmanaged
+  // "unknown" position that never gets stop-loss / leader-exit handling).
   let stalePositionCount = 0;
   for (const local of localPositions) {
     if (local.shares <= DUST) continue;
     if (accountTokens.has(local.tokenId)) continue;
+    if (now - (local.updatedAt ?? local.openedAt ?? 0) < FRESH_POSITION_GRACE_MS) {
+      positions.push(local);
+      continue;
+    }
     stalePositionCount += 1;
     entries.push({
       tokenId: local.tokenId,

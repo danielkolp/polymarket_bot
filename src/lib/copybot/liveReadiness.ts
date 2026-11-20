@@ -162,10 +162,12 @@ export function evaluateBuyReadiness(input: ReadinessInput): BuyReadiness {
           "no-unknown-positions",
           "No unknown live positions",
           livePositions!.unknownPositionCount === 0,
-          "block",
+          // Manual / pre-existing positions are counted toward exposure caps and
+          // never auto-traded, so they no longer block new copy BUYs.
+          "warn",
           livePositions!.unknownPositionCount === 0
             ? "No unknown/manual live positions."
-            : `${livePositions!.unknownPositionCount} unknown live position(s); mark them manual/adopt before new BUYs.`,
+            : `${livePositions!.unknownPositionCount} position(s) you opened yourself: counted toward limits, never auto-traded.`,
         ),
       );
       gates.push(

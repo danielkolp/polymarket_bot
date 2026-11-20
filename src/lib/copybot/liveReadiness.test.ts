@@ -122,7 +122,7 @@ describe("evaluateBuyReadiness — real-mode live state", () => {
     expect(r.blockers.map((b) => b.code)).toContain("no-stale-pending");
   });
 
-  it("blocks on unknown existing live positions", () => {
+  it("only warns (does not block) on manual / pre-existing live positions", () => {
     const r = evaluateBuyReadiness({
       settings,
       state: makeState(),
@@ -130,8 +130,8 @@ describe("evaluateBuyReadiness — real-mode live state", () => {
       livePositions: healthyLivePositions({ unknownPositionCount: 1 }),
       now: NOW,
     });
-    expect(r.buysAllowed).toBe(false);
-    expect(r.blockers.map((b) => b.code)).toContain("no-unknown-positions");
+    expect(r.buysAllowed).toBe(true);
+    expect(r.warnings.map((b) => b.code)).toContain("no-unknown-positions");
   });
 
   it("blocks on a stale live-position snapshot", () => {

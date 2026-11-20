@@ -647,6 +647,24 @@ function applySell(
   return { positions: nextPositions, copiedShares: shares, copyAmountUsd, realizedPnlUsd };
 }
 
+/**
+ * Fresh outcome-book pricing for a live exit SELL: reference = best bid, worst
+ * acceptable price = 3 ticks under it. Falls back to the mark when no book.
+ */
+async function liveExitPricing(
+  tokenId: string,
+  conditionId: string,
+  fallbackPrice: number,
+): Promise<{ referencePrice: number; limitPrice: number }> {
+  const [book, meta] = await Promise.all([
+    tryGetOutcomeBook(tokenId, 2_000),
+    getTokenMarketMeta(tokenId, conditionId).catch(() => null),
+  ]);
+  const tick = meta?.tickSize ?? 0.01;
+  const ref = book?.bestBid != null && book.bestBid > 0 ? book.bestBid : fallbackPrice;
+  return { referencePrice: ref, limitPrice: roundToTick(ref - 3 * tick, tick, "up") };
+}
+
 /** A poll running longer than this is considered hung and is abandoned. */
 const MIN_STUCK_TICK_MS = 120_000;
 const WATCHDOG_INTERVAL_MS = 30_000;
@@ -1273,9 +1291,10 @@ export class CopyBotEngine {
       try {
         const res = await placeLiveMarketOrder({
           tokenId: position.tokenId,
+          conditionId: position.conditionId,
           side: "SELL",
           shares: sellSize.shares,
-          referencePrice: price,
+          ...(await liveExitPricing(position.tokenId, position.conditionId, price)),
         });
         clearLiveBalanceCache();
         if (!res.success || res.filledShares <= 0) {
@@ -1675,13 +1694,14 @@ export class CopyBotEngine {
     }
     if (!result.summary.ran) return;
     await saveTrades(result.records);
-    const { matched, partial, unmatched, fetchedFills, error } = result.summary;
+    const { matched, partial, unmatched, voided, fetchedFills, error } = result.summary;
     if (error) {
-      await appendLog("error", `Live reconciliation (${context}) failed: ${error}. Live orders flagged unverified.`);
-    } else if (matched + partial + unmatched > 0) {
+      await appendLog("warning", `Live reconciliation (${context}): trade history unavailable (${error}); will retry next poll.`);
+    }
+    if (matched + partial + unmatched + voided > 0) {
       await appendLog(
         unmatched > 0 ? "warning" : "info",
-        `Live reconciliation (${context}): ${matched} matched, ${partial} partial, ${unmatched} unmatched vs ${fetchedFills} CLOB fill(s).`,
+        `Live reconciliation (${context}): ${matched} matched, ${partial} partial, ${unmatched} unconfirmed, ${voided} cleared as never filled (${fetchedFills} exchange fill(s) checked).`,
       );
     }
   }
@@ -2599,12 +2619,13 @@ export class CopyBotEngine {
       try {
         const res = await placeLiveMarketOrder({
           tokenId: position.tokenId,
+          conditionId: position.conditionId,
           side: "SELL",
           shares: sellSize.shares,
-          referencePrice: price,
+          ...(await liveExitPricing(position.tokenId, position.conditionId, price)),
         });
         clearLiveBalanceCache();
-        if (!res.success) {
+        if (!res.success || res.filledShares <= 0) {
           await appendLog("error", `Live auto-exit SELL rejected for ${position.outcome}: ${res.error ?? "unknown"}. Keeping position.`);
           remaining.push(bookPosition);
           continue;
@@ -2765,9 +2786,10 @@ export class CopyBotEngine {
       try {
         const res = await placeLiveMarketOrder({
           tokenId: position.tokenId,
+          conditionId: position.conditionId,
           side: "SELL",
           shares: sellSize.shares,
-          referencePrice: price,
+          ...(await liveExitPricing(position.tokenId, position.conditionId, price)),
         });
         clearLiveBalanceCache();
         if (!res.success || res.filledShares <= 0) {

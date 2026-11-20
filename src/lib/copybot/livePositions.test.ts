@@ -101,3 +101,20 @@ describe("reconcileAccountPositions", () => {
     expect(snapshot.redeemableCount).toBe(1);
   });
 });
+describe("fresh-position grace period", () => {
+  it("keeps a just-opened bot position the lagging positions API doesn't show yet", () => {
+    const now = 1_800_000_000_000;
+    const local = makePosition({ tokenId: "fresh", shares: 6, openedAt: now - 30_000, updatedAt: now - 30_000, sourceWallets: ["0xleader"] });
+    const { positions, snapshot } = reconcileAccountPositions([], [local], [makeTrader("0xleader")], now);
+    expect(positions.map((p) => p.tokenId)).toContain("fresh");
+    expect(snapshot.stalePositionCount).toBe(0);
+  });
+
+  it("drops an old local position the account no longer holds", () => {
+    const now = 1_800_000_000_000;
+    const local = makePosition({ tokenId: "old", shares: 6, openedAt: now - 3_600_000, updatedAt: now - 3_600_000 });
+    const { positions, snapshot } = reconcileAccountPositions([], [local], [], now);
+    expect(positions.map((p) => p.tokenId)).not.toContain("old");
+    expect(snapshot.stalePositionCount).toBe(1);
+  });
+});

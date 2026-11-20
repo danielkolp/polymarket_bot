@@ -102,3 +102,38 @@ describe("matchLiveFills", () => {
     expect(records[0]).toBe(rec);
   });
 });
+
+import { classifyUnconfirmedOrder, UNKNOWN_ORDER_VOID_MS, voidLiveRecord } from "./reconciliation";
+
+describe("classifyUnconfirmedOrder (self-healing)", () => {
+  const now = 1_800_000_000_000;
+  const rec = (over: Record<string, unknown> = {}) =>
+    ({
+      id: "r1", sourceTradeId: "s", status: "copied", mode: "real", traderWallet: "0x", traderName: "t",
+      side: "BUY", tokenId: "tok", conditionId: "c", marketSlug: "m", marketTitle: "M", outcome: "Yes",
+      price: 0.5, sourceSize: 10, sourceAmountUsd: 5, copyAmountUsd: 3, copiedShares: 6, realizedPnlUsd: 0,
+      reason: "LIVE BUY", txOrOrderId: "order-1", sourceTimestamp: now - 1000, processedAt: now - 1000,
+      reconciliationStatus: "unmatched", ...over,
+    }) as never;
+
+  it("voids a record with no order id immediately", () => {
+    expect(classifyUnconfirmedOrder(rec({ txOrOrderId: "" }), null, now).action).toBe("void");
+  });
+  it("voids a cancelled/unmatched order with nothing filled", () => {
+    const v = classifyUnconfirmedOrder(rec(), { orderId: "order-1", status: "CANCELED", sizeMatched: 0, originalSize: 6, price: 0.5, side: "BUY", tokenId: "tok" }, now);
+    expect(v.action).toBe("void");
+  });
+  it("records a matched size reported by the exchange", () => {
+    const v = classifyUnconfirmedOrder(rec(), { orderId: "order-1", status: "MATCHED", sizeMatched: 5.5, originalSize: 6, price: 0.51, side: "BUY", tokenId: "tok" }, now);
+    expect(v).toEqual({ action: "fill", shares: 5.5, price: 0.51 });
+  });
+  it("waits on an unknown order until the void window passes", () => {
+    expect(classifyUnconfirmedOrder(rec(), null, now).action).toBe("wait");
+    expect(classifyUnconfirmedOrder(rec({ processedAt: now - UNKNOWN_ORDER_VOID_MS - 1 }), null, now).action).toBe("void");
+  });
+  it("voided records stop counting as open live orders", () => {
+    const voided = voidLiveRecord(rec(), "test", now) as { status: string; actualFilledShares: number };
+    expect(voided.status).toBe("failed");
+    expect(voided.actualFilledShares).toBe(0);
+  });
+});

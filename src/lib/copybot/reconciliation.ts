@@ -17,7 +17,7 @@
  * It never mutates positions and never places orders; it only annotates records.
  */
 import { config } from "@/lib/config";
-import { fetchLiveTrades, type LiveTradeFill } from "@/lib/execution/liveClob";
+import { fetchLiveOrder, fetchLiveTrades, type LiveOrderState, type LiveTradeFill } from "@/lib/execution/liveClob";
 import { tradeIsAuthoritative } from "./ledger";
 import type { CopyTradeRecord, ReconciliationStatus } from "./types";
 
@@ -28,8 +28,16 @@ export interface ReconciliationSummary {
   partial: number;
   unmatched: number;
   errored: number;
+  /** Orders the exchange confirmed never filled (cleared so they stop blocking). */
+  voided: number;
   error: string | null;
 }
+
+/** After this long without any trace on the exchange, an order is treated as never filled. */
+export const UNKNOWN_ORDER_VOID_MS = 10 * 60 * 1000;
+/** Max per-order status lookups per reconciliation pass (rate-limit friendly). */
+const MAX_ORDER_LOOKUPS = 6;
+const DEAD_ORDER_STATUSES = new Set(["CANCELED", "CANCELLED", "UNMATCHED", "CANCELED_MARKET_RESOLVED", "EXPIRED", "KILLED"]);
 
 export interface MatchOptions {
   /** Allow heuristic token/side/time matching. Default false (order-id only). */
@@ -56,6 +64,7 @@ const emptySummary: ReconciliationSummary = {
   partial: 0,
   unmatched: 0,
   errored: 0,
+  voided: 0,
   error: null,
 };
 
@@ -156,47 +165,141 @@ export function matchLiveFills(
 }
 
 /**
- * Reconcile real-mode copy records against authoritative CLOB fills. Returns a
- * new records array (already-authoritative records are left untouched) plus a
- * summary. Fetch/parse failures flag unverified records as `error` so the
- * dashboard surfaces the gap and new BUYs block — never fabricates fills.
+ * Mark a copied live order as having never filled: it becomes a `failed`
+ * record (no fill, excluded from accounting) so it stops blocking trading.
+ */
+export function voidLiveRecord(record: CopyTradeRecord, why: string, now = Date.now()): CopyTradeRecord {
+  return {
+    ...record,
+    status: "failed",
+    reconciliationStatus: "matched",
+    reconciledAt: now,
+    actualFilledShares: 0,
+    actualNotionalUsd: 0,
+    reason: `${record.reason} [No fill: ${why}]`,
+  };
+}
+
+/**
+ * Decide what to do with a still-unconfirmed order given its exchange state.
+ * Pure — exported for tests.
+ *  - "void": the exchange says it never filled (or it is unknown for too long)
+ *  - "fill": the exchange reports a matched size we can record
+ *  - "wait": still inconclusive
+ */
+export function classifyUnconfirmedOrder(
+  record: CopyTradeRecord,
+  order: LiveOrderState | null,
+  now = Date.now(),
+): { action: "void"; why: string } | { action: "fill"; shares: number; price: number } | { action: "wait" } {
+  if (!record.txOrOrderId) return { action: "void", why: "no order id was returned" };
+  const age = now - record.processedAt;
+  if (order && order.sizeMatched > 0) {
+    const price = order.price > 0 ? order.price : record.effectivePrice ?? record.price;
+    return { action: "fill", shares: order.sizeMatched, price };
+  }
+  if (order && DEAD_ORDER_STATUSES.has(order.status)) {
+    return { action: "void", why: `exchange status ${order.status}` };
+  }
+  if (age > UNKNOWN_ORDER_VOID_MS) {
+    return { action: "void", why: order ? `still ${order.status || "unknown"} after 10 minutes` : "order unknown to the exchange after 10 minutes" };
+  }
+  return { action: "wait" };
+}
+
+/**
+ * Reconcile real-mode copy records against authoritative CLOB fills, then ask
+ * the exchange directly about any order that still has no trace. Orders that
+ * never filled are voided so a single stuck record can no longer block trading
+ * indefinitely. A failed history fetch leaves records as they were (it never
+ * escalates them) and is reported in the summary.
  */
 export async function reconcileLiveTrades(
   records: CopyTradeRecord[],
   now = Date.now(),
 ): Promise<{ records: CopyTradeRecord[]; summary: ReconciliationSummary }> {
-  const targets = records.filter(isReconcilable);
-  if (targets.length === 0) return { records, summary: { ...emptySummary } };
+  const unresolved = records.filter((r) => isReconcilable(r) && !tradeIsAuthoritative(r));
+  if (unresolved.length === 0) return { records, summary: { ...emptySummary } };
 
-  let fills: LiveTradeFill[];
+  // Only walk trade history newer than the oldest unresolved order (minus slack).
+  const sinceMs = Math.min(...unresolved.map((r) => r.processedAt)) - 60 * 60 * 1000;
+  let fills: LiveTradeFill[] = [];
+  let fetchError: string | null = null;
   try {
-    fills = await fetchLiveTrades();
+    fills = await fetchLiveTrades({ sinceMs });
   } catch (err) {
-    const updated = records.map((record) =>
-      isReconcilable(record) && !tradeIsAuthoritative(record)
-        ? { ...record, reconciliationStatus: "error" as ReconciliationStatus, reconciledAt: now }
-        : record,
-    );
-    return {
-      records: updated,
-      summary: {
-        ...emptySummary,
-        ran: true,
-        errored: targets.length,
-        error: err instanceof Error ? err.message : String(err),
-      },
-    };
+    fetchError = err instanceof Error ? err.message : String(err);
   }
 
-  const { records: updated, matched, partial, unmatched } = matchLiveFills(
-    records,
-    fills,
-    { allowFuzzy: config.liveAllowFuzzyReconcile },
-    now,
-  );
+  let working = records;
+  let matched = 0;
+  let partial = 0;
+  let unmatched = 0;
+  if (!fetchError) {
+    const res = matchLiveFills(records, fills, { allowFuzzy: config.liveAllowFuzzyReconcile }, now);
+    working = res.records;
+    matched = res.matched;
+    partial = res.partial;
+    unmatched = res.unmatched;
+  }
+
+  // Ask the exchange about orders still without a confirmed fill.
+  let voided = 0;
+  let lookups = 0;
+  const out: CopyTradeRecord[] = [];
+  for (const record of working) {
+    if (!isReconcilable(record) || tradeIsAuthoritative(record)) {
+      out.push(record);
+      continue;
+    }
+    let order: LiveOrderState | null = null;
+    let lookedUp = false;
+    if (record.txOrOrderId && lookups < MAX_ORDER_LOOKUPS) {
+      lookups += 1;
+      try {
+        order = await fetchLiveOrder(record.txOrOrderId);
+        lookedUp = true;
+      } catch {
+        lookedUp = false;
+      }
+    }
+    if (!lookedUp && record.txOrOrderId) {
+      out.push(record);
+      continue;
+    }
+    const verdict = classifyUnconfirmedOrder(record, order, now);
+    if (verdict.action === "void") {
+      voided += 1;
+      if (unmatched > 0) unmatched -= 1;
+      out.push(voidLiveRecord(record, verdict.why, now));
+    } else if (verdict.action === "fill") {
+      const shares = record.copiedShares > 0 ? Math.min(verdict.shares, record.copiedShares * 1.0001) : verdict.shares;
+      partial += 1;
+      if (unmatched > 0) unmatched -= 1;
+      out.push({
+        ...record,
+        reconciliationStatus: "partial-match",
+        reconciledAt: now,
+        actualFilledShares: shares,
+        actualAvgPrice: verdict.price,
+        actualNotionalUsd: shares * verdict.price,
+      });
+    } else {
+      out.push(record);
+    }
+  }
 
   return {
-    records: updated,
-    summary: { ...emptySummary, ran: true, fetchedFills: fills.length, matched, partial, unmatched },
+    records: out,
+    summary: {
+      ...emptySummary,
+      ran: true,
+      fetchedFills: fills.length,
+      matched,
+      partial,
+      unmatched,
+      voided,
+      error: fetchError,
+    },
   };
 }
