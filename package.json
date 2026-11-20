@@ -14,8 +14,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@polymarket/clob-client": "^5.8.1",
-    "@polymarket/clob-client-v2": "^1.0.6",
+    "@polymarket/clob-client-v2": "^1.3.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "ethers": "^5.8.0",

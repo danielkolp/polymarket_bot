@@ -51,6 +51,9 @@ export interface RawClobBook {
   asks?: RawClobBookLevel[];
   hash?: string;
   timestamp?: string;
+  min_order_size?: string;
+  tick_size?: string;
+  neg_risk?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +119,11 @@ export interface OrderBook {
   timestamp: number | null;
   /** When Bonk fetched it (ms epoch). Used for stale-data detection. */
   fetchedAt: number;
+  /** Market minimum order size in shares (CLOB `min_order_size`), if reported. */
+  minOrderSize?: number | null;
+  /** Price tick (CLOB `tick_size`), if reported. */
+  tickSize?: number | null;
+  negRisk?: boolean | null;
 }
 
 // ---------------------------------------------------------------------------

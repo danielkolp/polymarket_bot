@@ -1,40 +1,40 @@
 /**
  * ⚠️  LIVE POLYMARKET EXECUTION — REAL MONEY.  ⚠️
  *
- * Talks to Polymarket's CLOB through @polymarket/clob-client (v5, viem-based),
- * using an ethers v5 Wallet as the EIP-712 signer. Everything here is gated:
+ * Talks to Polymarket's CLOB V2 (production since 2026-04-28) through
+ * @polymarket/clob-client-v2 for EVERY wallet type, using an ethers v5 Wallet
+ * as the EIP-712 signer. The legacy V1 client no longer works against
+ * production and has been removed. Everything here is gated:
  *
  *   1. config.enableRealTrading must be true (ENABLE_REAL_TRADING=true), AND
- *   2. POLYMARKET_PRIVATE_KEY must be set (+ funder/signature type for proxy/safe
- *      wallets).
+ *   2. POLYMARKET_PRIVATE_KEY must be set (+ funder/signature type for proxy,
+ *      safe or deposit wallets).
  *
- * Orders are placed as FAK ("fill and kill") market orders: they take liquidity
- * from the live book and cancel any unfilled remainder. BUY `amount` is USDC,
- * SELL `amount` is shares — matching the copy-trading flow.
+ * Orders are FAK ("fill and kill") marketable orders WITH an explicit worst
+ * price: a BUY never pays more than its limit and a SELL never accepts less than
+ * its floor. Unfilled remainders are cancelled by the exchange.
  *
- * NOTE ON ACCOUNTING: the returned `filledShares` / `effectivePrice` are a local
- * mirror estimated from the reference quote so the dashboard stays roughly
- * correct. The authoritative fills live on-chain and in the CLOB trade history;
- * reconciling against `getTrades()` is a documented follow-up.
+ * Every network call is wrapped in a timeout so a hung request can never freeze
+ * the bot loop.
  *
  * SERVER-ONLY. Never import this into a client component.
  */
 import { Wallet } from "ethers";
 import {
+  AssetType,
   ClobClient,
   OrderType,
   Side,
-  AssetType,
-  COLLATERAL_TOKEN_DECIMALS,
-  type ApiKeyCreds,
-} from "@polymarket/clob-client";
-import {
-  ClobClient as ClobClientV2,
   SignatureTypeV2,
-  Chain as ChainV2,
-  type ApiKeyCreds as ApiKeyCredsV2,
+  type ApiKeyCreds,
+  type Chain,
 } from "@polymarket/clob-client-v2";
 import { config } from "@/lib/config";
+import { getTokenMarketMeta, roundToTick } from "@/lib/polymarket/clobMeta";
+import { withTimeout } from "@/lib/util/withTimeout";
+
+const CLOB_CALL_TIMEOUT_MS = 15_000;
+const COLLATERAL_DECIMALS = 6;
 
 // Polymarket USD (pUSD) collateral for Deposit Wallet accounts. The v5 CLOB
 // client still reports the legacy USDC.e collateral balance through
@@ -200,6 +200,10 @@ export interface LiveOrderResult {
   txHashes: string[];
   raw: unknown;
   error: string | null;
+  /** The worst price the order was allowed to fill at. */
+  limitPrice?: number;
+  /** Accepted but delayed by the exchange: fill unknown, check via getOrder. */
+  pending?: boolean;
 }
 
 export interface LiveUsdcBalance {
@@ -240,6 +244,19 @@ export function getLiveAccountAddress(): string {
   return new Wallet(config.livePrivateKey.trim()).address.toLowerCase();
 }
 
+function signatureTypeV2(): SignatureTypeV2 {
+  switch (config.liveSignatureType) {
+    case 1:
+      return SignatureTypeV2.POLY_PROXY;
+    case 2:
+      return SignatureTypeV2.POLY_GNOSIS_SAFE;
+    case 3:
+      return SignatureTypeV2.POLY_1271;
+    default:
+      return SignatureTypeV2.EOA;
+  }
+}
+
 let clientPromise: Promise<ClobClient> | null = null;
 
 async function buildClient(): Promise<ClobClient> {
@@ -247,30 +264,28 @@ async function buildClient(): Promise<ClobClient> {
     throw new LiveTradingError("POLYMARKET_PRIVATE_KEY is not set.");
   }
   const host = config.clobUrl;
-  const chainId = config.liveChainId;
-  const signatureType = config.liveSignatureType as ConstructorParameters<typeof ClobClient>[4];
-  const funder = config.liveFunderAddress.trim() || undefined;
-
-  // ethers v5 Wallet — satisfies the client's EthersSigner interface
-  // (_signTypedData + getAddress). No RPC provider is needed to sign orders.
+  const chain = config.liveChainId as Chain;
+  const funderAddress = config.liveFunderAddress.trim() || undefined;
+  const signatureType = signatureTypeV2();
+  // ethers v5 Wallet satisfies the client's signer interface (_signTypedData +
+  // getAddress). No RPC provider is needed to sign orders.
   const signer = new Wallet(config.livePrivateKey.trim());
 
   // L1 (key-signing) client used only to mint/derive the L2 API credentials.
-  const l1 = new ClobClient(host, chainId, signer, undefined, signatureType, funder);
+  const l1 = new ClobClient({ host, chain, signer, signatureType, funderAddress, useServerTime: true });
   let creds: ApiKeyCreds;
   try {
-    creds = await l1.createOrDeriveApiKey();
+    creds = await withTimeout(l1.createOrDeriveApiKey(), CLOB_CALL_TIMEOUT_MS, "Polymarket API key derivation");
   } catch (err) {
-    throw new LiveTradingError(
-      `Failed to derive Polymarket API credentials: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    throw new LiveTradingError(`Failed to derive Polymarket API credentials: ${errorMessage(err)}`);
   }
-
-  // L2 (authenticated) client used for order placement.
-  return new ClobClient(host, chainId, signer, creds, signatureType, funder);
+  if (!creds?.key || !creds?.secret || !creds?.passphrase) {
+    throw new LiveTradingError("Polymarket returned incomplete API credentials.");
+  }
+  return new ClobClient({ host, chain, signer, creds, signatureType, funderAddress, useServerTime: true });
 }
 
-/** Lazily construct and cache the authenticated CLOB client. */
+/** Lazily construct and cache the authenticated CLOB V2 client. */
 export async function getLiveClobClient(): Promise<ClobClient> {
   if (!clientPromise) {
     clientPromise = buildClient().catch((err) => {
@@ -286,45 +301,9 @@ export function resetLiveClobClient(): void {
   clientPromise = null;
 }
 
-// ── v2 client (POLYMARKET_SIGNATURE_TYPE=3 / POLY_1271) ──────────────────────
-
-let clientV2Promise: Promise<ClobClientV2> | null = null;
-
-async function buildClientV2(): Promise<ClobClientV2> {
-  if (!config.livePrivateKey.trim()) {
-    throw new LiveTradingError("POLYMARKET_PRIVATE_KEY is not set.");
-  }
-  const host = config.clobUrl;
-  // ChainV2 is a numeric enum (137 / 80002) that matches config.liveChainId.
-  const chain = config.liveChainId as ChainV2;
-  const funder = config.liveFunderAddress.trim() || undefined;
-  const signer = new Wallet(config.livePrivateKey.trim());
-
-  const l1 = new ClobClientV2({ host, chain, signer, signatureType: SignatureTypeV2.POLY_1271, funderAddress: funder });
-  let creds: ApiKeyCredsV2;
-  try {
-    creds = await l1.createOrDeriveApiKey();
-  } catch (err) {
-    throw new LiveTradingError(
-      `Failed to derive Polymarket API credentials (v2): ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
-  return new ClobClientV2({ host, chain, signer, creds, signatureType: SignatureTypeV2.POLY_1271, funderAddress: funder });
-}
-
-export async function getLiveV2ClobClient(): Promise<ClobClientV2> {
-  if (!clientV2Promise) {
-    clientV2Promise = buildClientV2().catch((err) => {
-      clientV2Promise = null;
-      throw err;
-    });
-  }
-  return clientV2Promise;
-}
-
-export function resetLiveV2ClobClient(): void {
-  clientV2Promise = null;
+/** Run a CLOB client call with a hard timeout. */
+function clob<T>(promise: Promise<T>, label: string, ms = CLOB_CALL_TIMEOUT_MS): Promise<T> {
+  return withTimeout(promise, ms, label);
 }
 
 function errorMessage(err: unknown): string {
@@ -335,47 +314,46 @@ function normalizeCollateralAmount(value: unknown, field: string): number {
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "bigint") {
     throw new LiveTradingError("Polymarket balance response is missing numeric " + field + ".");
   }
-
   const raw = String(value).trim();
-  if (!raw) {
-    throw new LiveTradingError("Polymarket balance response returned empty " + field + ".");
-  }
-
+  if (!raw) throw new LiveTradingError("Polymarket balance response returned empty " + field + ".");
   if (/^\d+$/.test(raw)) {
-    const units = BigInt(raw);
-    const divisor = 10n ** BigInt(COLLATERAL_TOKEN_DECIMALS);
-    const whole = units / divisor;
-    const fraction = (units % divisor).toString().padStart(COLLATERAL_TOKEN_DECIMALS, "0");
-    const normalized = Number(whole.toString() + "." + fraction);
-    if (!Number.isFinite(normalized) || normalized > Number.MAX_SAFE_INTEGER) {
-      throw new LiveTradingError("Polymarket balance response " + field + " is too large to normalize safely.");
-    }
-    return normalized;
+    return normalizeErc20Balance("0x" + BigInt(raw).toString(16), COLLATERAL_DECIMALS);
   }
-
   if (/^\d+\.\d+$/.test(raw)) {
     const normalized = Number(raw);
-    if (!Number.isFinite(normalized) || normalized > Number.MAX_SAFE_INTEGER) {
-      throw new LiveTradingError("Polymarket balance response " + field + " is invalid.");
-    }
+    if (!Number.isFinite(normalized)) throw new LiveTradingError("Polymarket balance response " + field + " is invalid.");
     return normalized;
   }
-
   throw new LiveTradingError("Polymarket balance response " + field + " has an unsupported format.");
 }
 
-function normalizeOptionalCollateralAmount(value: unknown, field: string): number | undefined {
-  if (value == null || value === "") return undefined;
-  try {
-    return normalizeCollateralAmount(value, field);
-  } catch {
-    return undefined;
+function maxAllowance(raw: Record<string, unknown>): number | undefined {
+  const allowances = raw.allowances;
+  if (allowances && typeof allowances === "object") {
+    let best: number | undefined;
+    for (const v of Object.values(allowances as Record<string, unknown>)) {
+      try {
+        const n = normalizeCollateralAmount(v, "allowance");
+        best = best == null ? n : Math.max(best, n);
+      } catch {
+        // ignore malformed allowance entries
+      }
+    }
+    return best;
   }
+  if (raw.allowance != null) {
+    try {
+      return normalizeCollateralAmount(raw.allowance, "allowance");
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 async function syncClobBalanceAllowance(client: ClobClient): Promise<unknown> {
   try {
-    return await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    return await clob(client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL }), "balance-allowance sync");
   } catch (err) {
     return { error: errorMessage(err) };
   }
@@ -408,9 +386,9 @@ async function fetchPusdBalanceSnapshot(
   throw new PusdBalanceUnavailableError();
 }
 /**
- * Fetch the authoritative live cash balance. For EOA/proxy/safe accounts this
- * uses authenticated CLOB balance-allowance; for deposit-wallet pUSD accounts it
- * reads cash-only public/on-chain sources by funder address.
+ * Fetch the authoritative live cash balance. Uses authenticated CLOB V2
+ * balance-allowance; deposit-wallet (type 3) accounts and empty CLOB reads fall
+ * back to cash-only public/on-chain pUSD sources by funder address.
  */
 export async function fetchLiveUsdcBalance(options: { syncAllowance?: boolean } = {}): Promise<LiveUsdcBalance> {
   const privateKey = config.livePrivateKey.trim();
@@ -424,82 +402,61 @@ export async function fetchLiveUsdcBalance(options: { syncAllowance?: boolean } 
   }
 
   if (!privateKey) {
-    if (funder) {
-      return fetchPusdBalanceSnapshot(funder, { skippedClob: "POLYMARKET_PRIVATE_KEY not set" });
-    }
+    if (funder) return fetchPusdBalanceSnapshot(funder, { skippedClob: "POLYMARKET_PRIVATE_KEY not set" });
     throw new LiveTradingError("POLYMARKET_PRIVATE_KEY is not set. Cannot fetch live balance.");
   }
 
   try {
     const client = await getLiveClobClient();
     let syncResult: unknown = null;
-    if (options.syncAllowance) {
+    if (options.syncAllowance) syncResult = await syncClobBalanceAllowance(client);
+
+    const read = async () => {
+      const resp = await clob(client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL }), "balance read");
+      const raw = (resp ?? {}) as unknown as Record<string, unknown>;
+      if (raw.error) throw new LiveTradingError("Polymarket balance endpoint returned an error: " + String(raw.error));
+      return { resp, raw, balance: normalizeCollateralAmount(raw.balance, "balance") };
+    };
+
+    let r = await read();
+    if (r.balance === 0 && !options.syncAllowance) {
       syncResult = await syncClobBalanceAllowance(client);
+      r = await read();
     }
-
-    const resp = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-    const raw = (resp ?? {}) as unknown as Record<string, unknown>;
-    if (raw.error) {
-      throw new LiveTradingError("Polymarket balance endpoint returned an error: " + String(raw.error));
-    }
-
-    const clobBalance = normalizeCollateralAmount(raw.balance, "balance");
-
-    if (clobBalance === 0 && funder) {
-      if (!options.syncAllowance) {
-        syncResult = await syncClobBalanceAllowance(client);
-        const refreshed = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-        const refreshedRaw = (refreshed ?? {}) as unknown as Record<string, unknown>;
-        if (refreshedRaw.error) {
-          throw new LiveTradingError("Polymarket balance endpoint returned an error: " + String(refreshedRaw.error));
-        }
-        const refreshedBalance = normalizeCollateralAmount(refreshedRaw.balance, "balance");
-        if (refreshedBalance > 0) {
-          return {
-            usdcBalance: refreshedBalance,
-            usdcAllowance: normalizeOptionalCollateralAmount(refreshedRaw.allowance, "allowance"),
-            raw: { balanceSource: "clob-after-sync", balanceSync: syncResult, balanceAllowance: refreshed },
-            updatedAt: new Date().toISOString(),
-          };
-        }
+    if (r.balance === 0 && funder) {
+      try {
+        return await fetchPusdBalanceSnapshot(funder, {
+          balanceSource: "clob-zero-fallback",
+          balanceSync: syncResult,
+          balanceAllowance: r.resp,
+        });
+      } catch {
+        // pUSD fallback unavailable: a genuine zero balance is still a valid answer
       }
-
-      return fetchPusdBalanceSnapshot(funder, {
-        balanceSource: "clob-zero-fallback",
-        balanceSync: syncResult,
-        balanceAllowance: resp,
-      });
     }
-
     return {
-      usdcBalance: clobBalance,
-      usdcAllowance: normalizeOptionalCollateralAmount(raw.allowance, "allowance"),
-      raw: syncResult ? { balanceSource: "clob", balanceSync: syncResult, balanceAllowance: resp } : resp,
+      usdcBalance: r.balance,
+      usdcAllowance: maxAllowance(r.raw),
+      raw: { balanceSource: "clob-v2", balanceSync: syncResult, balanceAllowance: r.resp },
       updatedAt: new Date().toISOString(),
     };
   } catch (err) {
     if (err instanceof LiveTradingError) throw err;
-    throw new LiveTradingError("Failed to fetch live USDC balance from Polymarket CLOB: " + errorMessage(err));
+    throw new LiveTradingError("Failed to fetch live balance from Polymarket CLOB: " + errorMessage(err));
   }
 }
+
 /**
- * Best-effort: make sure the CLOB has a USDC (collateral) allowance. Proxy/safe
- * wallets are handled by Polymarket; an EOA may need a one-time on-chain
- * approval that this call cannot perform — failures are swallowed.
+ * Best-effort: ask the CLOB to refresh its view of the collateral allowance.
+ * Proxy/safe wallets are approved by Polymarket; an EOA may need a one-time
+ * on-chain approval that this call cannot perform — failures are swallowed.
  */
 export async function ensureUsdcAllowance(): Promise<void> {
   try {
-    if (config.liveSignatureType === 3) {
-      const client = await getLiveV2ClobClient();
-      // AssetType string value is identical between v1 and v2 ("COLLATERAL").
-      await (client as unknown as { updateBalanceAllowance: (p: { asset_type: string }) => Promise<void> })
-        .updateBalanceAllowance({ asset_type: "COLLATERAL" });
-    } else {
-      const client = await getLiveClobClient();
-      await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-    }
+    const client = await getLiveClobClient();
+    await syncClobBalanceAllowance(client);
   } catch {
-    // ignore — surfaced elsewhere if an order later fails on allowance
+    // surfaced elsewhere if an order later fails on allowance
   }
 }
 
@@ -588,40 +545,35 @@ function extractTradePage(resp: unknown): { rows: unknown[]; nextCursor: string 
 }
 
 /**
- * Fetch authoritative trade fills for the trading account from the CLOB. This is
- * the source of truth for reconciling local live-order estimates against what
- * actually filled on-chain.
+ * Fetch authoritative trade fills for the trading account from the CLOB.
  *
- * Walks pages (up to config.liveReconcileMaxPages) when the client returns a
- * cursor-paginated shape, so older fills are not missed. Throws on network errors
- * OR on an unexpected payload shape — callers turn that into a reconciliation
- * error that blocks new BUYs. It never silently returns [] on a shape change.
+ * Only walks history newer than `sinceMs` (when given) and stops after
+ * config.liveReconcileMaxPages pages, so a long-lived account does not re-read
+ * its whole history every poll. Throws on network errors OR an unexpected
+ * payload shape — callers turn that into a reconciliation error.
  */
-export async function fetchLiveTrades(): Promise<LiveTradeFill[]> {
+export async function fetchLiveTrades(options: { sinceMs?: number } = {}): Promise<LiveTradeFill[]> {
   assertLiveTradingAllowed();
-  const rawClient = config.liveSignatureType === 3
-    ? await getLiveV2ClobClient()
-    : await getLiveClobClient();
-  const getTrades = (rawClient as unknown as { getTrades: (...args: unknown[]) => Promise<unknown> }).getTrades;
-  if (typeof getTrades !== "function") {
-    throw new LiveTradingError("Polymarket CLOB client does not expose getTrades(); cannot reconcile fills.");
-  }
-  const client = rawClient;
-
+  const client = await getLiveClobClient();
   const out: LiveTradeFill[] = [];
   const seen = new Set<string>();
-  let cursor: string | null = null;
+  let cursor: string | undefined;
   const maxPages = Math.max(1, config.liveReconcileMaxPages);
+  const params = options.sinceMs && options.sinceMs > 0
+    ? { after: String(Math.floor(options.sinceMs / 1000)) }
+    : undefined;
 
   for (let page = 0; page < maxPages; page += 1) {
     let resp: unknown;
     try {
-      resp = cursor ? await getTrades.call(client, undefined, false, cursor) : await getTrades.call(client);
+      resp = await clob(client.getTradesPaginated(params, cursor), "trade history read");
     } catch (err) {
       throw new LiveTradingError("Failed to fetch live trade history from Polymarket CLOB: " + errorMessage(err));
     }
-
-    const { rows, nextCursor } = extractTradePage(resp);
+    const shaped = resp && typeof resp === "object" && Array.isArray((resp as { trades?: unknown }).trades)
+      ? { data: (resp as { trades: unknown[] }).trades, next_cursor: (resp as { next_cursor?: string }).next_cursor }
+      : resp;
+    const { rows, nextCursor } = extractTradePage(shaped);
     for (const item of rows) {
       if (item && typeof item === "object") {
         const fill = normalizeLiveTrade(item as Record<string, unknown>);
@@ -631,12 +583,52 @@ export async function fetchLiveTrades(): Promise<LiveTradeFill[]> {
         }
       }
     }
-
     if (!nextCursor) break;
     cursor = nextCursor;
   }
-
   return out;
+}
+
+/** Authoritative state of one order (size matched so far, status). */
+export interface LiveOrderState {
+  orderId: string;
+  /** e.g. "MATCHED", "CANCELED", "LIVE", "UNMATCHED", "DELAYED". Upper-cased. */
+  status: string;
+  sizeMatched: number;
+  originalSize: number;
+  price: number;
+  side: "BUY" | "SELL";
+  tokenId: string;
+}
+
+/**
+ * Read one order from the CLOB. Returns null when the CLOB does not know the
+ * order (never accepted) — callers treat that as "no fill".
+ */
+export async function fetchLiveOrder(orderId: string): Promise<LiveOrderState | null> {
+  assertLiveTradingAllowed();
+  if (!orderId) return null;
+  const client = await getLiveClobClient();
+  let raw: unknown;
+  try {
+    raw = await clob(client.getOrder(orderId), "order status read");
+  } catch (err) {
+    const msg = errorMessage(err);
+    if (/not found|404|does not exist/i.test(msg)) return null;
+    throw new LiveTradingError("Failed to read order " + orderId + ": " + msg);
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (o.error || !(o.id || o.orderID)) return null;
+  return {
+    orderId: String(o.id ?? o.orderID ?? orderId),
+    status: String(o.status ?? "").toUpperCase(),
+    sizeMatched: toNum(o.size_matched),
+    originalSize: toNum(o.original_size),
+    price: toNum(o.price),
+    side: String(o.side ?? "").toUpperCase() === "SELL" ? "SELL" : "BUY",
+    tokenId: String(o.asset_id ?? ""),
+  };
 }
 
 export interface LiveMarketOrderParams {
@@ -646,92 +638,132 @@ export interface LiveMarketOrderParams {
   usdAmount?: number;
   /** Shares to sell — required for SELL. */
   shares?: number;
-  /** Best ask (BUY) / best bid (SELL); used for mirror accounting, not as a limit. */
+  /** Best ask (BUY) / best bid (SELL) used for the local estimate. */
   referencePrice: number;
+  /**
+   * Worst acceptable price: BUY never pays above it, SELL never sells below it.
+   * Rounded onto the market tick grid (down for BUY, up for SELL).
+   */
+  limitPrice?: number;
+  conditionId?: string | null;
+}
+
+function parseAmount(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /**
- * Place a marketable FAK order and return a normalized result. Throws only on
- * a hard failure (bad config, network); a rejected order returns success:false.
+ * Derive the actual fill from an order response's making/taking amounts.
+ * BUY: making = USDC paid, taking = shares received. SELL: the reverse.
+ * Amounts may come back as decimals or 6-dp base units; both are handled by
+ * sanity-checking against the requested size.
+ */
+export function fillFromOrderResponse(
+  side: "BUY" | "SELL",
+  requested: number,
+  making: unknown,
+  taking: unknown,
+): { shares: number; usd: number } | null {
+  let m = parseAmount(making);
+  let t = parseAmount(taking);
+  if (m == null || t == null) return null;
+  const scale = (x: number, cap: number) => (x > cap * 1000 ? x / 10 ** COLLATERAL_DECIMALS : x);
+  if (side === "BUY") {
+    m = scale(m, Math.max(1, requested)); // usd
+    t = scale(t, Math.max(1, requested) * 1000); // shares
+    const price = m / t;
+    if (!(price > 0 && price <= 1.0001)) return null;
+    return { shares: t, usd: m };
+  }
+  m = scale(m, Math.max(1, requested)); // shares
+  t = scale(t, Math.max(1, requested)); // usd
+  const price = t / m;
+  if (!(price > 0 && price <= 1.0001)) return null;
+  return { shares: m, usd: t };
+}
+
+/**
+ * Place a price-protected FAK order and return a normalized result. Throws only
+ * on a hard failure (bad config, network, timeout); a rejected order returns
+ * success:false. `filledShares` is the MATCHED size (0 when nothing filled).
  */
 export async function placeLiveMarketOrder(params: LiveMarketOrderParams): Promise<LiveOrderResult> {
   assertLiveTradingAllowed();
 
   const side = params.side === "BUY" ? Side.BUY : Side.SELL;
-  const amount = params.side === "BUY" ? params.usdAmount ?? 0 : params.shares ?? 0;
+  const amount = params.side === "BUY"
+    ? Math.floor((params.usdAmount ?? 0) * 100) / 100
+    : Math.floor((params.shares ?? 0) * 100) / 100;
   if (!(amount > 0)) {
     throw new LiveTradingError(`Live ${params.side} amount must be positive (got ${amount}).`);
   }
 
-  // We compute the marketable price ourselves and clamp it into the market's
-  // valid [tick, 1-tick] band before posting. Left to the library, deep books
-  // near 0/1 (a best bid of 0.999 with a reported 0.01 tick) make it derive a
-  // price its own validator then rejects ("invalid price (0.999)…"), which would
-  // strand a position the leader has already exited. A clamped SELL limit still
-  // crosses (a 0.99 limit fills against a 0.999 bid); FAK kills any remainder.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const client: any =
-    config.liveSignatureType === 3 ? await getLiveV2ClobClient() : await getLiveClobClient();
+  const client = await getLiveClobClient();
+  const meta = await getTokenMarketMeta(params.tokenId, params.conditionId);
+  const tick = meta.tickSize;
 
-  let tick = 0.01;
-  try {
-    tick = Number.parseFloat(await client.getTickSize(params.tokenId)) || 0.01;
-  } catch {
-    // Fall back to a conservative 0.01 tick; the clamp below still applies.
-  }
+  // Worst acceptable price on the tick grid. Without an explicit limit, fall
+  // back to the reference price +/- 5 ticks so an order can never sweep a thin
+  // book far away from the quote it was sized on.
+  const fallbackLimit = params.side === "BUY"
+    ? params.referencePrice + 5 * tick
+    : params.referencePrice - 5 * tick;
+  const rawLimit = params.limitPrice != null && Number.isFinite(params.limitPrice) ? params.limitPrice : fallbackLimit;
+  const price = roundToTick(rawLimit, tick, params.side === "BUY" ? "down" : "up");
 
-  let marketPrice: number | undefined;
-  try {
-    marketPrice = await client.calculateMarketPrice(params.tokenId, side, amount, OrderType.FAK);
-  } catch {
-    // No book / no match — let the library try (and surface its own error).
-    marketPrice = undefined;
-  }
-  if (marketPrice != null && Number.isFinite(marketPrice)) {
-    const lo = tick;
-    const hi = 1 - tick;
-    marketPrice = Math.round(marketPrice / tick) * tick;
-    marketPrice = Math.min(hi, Math.max(lo, marketPrice));
-  } else {
-    marketPrice = undefined;
-  }
-
-  // Side and OrderType string values ("BUY"/"SELL", "FAK") are identical in v1 and v2.
-  const order = {
-    tokenID: params.tokenId,
-    amount,
-    side,
-    orderType: OrderType.FAK,
-    ...(marketPrice != null ? { price: marketPrice } : {}),
-  };
-  const options = { tickSize: String(tick) };
-  const resp: unknown = await client.createAndPostMarketOrder(order, options, OrderType.FAK);
+  const resp: unknown = await clob(
+    client.createAndPostMarketOrder(
+      { tokenID: params.tokenId, amount, side, price, orderType: OrderType.FAK },
+      { tickSize: String(tick) as never, negRisk: meta.negRisk },
+      OrderType.FAK,
+    ),
+    "order placement",
+    25_000,
+  );
 
   const r = (resp ?? {}) as Record<string, unknown>;
   const orderIdRaw = r.orderID ?? r.orderId ?? null;
   const orderId = orderIdRaw ? String(orderIdRaw) : null;
   const status = r.status != null ? String(r.status) : null;
-  // v1 uses errorMsg; v2 client returns { error: string, status: number } on rejection
   const errorMsg = r.errorMsg ? String(r.errorMsg) : r.error ? String(r.error) : null;
-  const success = r.success === true || (r.success == null && orderId != null && !errorMsg);
+  const accepted = (r.success === true || (r.success == null && orderId != null)) && !errorMsg && orderId != null;
   const rawHashes = (r.transactionsHashes ?? r.transactionHashes) as unknown;
   const txHashes = Array.isArray(rawHashes) ? rawHashes.map(String) : [];
 
-  // Mirror estimate from the reference quote (see file header).
-  const price = params.referencePrice > 0 ? params.referencePrice : 0;
-  const filledShares =
-    params.side === "BUY" ? (price > 0 ? (params.usdAmount ?? 0) / price : 0) : params.shares ?? 0;
-  const notionalUsd = params.side === "BUY" ? params.usdAmount ?? 0 : filledShares * price;
+  let fill = fillFromOrderResponse(params.side, amount, r.makingAmount, r.takingAmount);
+  if (accepted && !fill && orderId) {
+    // Ask the CLOB what actually matched.
+    try {
+      const state = await fetchLiveOrder(orderId);
+      if (state && state.sizeMatched > 0) {
+        const px = state.price > 0 ? state.price : price;
+        fill = { shares: state.sizeMatched, usd: state.sizeMatched * px };
+      }
+    } catch {
+      // leave unknown; reconciliation resolves it
+    }
+  }
+
+  const delayed = /delay/i.test(status ?? "");
+  const filledShares = fill?.shares ?? 0;
+  const notionalUsd = fill?.usd ?? 0;
+  const effectivePrice = filledShares > 0 ? notionalUsd / filledShares : 0;
+  const success = accepted && (filledShares > 0 || delayed);
 
   return {
     success,
     orderId,
     status,
     filledShares,
-    effectivePrice: price,
+    effectivePrice,
     notionalUsd,
     txHashes,
     raw: resp,
-    error: success ? null : errorMsg ?? "Order was not accepted by the CLOB.",
+    error: success
+      ? null
+      : errorMsg ?? (accepted ? "Order was accepted but nothing filled at or better than the limit price." : "Order was not accepted by the CLOB."),
+    limitPrice: price,
+    pending: accepted && delayed && filledShares === 0,
   };
 }

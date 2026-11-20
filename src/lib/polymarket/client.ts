@@ -53,9 +53,17 @@ async function doFetch<T>(url: string, options: RequestOptions): Promise<T> {
         // Always hit the network; we add our own caching at the route layer.
         cache: "no-store",
       });
-      clearTimeout(timer);
+      // NOTE: the abort timer stays armed until the body is fully read, so a
+      // stalled response body can never hang the caller.
 
+      if (res.status === 429 && attempt < retries) {
+        // Rate limited: back off and retry instead of silently dropping data.
+        clearTimeout(timer);
+        await sleep(1000 * (attempt + 1));
+        continue;
+      }
       if (res.status >= 500) {
+        clearTimeout(timer);
         lastError = new PolymarketError(`Upstream ${res.status} for ${url}`, 502);
         if (attempt < retries) {
           await sleep(250 * (attempt + 1));
@@ -65,13 +73,16 @@ async function doFetch<T>(url: string, options: RequestOptions): Promise<T> {
       }
       if (!res.ok) {
         const text = await res.text().catch(() => "");
+        clearTimeout(timer);
         throw new PolymarketError(
           `Upstream ${res.status} for ${url}${text ? `: ${text.slice(0, 200)}` : ""}`,
           res.status,
         );
       }
 
-      return (await res.json()) as T;
+      const parsed = (await res.json()) as T;
+      clearTimeout(timer);
+      return parsed;
     } catch (err) {
       clearTimeout(timer);
       lastError = err;

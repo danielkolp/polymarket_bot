@@ -121,5 +121,13 @@ export function normalizeBook(raw: RawClobBook, tokenIdFallback: string): OrderB
     spread,
     timestamp: Number.isFinite(ts) ? ts : null,
     fetchedAt: Date.now(),
+    minOrderSize: positiveOrNull(raw.min_order_size),
+    tickSize: positiveOrNull(raw.tick_size),
+    negRisk: typeof raw.neg_risk === "boolean" ? raw.neg_risk : null,
   };
+}
+
+function positiveOrNull(value: string | undefined): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
