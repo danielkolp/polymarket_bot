@@ -27,10 +27,21 @@ const ERRORS_FILE = path.join(DATA_DIR, "errors.log");
 const STATE_FILE = path.join(DATA_DIR, "bot-state.json");
 const LIVE_POSITIONS_FILE = path.join(DATA_DIR, "live-positions.json");
 const REDEEMED_FILE = path.join(DATA_DIR, "redeemed.json");
+const SKIPS_FILE = path.join(DATA_DIR, "skips.json");
 
-const MAX_TRADES = 1000;
+/** Real copies/exits only (skips live in their own small ring). */
+const MAX_TRADES = 2000;
+/** Recent skipped-trade decisions kept for the dashboard. */
+const MAX_SKIPS = 300;
 const MAX_LOGS = 500;
-const MAX_EQUITY_POINTS = 1500;
+const MAX_EQUITY_POINTS = 2000;
+/** Equity points closer together than this replace the previous point. */
+const EQUITY_POINT_SPACING_MS = 120_000;
+/** errors.log is rotated to errors.log.1 once it grows past this. */
+const MAX_LOG_BYTES = 1024 * 1024;
+/** The dashboard only ever needs the newest log lines. */
+const LOG_TAIL_BYTES = 96 * 1024;
+const MAX_SEEN_IDS = 5000;
 const JSON_READ_RETRY_DELAYS_MS = [20, 50, 100];
 let writeChain = Promise.resolve();
 const lastGoodJson = new Map<string, unknown>();
@@ -100,7 +111,8 @@ async function writeJson<T>(file: string, value: T): Promise<void> {
     `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
   );
   try {
-    await fs.writeFile(tmpFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    // Compact JSON: these files are rewritten every poll on a small VPS disk.
+    await fs.writeFile(tmpFile, `${JSON.stringify(value)}\n`, "utf8");
     try {
       await fs.rename(tmpFile, file);
     } catch (renameErr) {
@@ -177,20 +189,48 @@ export async function loadSeenTrades(): Promise<SeenTradeBook> {
 }
 
 export async function saveSeenTrades(book: SeenTradeBook): Promise<void> {
-  await enqueueWrite(() => writeJson(SEEN_FILE, { ids: [...new Set(book.ids)].slice(-10000) }));
+  await enqueueWrite(() => writeJson(SEEN_FILE, { ids: [...new Set(book.ids)].slice(-MAX_SEEN_IDS) }));
 }
 
+/** Copy/exit ledger (never contains skipped decisions). */
 export async function loadTrades(): Promise<CopyTradeRecord[]> {
-  return readJson<CopyTradeRecord[]>(TRADES_FILE, []);
+  const trades = await readJson<CopyTradeRecord[]>(TRADES_FILE, []);
+  return trades.filter((t) => t.status !== "skipped");
 }
 
 export async function saveTrades(trades: CopyTradeRecord[]): Promise<void> {
-  await enqueueWrite(() => writeJson(TRADES_FILE, trades.slice(0, MAX_TRADES)));
+  const kept = trades.filter((t) => t.status !== "skipped").slice(0, MAX_TRADES);
+  await enqueueWrite(() => writeJson(TRADES_FILE, kept));
 }
 
+/** Recent skipped decisions (newest first), kept apart so they never crowd out real trades. */
+export async function loadSkips(): Promise<CopyTradeRecord[]> {
+  return readJson<CopyTradeRecord[]>(SKIPS_FILE, []);
+}
+
+/**
+ * Record one decision. Skips go to a small ring buffer; everything else to the
+ * trade ledger — so the ledger isn't rewritten for every skipped trade and real
+ * history never ages out early.
+ */
 export async function prependTrade(record: CopyTradeRecord): Promise<void> {
+  if (record.status === "skipped") {
+    const skips = await loadSkips();
+    await enqueueWrite(() => writeJson(SKIPS_FILE, [record, ...skips].slice(0, MAX_SKIPS)));
+    return;
+  }
   const trades = await loadTrades();
   await saveTrades([record, ...trades]);
+}
+
+/** Ledger + recent skips merged newest-first (dashboard / scoreboard view). */
+export async function loadRecentDecisions(limit = 300): Promise<CopyTradeRecord[]> {
+  const [trades, skips] = await Promise.all([loadTrades(), loadSkips()]);
+  return [...trades.slice(0, limit), ...skips].sort((a, b) => b.processedAt - a.processedAt).slice(0, limit);
+}
+
+export async function clearSkips(): Promise<void> {
+  await enqueueWrite(() => writeJson(SKIPS_FILE, []));
 }
 
 export async function loadPositions(): Promise<BotPosition[]> {
@@ -214,7 +254,7 @@ export async function saveEquityCurve(points: EquityPoint[]): Promise<void> {
 export async function appendEquityPoint(point: EquityPoint): Promise<void> {
   const points = await loadEquityCurve();
   const last = points[points.length - 1];
-  const shouldReplace = last && point.ts - last.ts < 5000;
+  const shouldReplace = last && point.ts - last.ts < EQUITY_POINT_SPACING_MS;
   const next = shouldReplace ? [...points.slice(0, -1), point] : [...points, point];
   await saveEquityCurve(next);
 }
@@ -280,22 +320,54 @@ export async function clearLogs(): Promise<void> {
   await enqueueWrite(() => fs.writeFile(ERRORS_FILE, "", "utf8"));
 }
 
+let appendsSinceSizeCheck = 0;
+
+async function rotateLogIfLarge(): Promise<void> {
+  appendsSinceSizeCheck += 1;
+  if (appendsSinceSizeCheck < 50) return;
+  appendsSinceSizeCheck = 0;
+  try {
+    const stat = await fs.stat(ERRORS_FILE);
+    if (stat.size > MAX_LOG_BYTES) await fs.rename(ERRORS_FILE, `${ERRORS_FILE}.1`);
+  } catch {
+    // rotation is best-effort
+  }
+}
+
 export async function appendLog(level: BotLogEntry["level"], message: string): Promise<BotLogEntry> {
   await ensureErrorLog();
   const entry: BotLogEntry = {
     id: `log_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
     ts: Date.now(),
     level,
-    message,
+    message: message.length > 2000 ? message.slice(0, 2000) + "…" : message,
   };
   const line = JSON.stringify(entry);
   await fs.appendFile(ERRORS_FILE, `${line}\n`, "utf8");
+  await rotateLogIfLarge();
   return entry;
+}
+
+/** Read only the tail of a file (the dashboard needs the newest lines). */
+async function readTail(file: string, bytes: number): Promise<string> {
+  const handle = await fs.open(file, "r");
+  try {
+    const { size } = await handle.stat();
+    const start = Math.max(0, size - bytes);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    const text = buffer.toString("utf8");
+    // Drop a partial first line when we started mid-file.
+    return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function loadLogs(limit = MAX_LOGS): Promise<BotLogEntry[]> {
   await ensureErrorLog();
-  const raw = await fs.readFile(ERRORS_FILE, "utf8");
+  const raw = await readTail(ERRORS_FILE, LOG_TAIL_BYTES);
   const entries = raw
     .split(/\r?\n/)
     .filter(Boolean)

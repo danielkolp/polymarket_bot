@@ -182,10 +182,10 @@ export async function updateMissedOpportunities(opts: MissedOptions): Promise<nu
         basis,
       };
       await appendNdjson(ANALYTICS_FILES.missed, missed);
-      // Only mark "resolved" permanently once the market actually settled; an
-      // elapsed-but-open market is re-evaluated on a later pass so we capture the
-      // final outcome rather than a midpoint snapshot.
-      if (basis === "resolved") resolved.add(d.id);
+      // Each skipped decision is evaluated once. (Re-evaluating still-open
+      // markets used to re-append the same oldest rows every pass, so the queue
+      // never advanced and missed.ndjson filled with duplicates.)
+      resolved.add(d.id);
       count += 1;
     } catch {
       // Swallow per-item failures; retry on a later pass.

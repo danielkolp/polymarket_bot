@@ -22,8 +22,10 @@ export const ANALYTICS_FILES = {
   missedResolved: path.join(ANALYTICS_DIR, "missed-resolved.json"),
 } as const;
 
-const COMPACT_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8 MB
-const COMPACT_KEEP_LINES = 50_000;
+// Small-VPS budget: each stream stays under ~2 MB (compacted to its newest
+// 5,000 lines), so the whole analytics folder is bounded to ~10 MB.
+const COMPACT_THRESHOLD_BYTES = 2 * 1024 * 1024; // 2 MB
+const COMPACT_KEEP_LINES = 5_000;
 
 async function ensureDir(): Promise<void> {
   await fs.mkdir(ANALYTICS_DIR, { recursive: true });
@@ -136,7 +138,7 @@ export async function writeResolvedSet(ids: Set<string>): Promise<void> {
   try {
     await ensureDir();
     // Bound the set so it cannot grow without limit.
-    const arr = [...ids].slice(-100_000);
+    const arr = [...ids].slice(-20_000);
     await fs.writeFile(ANALYTICS_FILES.missedResolved, JSON.stringify(arr), "utf8");
   } catch (err) {
     if (process.env.NODE_ENV !== "test") {

@@ -71,20 +71,12 @@ export function mutationGuard(req: Request): NextResponse | null {
     return deny("Cross-origin request rejected.", 403);
   }
 
-  // 2) Optional shared-secret auth.
-  const expected = config.dashboardAuthToken.trim();
-  if (expected) {
-    const headerToken = req.headers.get("x-dashboard-token")?.trim() ?? "";
-    const cookieToken = parseCookies(req.headers.get("cookie")).dashboard_token?.trim() ?? "";
-    const provided = headerToken || cookieToken;
-    if (!provided || !constantTimeEqual(provided, expected)) {
-      return deny("Unauthorized: missing or invalid dashboard token.", 401);
-    }
-  }
-
-  // 3) Rate limiting.
+  // 2) Rate limiting — BEFORE the token check so tokens can't be brute-forced.
   const key = clientKey(req, pathname);
   const now = Date.now();
+  if (buckets.size > 2_000) {
+    for (const [k, v] of buckets) if (now > v.resetAt) buckets.delete(k);
+  }
   const bucket = buckets.get(key);
   if (!bucket || now > bucket.resetAt) {
     buckets.set(key, { count: 1, resetAt: now + RATE_WINDOW_MS });
@@ -92,6 +84,17 @@ export function mutationGuard(req: Request): NextResponse | null {
     bucket.count += 1;
     if (bucket.count > RATE_MAX) {
       return deny("Too many requests. Slow down.", 429);
+    }
+  }
+
+  // 3) Optional shared-secret auth.
+  const expected = config.dashboardAuthToken.trim();
+  if (expected) {
+    const headerToken = req.headers.get("x-dashboard-token")?.trim() ?? "";
+    const cookieToken = parseCookies(req.headers.get("cookie")).dashboard_token?.trim() ?? "";
+    const provided = headerToken || cookieToken;
+    if (!provided || !constantTimeEqual(provided, expected)) {
+      return deny("Unauthorized: missing or invalid dashboard token.", 401);
     }
   }
 

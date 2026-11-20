@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { config } from "@/lib/config";
 import { fetchBook } from "@/lib/polymarket/clob";
 import { fetchMarketById } from "@/lib/polymarket/gamma";
@@ -27,7 +28,6 @@ import {
   sourceWalletsOf,
 } from "./leaderPositions";
 import { fetchUserPositions } from "@/lib/polymarket/positions";
-import { inspectBullpenCli } from "./bullpen";
 import {
   applyRiskPreset,
   isRiskPresetId,
@@ -57,8 +57,10 @@ import {
   loadLogs,
   loadLivePositions,
   loadPositions,
+  loadRecentDecisions,
   loadRedeemBook,
   loadSeenTrades,
+  clearSkips,
   loadSettings,
   loadTraders,
   loadTrades,
@@ -137,6 +139,11 @@ function sourceTradeId(trade: TraderTrade): string {
     trade.price,
     trade.size,
   ].join(":");
+}
+
+/** Compact key for the seen-trade book (16 hex chars instead of ~200). */
+function seenKey(trade: TraderTrade): string {
+  return createHash("sha1").update(sourceTradeId(trade)).digest("hex").slice(0, 16);
 }
 
 function normalizeWallet(wallet: string): string {
@@ -718,14 +725,17 @@ export class CopyBotEngine {
   async status(): Promise<BotStatus> {
     await ensureDataFiles();
     const settings = await loadSettings();
-    const [state, traders, positions, trades, equityCurve, logs, bullpen, livePositions, redeemBook] = await Promise.all([
+    const [state, traders, positions, trades, recentDecisions, equityCurve, logs, bullpen, livePositions, redeemBook] = await Promise.all([
       loadBotState(settings),
       loadTraders(),
       loadPositions(),
       loadTrades(),
+      loadRecentDecisions(300),
       loadEquityCurve(settings),
       loadLogs(),
-      inspectBullpenCli(),
+      // Legacy Bullpen CLI probe removed (it spawned a child process every few
+      // minutes); kept in the payload shape for older dashboards.
+      Promise.resolve({ available: false, checkedAt: null, helpText: null, error: null }),
       loadLivePositions(),
       loadRedeemBook(),
     ]);
@@ -751,7 +761,7 @@ export class CopyBotEngine {
       void this.resumeIfDesired();
     }
 
-    const scoreboard = buildScoreboard(settings, statusState, statusMetrics, positions, trades);
+    const scoreboard = buildScoreboard(settings, statusState, statusMetrics, positions, recentDecisions);
     const buyReadiness = evaluateBuyReadiness({
       settings,
       state: statusState,
@@ -770,7 +780,7 @@ export class CopyBotEngine {
       bullpen,
       traders,
       positions,
-      recentTrades: trades.slice(0, 100),
+      recentTrades: recentDecisions.slice(0, 100),
       equityCurve,
       logs,
       livePositions: settings.mode === "real" ? livePositions : null,
@@ -1131,6 +1141,7 @@ export class CopyBotEngine {
     }
     await savePositions([]);
     await saveTrades([]);
+    await clearSkips();
     await saveSeenTrades({ ids: [] });
     await saveLivePositions(null);
     await saveEquityCurve([
@@ -1569,7 +1580,7 @@ export class CopyBotEngine {
     if (initialTrades.length > 0) {
       const seen = await loadSeenTrades();
       const ids = new Set(seen.ids);
-      for (const trade of initialTrades) ids.add(sourceTradeId(trade));
+      for (const trade of initialTrades) ids.add(seenKey(trade));
       await saveSeenTrades({ ids: [...ids] });
       await appendLog("info", `Marked ${initialTrades.length} existing trades as seen for manual trader ${wallet}.`);
     }
@@ -1649,7 +1660,7 @@ export class CopyBotEngine {
         const seen = await loadSeenTrades();
         const ids = new Set(seen.ids);
         const existingTrades = await fetchTradesForWallets(newWallets, 30);
-        for (const trade of existingTrades) ids.add(sourceTradeId(trade));
+        for (const trade of existingTrades) ids.add(seenKey(trade));
         await saveSeenTrades({ ids: [...ids] });
         await appendLog("info", `Marked ${existingTrades.length} existing trades as seen for ${newWallets.length} newly discovered wallets.`);
       } catch (err) {
@@ -1680,7 +1691,7 @@ export class CopyBotEngine {
     if (wallets.length === 0) return;
     const existingTrades = await fetchTradesForWallets(wallets, 30);
     const ids = new Set(seen.ids);
-    for (const trade of existingTrades) ids.add(sourceTradeId(trade));
+    for (const trade of existingTrades) ids.add(seenKey(trade));
     await saveSeenTrades({ ids: [...ids] });
     const state = await loadBotState(settings);
     await saveBotState({ ...state, firstRunBootstrappedAt: Date.now() });
@@ -2058,7 +2069,7 @@ export class CopyBotEngine {
         // Stop/Pause/Panic pressed mid-poll (or this poll was abandoned): stop
         // acting on new trades immediately.
         if (this.desired !== "running" || this.stale(gen)) break;
-        const id = sourceTradeId(trade);
+        const id = seenKey(trade);
         if (seenIds.has(id)) continue;
         seenIds.add(id);
         if (exposurePausedForBuys && trade.side === "BUY") {
@@ -2155,7 +2166,7 @@ export class CopyBotEngine {
       // Analytics (observational only): periodically snapshot the open-position
       // timeline and run bounded background maintenance. Both are self-guarding
       // (never throw) and rate-limited so they add negligible poll overhead.
-      if (now - this.lastAnalyticsSnapshotAt >= 60_000) {
+      if (now - this.lastAnalyticsSnapshotAt >= 5 * 60_000) {
         this.lastAnalyticsSnapshotAt = now;
         await analytics.recordPositionSnapshots(positions, settings.mode);
       }

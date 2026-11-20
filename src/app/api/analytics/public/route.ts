@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { loadEquityCurve, loadPositions, loadSettings, loadTrades } from "@/lib/copybot/store";
+import { loadBotState, loadEquityCurve, loadLogs, loadPositions, loadSettings, loadTraders, loadTrades } from "@/lib/copybot/store";
 import { buildAnalyticsExport } from "@/lib/analytics";
 import { config } from "@/lib/config";
 
@@ -9,8 +9,9 @@ export const dynamic = "force-dynamic";
 /**
  * Public, token-gated analytics export — intended to be served WITHOUT the
  * dashboard's Basic Auth (see the dedicated nginx location) so an external AI can
- * fetch the JSON on a schedule. Access requires `?token=` to match
- * ANALYTICS_EXPORT_TOKEN; when that env var is unset the endpoint is disabled.
+ * fetch the JSON on a schedule. Access requires the ANALYTICS_EXPORT_TOKEN, sent
+ * as an `x-export-token` header (preferred: never lands in access logs) or as
+ * `?token=`. When that env var is unset the endpoint is disabled.
  *
  * Returns the full bundle by default (account, config, equity curve, open
  * positions, decisions, completed trades, missed opps, trader/market/execution/
@@ -51,7 +52,7 @@ export async function GET(req: Request) {
   }
 
   const url = new URL(req.url);
-  const provided = (url.searchParams.get("token") ?? "").trim();
+  const provided = (req.headers.get("x-export-token") ?? url.searchParams.get("token") ?? "").trim();
   if (!provided || !constantTimeEqual(provided, expected)) {
     return NextResponse.json(
       { ok: false, error: "Unauthorized: missing or invalid export token." },
@@ -72,10 +73,29 @@ export async function GET(req: Request) {
       loadTrades(),
       loadEquityCurve(settings),
     ]);
-    const data = await buildAnalyticsExport(
+    const [state, traders, logs] = await Promise.all([loadBotState(settings), loadTraders(), loadLogs(40)]);
+    const exported = await buildAnalyticsExport(
       { settings, positions, trades, equityCurve },
       { includeDecisions, maxDecisions },
     );
+    // Compact operator view of the loop itself (run state, health, recent log).
+    const data = {
+      ...exported,
+      bot: {
+        mode: settings.mode,
+        preset: settings.riskPreset,
+        runState: state.runState,
+        desiredRunState: state.desiredRunState ?? null,
+        panic: state.panic,
+        dailyLossLockout: state.dailyLossLockout,
+        drawdownPauseUntil: state.drawdownPauseUntil ?? null,
+        lastPollAt: state.lastPollAt,
+        lastHeartbeatAt: state.lastHeartbeatAt ?? null,
+        lastError: state.lastError,
+        followedTraders: traders.filter((t) => t.enabled && !t.exitOnly).length,
+        recentLogs: logs.map((l) => ({ ts: l.ts, level: l.level, message: l.message })),
+      },
+    };
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json; charset=utf-8",

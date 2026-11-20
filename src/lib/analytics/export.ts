@@ -25,7 +25,7 @@ export interface AccountSnapshot {
   unrealizedPnlUsd: number;
   openPositions: number;
   /** Cash basis note: local accounting (no live-balance fetch in the export). */
-  cashBasis: "local-accounting";
+  cashBasis: "local-accounting" | "live-wallet";
 }
 
 export interface OpenPositionDetail {
@@ -189,7 +189,11 @@ function openPositionDetails(positions: BotPosition[], decisions: DecisionRecord
 export async function buildAnalyticsExport(inputs: ExportInputs, opts: ExportOptions = {}): Promise<AnalyticsExport> {
   const { settings, positions, trades, equityCurve } = inputs;
   const now = Date.now();
-  const cashUsd = calculateAvailableBalance(settings, positions, trades);
+  // Real mode: the poll loop records authoritative wallet cash on the equity
+  // curve; local accounting is only a mirror there.
+  const lastPoint = equityCurve.length ? equityCurve[equityCurve.length - 1] : null;
+  const useLiveCash = settings.mode === "real" && lastPoint != null && Number.isFinite(lastPoint.cashUsd);
+  const cashUsd = useLiveCash ? lastPoint!.cashUsd : calculateAvailableBalance(settings, positions, trades);
   const bundle = await loadAnalyticsBundle(positions, cashUsd);
 
   const includeDecisions = opts.includeDecisions !== false;
@@ -218,7 +222,7 @@ export async function buildAnalyticsExport(inputs: ExportInputs, opts: ExportOpt
       realizedPnlUsd,
       unrealizedPnlUsd,
       openPositions: positions.length,
-      cashBasis: "local-accounting",
+      cashBasis: useLiveCash ? "live-wallet" : "local-accounting",
     },
     config: configSnapshot(settings),
     equityCurve: equity,
