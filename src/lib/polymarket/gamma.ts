@@ -78,11 +78,27 @@ export async function fetchMarkets(query: MarketQuery = {}): Promise<Market[]> {
   return normalizeMarkets(Array.isArray(raws) ? raws : []);
 }
 
-export async function fetchMarketById(conditionId: string): Promise<Market | null> {
-  // Gamma supports lookup by clob token / condition via the list endpoint filter.
+const MARKET_CACHE_TTL_MS = 30_000;
+const MARKET_CACHE_MAX = 1_000;
+const marketCache = new Map<string, { market: Market | null; at: number }>();
+
+/**
+ * Market lookup by CLOB token id (Gamma list filter), cached ~30s: the same
+ * market is looked up for every trade, every mark refresh and every exit check.
+ */
+export async function fetchMarketById(conditionId: string, maxAgeMs = MARKET_CACHE_TTL_MS): Promise<Market | null> {
+  const hit = marketCache.get(conditionId);
+  if (hit && Date.now() - hit.at <= maxAgeMs) return hit.market;
   const raws = await gammaRequest<RawGammaMarket[]>("/markets", {
     query: { clob_token_ids: conditionId, limit: 1 },
   });
   const markets = normalizeMarkets(Array.isArray(raws) ? raws : []);
-  return markets[0] ?? null;
+  const market = markets[0] ?? null;
+  marketCache.set(conditionId, { market, at: Date.now() });
+  while (marketCache.size > MARKET_CACHE_MAX) {
+    const first = marketCache.keys().next();
+    if (first.done) break;
+    marketCache.delete(first.value);
+  }
+  return market;
 }

@@ -261,6 +261,14 @@ function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): Bo
     takerFeeBps: sanitizeNumber(next.takerFeeBps, current.takerFeeBps, 0, 10000),
     maxSlippageBps: sanitizeNumber(next.maxSlippageBps, current.maxSlippageBps, 1, 10000),
     fallbackSpreadBps: sanitizeNumber(next.fallbackSpreadBps, current.fallbackSpreadBps, 0, 10000),
+    sizingBase: next.sizingBase === "equity" ? "equity" : next.sizingBase === "cash" ? "cash" : current.sizingBase ?? "cash",
+    maxOpenPositions: Math.round(sanitizeNumber(next.maxOpenPositions, current.maxOpenPositions ?? 0, 0, 200)),
+    cashReservePercent: sanitizeNumber(next.cashReservePercent, current.cashReservePercent ?? 0, 0, 90),
+    maxEntryCostPercent: sanitizeNumber(next.maxEntryCostPercent, current.maxEntryCostPercent ?? 0, 0, 50),
+    maxDrawdownPausePercent: sanitizeNumber(next.maxDrawdownPausePercent, current.maxDrawdownPausePercent ?? 0, 0, 95),
+    maxHoursToResolution: sanitizeNumber(next.maxHoursToResolution, current.maxHoursToResolution ?? 0, 0, 24 * 365),
+    consensusBoost: typeof next.consensusBoost === "boolean" ? next.consensusBoost : current.consensusBoost ?? false,
+    depositBaselineUsd: sanitizeNumber(next.depositBaselineUsd, current.depositBaselineUsd ?? 0, 0, 10_000_000),
   });
 }
 
@@ -2212,9 +2220,22 @@ export class CopyBotEngine {
       // Only the current poll may clear the in-flight flag or schedule the next
       // one; an abandoned poll that finally returns just exits quietly.
       if (!this.stale(gen)) {
+        await this.touchHeartbeat();
         this.inFlight = false;
         this.scheduleNext();
       }
+    }
+  }
+
+  /** Record that a poll finished (used by /api/health and the watchdog). */
+  private async touchHeartbeat(): Promise<void> {
+    if (this.desired !== "running" && this.desired !== "draining") return;
+    try {
+      const settings = await loadSettings();
+      const fresh = await loadBotState(settings);
+      await saveBotState({ ...fresh, lastHeartbeatAt: Date.now() });
+    } catch {
+      // heartbeat is best-effort
     }
   }
 
