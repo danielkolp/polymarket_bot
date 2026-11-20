@@ -18,6 +18,8 @@ import {
   walletExposure,
 } from "./accounting";
 import { effectiveMaxCopyAgeSec, evaluateAdverseEntry, type AdverseEntry } from "./entryGuards";
+import { planEntry, proportionalSellShares, type EntryPlan } from "./entryPlan";
+import { getTokenMarketMeta, roundToTick, takerFeeFraction, tryGetOutcomeBook, type TokenMarketMeta } from "@/lib/polymarket/clobMeta";
 import {
   buildLeaderHoldings,
   reconcileLeaderHoldings,
@@ -33,7 +35,7 @@ import {
   presetControlledValues,
   RISK_PRESETS,
 } from "./riskPresets";
-import { assertLiveTradingAllowed, CLOB_MIN_MARKET_BUY_USD, placeLiveMarketOrder, PusdBalanceUnavailableError, type LiveUsdcBalance } from "@/lib/execution/liveClob";
+import { assertLiveTradingAllowed, placeLiveMarketOrder, PusdBalanceUnavailableError, type LiveUsdcBalance } from "@/lib/execution/liveClob";
 import { clearLiveBalanceCache, getLiveUsdcBalance } from "@/lib/execution/liveBalance";
 import { createInitialBotState, todayKey } from "./defaults";
 import { recordId } from "./ids";
@@ -261,6 +263,26 @@ function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): Bo
     fallbackSpreadBps: sanitizeNumber(next.fallbackSpreadBps, current.fallbackSpreadBps, 0, 10000),
   });
 }
+
+/**
+ * Overlay the traded OUTCOME's own book on the Gamma market. Gamma's
+ * bestBid/bestAsk describe the market's first outcome only, so using them for a
+ * "No" token mis-prices every check downstream (spread, adverse move, refs).
+ */
+function withOutcomeQuotes(market: Market | null, book: OrderBook | null): Market | null {
+  if (!market || !book) return market;
+  if (book.bestBid == null && book.bestAsk == null) return market;
+  return {
+    ...market,
+    bestBid: book.bestBid,
+    bestAsk: book.bestAsk,
+    midpoint: book.midpoint,
+    spread: book.spread ?? market.spread,
+  };
+}
+
+const CONSENSUS_WINDOW_MS = 60 * 60 * 1000;
+const CONSENSUS_SIZE_MULTIPLIER = 1.5;
 
 function marketSpreadForFilter(market: Market | null): number | null {
   if (!market) return null;
@@ -625,9 +647,42 @@ function applySell(
   return { positions: nextPositions, copiedShares: shares, copyAmountUsd, realizedPnlUsd };
 }
 
+/** A poll running longer than this is considered hung and is abandoned. */
+const MIN_STUCK_TICK_MS = 120_000;
+const WATCHDOG_INTERVAL_MS = 30_000;
+const RESUME_RETRY_MS = 60_000;
+
+/** Fields only the operator controls; a running poll must never overwrite them. */
+function withControlFields(next: BotState, fresh: BotState): BotState {
+  return {
+    ...next,
+    runState: fresh.runState,
+    startedAt: fresh.startedAt,
+    stoppedAt: fresh.stoppedAt,
+    pausedAt: fresh.pausedAt,
+    panic: fresh.panic,
+    panicAt: fresh.panicAt,
+    panicReason: fresh.panicReason,
+    desiredRunState: fresh.desiredRunState,
+    nextPollAt: fresh.runState === "running" || fresh.runState === "draining" ? next.nextPollAt : null,
+  };
+}
+
 export class CopyBotEngine {
   private timer: NodeJS.Timeout | null = null;
   private inFlight = false;
+  /** When the in-flight poll started (ms epoch). */
+  private tickStartedAt = 0;
+  /** Incremented per poll; an abandoned (hung) poll sees a newer value and stops writing. */
+  private tickGeneration = 0;
+  private watchdog: NodeJS.Timeout | null = null;
+  /** In-memory mirror of what the operator asked for (authoritative for scheduling). */
+  private desired: BotState["runState"] | null = null;
+  private pollIntervalMs = 30_000;
+  private resumePromise: Promise<void> | null = null;
+  private resumeChecked = false;
+  /** tokenId -> (wallet -> last BUY seen ms) for the consensus sizing boost. */
+  private recentLeaderBuys = new Map<string, Map<string, number>>();
   private lastHeartbeatLogAt = 0;
   private buyExposurePaused = false;
   // Analytics-only cadence guards (observational; never gate trading).
@@ -660,27 +715,14 @@ export class CopyBotEngine {
     }
     const built = buildMetrics(settings, state, positions, trades, Date.now(), statusLiveBalance?.usdcBalance);
     const statusMetrics = await buildStatusMetrics(settings, built.metrics, statusLiveBalance);
-    let statusState = built.state;
-    if (
-      statusState.peakEquityUsd !== state.peakEquityUsd ||
-      statusState.dailyDate !== state.dailyDate ||
-      statusState.dailyStartEquityUsd !== state.dailyStartEquityUsd ||
-      statusState.dailyStartBotPnlUsd !== state.dailyStartBotPnlUsd ||
-      statusState.dailyLossLockout !== state.dailyLossLockout
-    ) {
-      await saveBotState(statusState);
-    }
+    // Display-only: daily/peak roll-overs are persisted by the poll loop, never
+    // here (a status read racing a poll must not write stale state).
+    const statusState = built.state;
 
+    // The process restarted while the operator wanted the bot running: bring it
+    // back (normally done at boot by instrumentation.ts; this is the fallback).
     if ((statusState.runState === "running" || statusState.runState === "draining") && !this.timer && !this.inFlight) {
-      statusState = {
-        ...statusState,
-        runState: "stopped",
-        stoppedAt: Date.now(),
-        nextPollAt: null,
-        lastError: null,
-      };
-      await saveBotState(statusState);
-      await appendLog("info", `Bot was marked ${state.runState} from a previous server session; left stopped until Start is clicked.`);
+      void this.resumeIfDesired();
     }
 
     const scoreboard = buildScoreboard(settings, statusState, statusMetrics, positions, trades);
@@ -710,7 +752,16 @@ export class CopyBotEngine {
     };
   }
 
-  async start(): Promise<BotStatus> {
+  async start(opts: { resumed?: boolean } = {}): Promise<BotStatus> {
+    await this.startEngine(opts);
+    return this.status();
+  }
+
+  /**
+   * Start (or, after a restart, resume) the poll loop. Throws when start is not
+   * allowed (panic latched, live trading misconfigured, balance unreadable).
+   */
+  private async startEngine(opts: { resumed?: boolean } = {}): Promise<void> {
     let settings = await loadSettings();
 
     // Refuse to start while a panic stop is latched. By default the operator must
@@ -763,36 +814,115 @@ export class CopyBotEngine {
           `Starting balance auto-synced to live wallet: $${prev.toFixed(2)} → $${settings.startingBalance.toFixed(2)}.`,
         );
       }
+      // A restart (or Stop/Start) on the same UTC day must NOT clear the daily
+      // loss lockout or move the day's baseline — only a new day does.
+      const sameDay = state.dailyDate === todayKey(now);
       state = {
         ...state,
         dailyDate: todayKey(now),
-        dailyStartEquityUsd: liveEquityUsd,
-        dailyStartBotPnlUsd,
-        peakEquityUsd: liveEquityUsd,
-        dailyLossLockout: false,
+        dailyStartEquityUsd: sameDay && state.dailyStartEquityUsd > 0 ? state.dailyStartEquityUsd : liveEquityUsd,
+        dailyStartBotPnlUsd: sameDay ? state.dailyStartBotPnlUsd : dailyStartBotPnlUsd,
+        peakEquityUsd: opts.resumed ? Math.max(state.peakEquityUsd || 0, liveEquityUsd) : liveEquityUsd,
+        dailyLossLockout: sameDay ? state.dailyLossLockout : false,
       };
       await appendLog(
         "info",
         `Real bankroll synced from live balance: cash $${startupLiveBalance.usdcBalance.toFixed(2)}, equity $${liveEquityUsd.toFixed(2)}.`,
       );
     }
+    // Refresh the followed-trader roster before going live. A discovery failure
+    // (upstream outage) keeps the previous roster instead of blocking the start.
+    try {
+      await this.discover(true);
+    } catch (err) {
+      await appendLog("warning", `Trader discovery failed on start (${messageFromUnknown(err)}); keeping the previous roster.`);
+    }
+    try {
+      await this.bootstrapSeenTrades();
+    } catch (err) {
+      await appendLog("warning", `Could not pre-mark recent trades as seen: ${messageFromUnknown(err)}.`);
+    }
+
     state = {
-      ...state,
+      ...(await loadBotState(settings)),
+      dailyDate: state.dailyDate,
+      dailyStartEquityUsd: state.dailyStartEquityUsd,
+      dailyStartBotPnlUsd: state.dailyStartBotPnlUsd,
+      peakEquityUsd: state.peakEquityUsd,
+      dailyLossLockout: state.dailyLossLockout,
       runState: "running",
-      startedAt: now,
+      desiredRunState: "running",
+      startedAt: opts.resumed && state.startedAt ? state.startedAt : now,
       stoppedAt: null,
       pausedAt: null,
       nextPollAt: now + settings.pollingIntervalSec * 1000,
       lastError: null,
-      sessionWalletsChecked: 0,
-      sessionTradesScanned: 0,
+      sessionWalletsChecked: opts.resumed ? state.sessionWalletsChecked : 0,
+      sessionTradesScanned: opts.resumed ? state.sessionTradesScanned : 0,
     };
     await saveBotState(state);
-    await appendLog("info", `Bot started in ${settings.mode} mode.`);
-    await this.discover(true);
-    await this.bootstrapSeenTrades();
+    this.desired = "running";
+    this.pollIntervalMs = settings.pollingIntervalSec * 1000;
+    await appendLog("info", opts.resumed ? `Bot resumed automatically in ${settings.mode} mode.` : `Bot started in ${settings.mode} mode.`);
+    this.ensureWatchdog();
     this.schedule(0);
-    return this.status();
+  }
+
+  /**
+   * Bring the loop back after a process restart if the operator last asked for
+   * it to run. Never overrides a panic stop. Retries every minute on failure
+   * (e.g. Polymarket briefly unreachable at boot).
+   */
+  async resumeIfDesired(): Promise<void> {
+    if (this.resumePromise) return this.resumePromise;
+    if (this.resumeChecked && (this.timer || this.inFlight || this.desired)) return;
+    this.resumePromise = (async () => {
+      try {
+        await ensureDataFiles();
+        const settings = await loadSettings();
+        const state = await loadBotState(settings);
+        const desired =
+          state.desiredRunState ??
+          (state.runState === "running" || state.runState === "draining" ? state.runState : "stopped");
+        this.resumeChecked = true;
+        if (this.timer || this.inFlight) return;
+        if (desired !== "running" && desired !== "draining") return;
+        if (state.panic) {
+          await appendLog("warning", "Not auto-resuming after restart: panic stop is engaged.");
+          await saveBotState({ ...state, runState: "stopped", desiredRunState: "stopped", nextPollAt: null });
+          return;
+        }
+        if (desired === "draining") {
+          this.desired = "draining";
+          this.pollIntervalMs = settings.pollingIntervalSec * 1000;
+          await saveBotState({ ...state, runState: "draining", desiredRunState: "draining" });
+          await appendLog("info", "Server restarted: resuming exit-only (draining) mode.");
+          this.ensureWatchdog();
+          this.schedule(0);
+          return;
+        }
+        await appendLog("info", "Server restarted: resuming the bot automatically.");
+        await this.startEngine({ resumed: true });
+      } catch (err) {
+        await appendLog("error", `Auto-resume failed (${messageFromUnknown(err)}); retrying in 60s.`).catch(() => undefined);
+        this.resumeChecked = false;
+        setTimeout(() => void this.resumeIfDesired(), RESUME_RETRY_MS).unref?.();
+      } finally {
+        this.resumePromise = null;
+      }
+    })();
+    return this.resumePromise;
+  }
+
+  /** Lightweight liveness info for /api/health and the systemd watchdog. */
+  health(): { desired: string | null; timerArmed: boolean; inFlight: boolean; tickAgeMs: number | null; pollIntervalMs: number } {
+    return {
+      desired: this.desired,
+      timerArmed: this.timer != null,
+      inFlight: this.inFlight,
+      tickAgeMs: this.inFlight ? Date.now() - this.tickStartedAt : null,
+      pollIntervalMs: this.pollIntervalMs,
+    };
   }
 
   async forceDiscover(): Promise<BotStatus> {
@@ -801,15 +931,17 @@ export class CopyBotEngine {
   }
 
   async pause(): Promise<BotStatus> {
+    this.desired = "paused";
     this.clearTimer();
     const settings = await loadSettings();
     const state = await loadBotState(settings);
-    await saveBotState({ ...state, runState: "paused", pausedAt: Date.now(), nextPollAt: null });
+    await saveBotState({ ...state, runState: "paused", desiredRunState: "paused", pausedAt: Date.now(), nextPollAt: null });
     await appendLog("info", "Bot paused.");
     return this.status();
   }
 
   async stop(opts: { liquidate?: boolean; source?: ExitSource } = {}): Promise<BotStatus> {
+    this.desired = "stopped";
     this.clearTimer();
     const settings = await loadSettings();
     let liq: FlattenResult | null = null;
@@ -817,7 +949,7 @@ export class CopyBotEngine {
       liq = await this.flatten(opts.source ?? "session-close");
     }
     const state = await loadBotState(settings);
-    await saveBotState({ ...state, runState: "stopped", stoppedAt: Date.now(), pausedAt: null, nextPollAt: null });
+    await saveBotState({ ...state, runState: "stopped", desiredRunState: "stopped", stoppedAt: Date.now(), pausedAt: null, nextPollAt: null });
     await appendLog(
       "info",
       liq
@@ -837,6 +969,7 @@ export class CopyBotEngine {
    * Flattening open positions requires the confirmation text "FLATTEN".
    */
   async panic(opts: { flatten?: boolean; confirmFlatten?: string; reason?: string } = {}): Promise<BotStatus> {
+    this.desired = "stopped";
     this.clearTimer();
     const settings = await loadSettings();
     let state = await loadBotState(settings);
@@ -846,6 +979,7 @@ export class CopyBotEngine {
     state = {
       ...state,
       runState: "stopped",
+      desiredRunState: "stopped",
       stoppedAt: now,
       pausedAt: null,
       nextPollAt: null,
@@ -951,6 +1085,7 @@ export class CopyBotEngine {
    * are kept.
    */
   async reset(): Promise<BotStatus> {
+    this.desired = "stopped";
     this.clearTimer();
     this.lastHeartbeatLogAt = 0;
     const settings = await loadSettings();
@@ -1257,10 +1392,14 @@ export class CopyBotEngine {
     await saveBotState({
       ...state,
       runState: "draining",
+      desiredRunState: "draining",
       pausedAt: null,
       nextPollAt: now + settings.pollingIntervalSec * 1000,
       lastError: null,
     });
+    this.desired = "draining";
+    this.pollIntervalMs = settings.pollingIntervalSec * 1000;
+    this.ensureWatchdog();
     await appendLog(
       "info",
       `Auto-exit (drain) mode: monitoring ${positions.length} open position(s); no new entries. ` +
@@ -1427,8 +1566,35 @@ export class CopyBotEngine {
   private schedule(delayMs: number): void {
     this.clearTimer();
     this.timer = setTimeout(() => {
+      this.timer = null;
       void this.tick();
     }, Math.max(0, delayMs));
+  }
+
+  /** Schedule the next poll if the operator still wants the loop running. */
+  private scheduleNext(): void {
+    if (this.desired === "running" || this.desired === "draining") {
+      this.schedule(this.pollIntervalMs);
+    }
+  }
+
+  /**
+   * Self-healing heartbeat: if the loop should be running but no poll is armed
+   * (lost timer) or the current poll has hung, kick a fresh poll.
+   */
+  private ensureWatchdog(): void {
+    if (this.watchdog) return;
+    this.watchdog = setInterval(() => {
+      if (this.desired !== "running" && this.desired !== "draining") return;
+      const stuckLimit = Math.max(MIN_STUCK_TICK_MS, 4 * this.pollIntervalMs);
+      if (this.inFlight && Date.now() - this.tickStartedAt > stuckLimit) {
+        void this.tick();
+      } else if (!this.inFlight && !this.timer) {
+        void appendLog("warning", "Watchdog: poll loop had no next poll scheduled; restarting it.").catch(() => undefined);
+        this.schedule(0);
+      }
+    }, WATCHDOG_INTERVAL_MS);
+    this.watchdog.unref?.();
   }
 
   private async discover(force = false): Promise<void> {
@@ -1772,22 +1938,50 @@ export class CopyBotEngine {
     return paused;
   }
 
+  /** True when a newer poll has superseded this one (it hung and was abandoned). */
+  private stale(gen: number): boolean {
+    return gen !== this.tickGeneration;
+  }
+
+  /** Persist poll-owned state without clobbering operator control fields. */
+  private async saveTickState(gen: number, settings: BotSettings, next: BotState): Promise<void> {
+    if (this.stale(gen)) return;
+    const fresh = await loadBotState(settings);
+    await saveBotState(withControlFields(next, fresh));
+  }
+
   private async tick(): Promise<void> {
-    if (this.inFlight) return;
+    if (this.inFlight) {
+      const stuckLimit = Math.max(MIN_STUCK_TICK_MS, 4 * this.pollIntervalMs);
+      const runningFor = Date.now() - this.tickStartedAt;
+      if (runningFor < stuckLimit) return;
+      // The previous poll hung (an upstream call never returned). Abandon it:
+      // bumping the generation makes it stop writing, then start a fresh poll.
+      await appendLog("error", `Poll was stuck for ${Math.round(runningFor / 1000)}s; abandoning it and starting a fresh one.`).catch(() => undefined);
+    }
+    const gen = ++this.tickGeneration;
     this.inFlight = true;
+    this.tickStartedAt = Date.now();
+    this.clearTimer();
 
     try {
       const settings = await loadSettings();
+      this.pollIntervalMs = settings.pollingIntervalSec * 1000;
       let state = await loadBotState(settings);
+      if (this.desired == null) this.desired = state.desiredRunState ?? state.runState;
       if (state.runState === "draining") {
         await this.drainTick(settings, state);
         return;
       }
-      if (state.runState !== "running") return;
+      if (state.runState !== "running" || this.desired !== "running") return;
 
-      await this.discover(false);
+      try {
+        await this.discover(false);
+      } catch (err) {
+        await appendLog("warning", `Trader discovery failed (${messageFromUnknown(err)}); keeping the current roster.`);
+      }
       state = await loadBotState(settings);
-      if (state.runState !== "running") return;
+      if (state.runState !== "running" || this.stale(gen)) return;
       const traders = await loadTraders();
       const traderByWallet = new Map(traders.map((t) => [t.wallet.toLowerCase(), t]));
       const wallets = enabledWallets(traders, MAX_WALLETS_PER_POLL);
@@ -1797,7 +1991,7 @@ export class CopyBotEngine {
         lastPollAt: now,
         nextPollAt: now + settings.pollingIntervalSec * 1000,
       };
-      await saveBotState(state);
+      await this.saveTickState(gen, settings, state);
 
       if (wallets.length === 0) {
         await appendLog("warning", "Poll skipped: no enabled followed traders.");
@@ -1831,6 +2025,9 @@ export class CopyBotEngine {
       const walletCycleCopies = new Map<string, number>();
 
       for (const trade of traderTrades) {
+        // Stop/Pause/Panic pressed mid-poll (or this poll was abandoned): stop
+        // acting on new trades immediately.
+        if (this.desired !== "running" || this.stale(gen)) break;
         const id = sourceTradeId(trade);
         if (seenIds.has(id)) continue;
         seenIds.add(id);
@@ -1839,6 +2036,7 @@ export class CopyBotEngine {
           continue;
         }
         const trader = traderByWallet.get(trade.wallet.toLowerCase()) ?? null;
+        if (trade.side === "BUY") this.rememberLeaderBuy(trade);
         const capture: DecisionCapture = {};
         const result = await this.processTrade(trade, settings, state, positions, walletCycleCopies, trader, capture);
         positions = result.positions;
@@ -1920,6 +2118,7 @@ export class CopyBotEngine {
         positions = await this.liveAutoExit(settings, positions);
       }
 
+      if (this.stale(gen)) return;
       await savePositions(positions);
       await saveSeenTrades({ ids: [...seenIds] });
 
@@ -1964,9 +2163,11 @@ export class CopyBotEngine {
         }
       }
       const metrics = buildMetrics(settings, state, positions, trades, Date.now(), loopLiveBalance?.usdcBalance);
-      await saveBotState({ ...metrics.state, lastError: null });
+      let nextState: BotState = { ...metrics.state, lastError: null, lastHeartbeatAt: Date.now() };
+      nextState = await this.applyDrawdownPause(settings, nextState, metrics.metrics.equityUsd);
+      await this.saveTickState(gen, settings, nextState);
       if (!state.dailyLossLockout && metrics.state.dailyLossLockout) {
-        await appendLog("warning", "Bot daily loss limit hit. BUYs disabled until next session/day.");
+        await appendLog("warning", "Daily loss limit hit: no new buys until tomorrow (UTC). Open positions are still managed.");
       }
       await appendEquityPoint({
         ts: Date.now(),
@@ -1975,20 +2176,49 @@ export class CopyBotEngine {
         exposureUsd: metrics.metrics.totalExposureUsd,
       });
     } catch (err) {
-      const settings = await loadSettings().catch(() => null);
-      if (settings) {
-        const state = await loadBotState(settings);
-        await saveBotState({ ...state, lastError: err instanceof Error ? err.message : "Unknown bot error" });
+      if (!this.stale(gen)) {
+        try {
+          const settings = await loadSettings();
+          const state = await loadBotState(settings);
+          await saveBotState({ ...state, lastError: err instanceof Error ? err.message : "Unknown bot error", lastHeartbeatAt: Date.now() });
+        } catch {
+          // never let error bookkeeping break the loop
+        }
+        await appendLog("error", `Bot loop error: ${err instanceof Error ? err.message : "Unknown error"}`).catch(() => undefined);
       }
-      await appendLog("error", `Bot loop error: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      this.inFlight = false;
-      const settings = await loadSettings().catch(() => null);
-      const state = settings ? await loadBotState(settings).catch(() => null) : null;
-      if (settings && (state?.runState === "running" || state?.runState === "draining")) {
-        this.schedule(settings.pollingIntervalSec * 1000);
+      // Only the current poll may clear the in-flight flag or schedule the next
+      // one; an abandoned poll that finally returns just exits quietly.
+      if (!this.stale(gen)) {
+        this.inFlight = false;
+        this.scheduleNext();
       }
     }
+  }
+
+  /**
+   * Drawdown circuit breaker: when account value falls maxDrawdownPausePercent
+   * below its peak, pause NEW buys for 24 hours (exits keep running), then
+   * restart the peak from the current value so the pause doesn't re-trigger.
+   */
+  private async applyDrawdownPause(settings: BotSettings, state: BotState, equityUsd: number): Promise<BotState> {
+    const pct = settings.maxDrawdownPausePercent;
+    const now = Date.now();
+    if (!(pct > 0) || !(equityUsd > 0) || !(state.peakEquityUsd > 0)) return state;
+    if (state.drawdownPauseUntil && state.drawdownPauseUntil > now) return state;
+    if (state.drawdownPauseUntil && state.drawdownPauseUntil <= now) {
+      await appendLog("info", "Drawdown pause over: new buys are allowed again.");
+      return { ...state, drawdownPauseUntil: null, peakEquityUsd: equityUsd };
+    }
+    const drawdown = 1 - equityUsd / state.peakEquityUsd;
+    if (drawdown * 100 >= pct) {
+      await appendLog(
+        "warning",
+        `Account is ${(drawdown * 100).toFixed(1)}% below its peak (limit ${pct}%): pausing new buys for 24 hours. Open positions are still managed.`,
+      );
+      return { ...state, drawdownPauseUntil: now + 24 * 60 * 60 * 1000 };
+    }
+    return state;
   }
 
   /**
@@ -1999,7 +2229,8 @@ export class CopyBotEngine {
     const now = Date.now();
     let positions = await loadPositions();
     if (positions.length === 0) {
-      await saveBotState({ ...state, runState: "stopped", stoppedAt: now, nextPollAt: null });
+      this.desired = "stopped";
+      await saveBotState({ ...state, runState: "stopped", desiredRunState: "stopped", stoppedAt: now, nextPollAt: null });
       await appendLog("info", "Auto-exit complete: all positions closed. Bot stopped.");
       return;
     }
@@ -2062,6 +2293,7 @@ export class CopyBotEngine {
     await saveBotState({
       ...metrics.state,
       runState: allClosed ? "stopped" : "draining",
+      desiredRunState: allClosed ? "stopped" : "draining",
       stoppedAt: allClosed ? now : state.stoppedAt,
       lastPollAt: now,
       nextPollAt: allClosed ? null : now + settings.pollingIntervalSec * 1000,
@@ -2074,7 +2306,10 @@ export class CopyBotEngine {
       exposureUsd: metrics.metrics.totalExposureUsd,
     });
 
-    if (allClosed) await appendLog("info", "Auto-exit complete: all positions closed. Bot stopped.");
+    if (allClosed) {
+      this.desired = "stopped";
+      await appendLog("info", "Auto-exit complete: all positions closed. Bot stopped.");
+    }
   }
 
   /**
@@ -2084,17 +2319,59 @@ export class CopyBotEngine {
    * enforced upstream. Any failure is recorded as a "failed" trade instead of
    * throwing, so the poll loop keeps running.
    */
+  /** Remember which followed wallets bought which outcome (consensus boost). */
+  private rememberLeaderBuy(trade: TraderTrade): void {
+    const at = trade.timestamp * 1000;
+    let byWallet = this.recentLeaderBuys.get(trade.tokenId);
+    if (!byWallet) {
+      byWallet = new Map();
+      this.recentLeaderBuys.set(trade.tokenId, byWallet);
+    }
+    byWallet.set(trade.wallet.toLowerCase(), Math.max(at, byWallet.get(trade.wallet.toLowerCase()) ?? 0));
+    if (this.recentLeaderBuys.size > 2000) {
+      const cutoff = Date.now() - CONSENSUS_WINDOW_MS;
+      for (const [token, wallets] of this.recentLeaderBuys) {
+        for (const [w, ts] of wallets) if (ts < cutoff) wallets.delete(w);
+        if (wallets.size === 0) this.recentLeaderBuys.delete(token);
+      }
+    }
+  }
+
+  /** How many OTHER followed wallets bought this outcome in the last hour. */
+  private consensusWallets(trade: TraderTrade, now: number): number {
+    const byWallet = this.recentLeaderBuys.get(trade.tokenId);
+    if (!byWallet) return 0;
+    const me = trade.wallet.toLowerCase();
+    let n = 0;
+    for (const [wallet, ts] of byWallet) if (wallet !== me && now - ts <= CONSENSUS_WINDOW_MS) n += 1;
+    return n;
+  }
+
+  /** Leader's position size before this SELL (current holding + sold), if readable. */
+  private async leaderSharesBefore(trade: TraderTrade): Promise<number | null> {
+    try {
+      const held = await fetchUserPositions(trade.wallet, 500);
+      const current = held.find((position) => position.tokenId === trade.tokenId)?.size ?? 0;
+      return current + trade.size;
+    } catch {
+      return null;
+    }
+  }
+
   private async executeRealTrade(
     trade: TraderTrade,
     settings: BotSettings,
-    requestedAmountUsd: number,
+    entry: EntryPlan | null,
+    sellShares: number,
     market: Market | null,
     positions: BotPosition[],
     now: number,
     buyEdge: Partial<CopyTradeRecord> = {},
+    meta: TokenMarketMeta | null = null,
   ): Promise<{ record: CopyTradeRecord; positions: BotPosition[] }> {
+    const requestedUsd = entry && entry.ok ? entry.usd : 0;
     const fail = (reason: string): { record: CopyTradeRecord; positions: BotPosition[] } => ({
-      record: makeRecord(trade, "failed", "real", requestedAmountUsd, 0, 0, reason, market, now, buyEdge),
+      record: makeRecord(trade, "failed", "real", requestedUsd, 0, 0, reason, market, now, buyEdge),
       positions,
     });
 
@@ -2105,19 +2382,56 @@ export class CopyBotEngine {
     }
 
     if (trade.side === "BUY") {
-      const usd = Math.max(CLOB_MIN_MARKET_BUY_USD, Math.min(requestedAmountUsd, config.liveMaxOrderUsd));
-      if (!(usd > 0)) return fail("Real BUY skipped: order size resolved to zero.");
-      const refPrice = clampPrice(market?.bestAsk ?? market?.midpoint ?? trade.price);
+      if (!entry || !entry.ok) return fail("Real BUY skipped: no valid entry plan.");
       try {
         const res = await placeLiveMarketOrder({
           tokenId: trade.tokenId,
+          conditionId: trade.conditionId,
           side: "BUY",
-          usdAmount: usd,
-          referencePrice: refPrice,
+          usdAmount: entry.usd,
+          referencePrice: entry.bestAsk,
+          limitPrice: entry.limitPrice,
         });
         clearLiveBalanceCache();
-        if (!res.success) return fail(`Live BUY rejected: ${res.error ?? "unknown error"}.`);
-        const nextPositions = applyBuy(positions, trade, market, res.filledShares, res.effectivePrice, refPrice, now);
+        if (res.pending) {
+          // Exchange delayed the match: record it (no position yet) so
+          // reconciliation picks up the real fill — or voids it — next poll.
+          const record = makeRecord(
+            trade,
+            "copied",
+            "real",
+            0,
+            0,
+            0,
+            `LIVE BUY $${entry.usd.toFixed(2)} submitted (limit ${(entry.limitPrice * 100).toFixed(1)}c) following ${trade.traderName}; exchange delayed the match - order ${res.orderId}.`,
+            market,
+            now,
+            buyEdge,
+          );
+          record.txOrOrderId = res.orderId ?? "";
+          record.reconciliationStatus = "pending";
+          return { record, positions };
+        }
+        if (!res.success || res.filledShares <= 0) {
+          return {
+            record: makeRecord(
+              trade,
+              "skipped",
+              "real",
+              0,
+              0,
+              0,
+              `Skipped LIVE BUY: ${res.error ?? "nothing filled at or below the limit price"} (limit ${(entry.limitPrice * 100).toFixed(1)}c).`,
+              market,
+              now,
+              buyEdge,
+            ),
+            positions,
+          };
+        }
+        const feeUsd = meta ? res.filledShares * takerFeeFraction(meta, res.effectivePrice) * res.effectivePrice : 0;
+        const costPerShare = (res.notionalUsd + feeUsd) / res.filledShares;
+        const nextPositions = applyBuy(positions, trade, market, res.filledShares, costPerShare, entry.bestAsk, now);
         const record = makeRecord(
           trade,
           "copied",
@@ -2125,10 +2439,10 @@ export class CopyBotEngine {
           res.notionalUsd,
           res.filledShares,
           0,
-          `LIVE BUY $${res.notionalUsd.toFixed(2)} (~${res.filledShares.toFixed(2)} sh @ ${(res.effectivePrice * 100).toFixed(1)}c) following ${trade.traderName} - order ${res.orderId ?? "?"} [${res.status ?? "posted"}].`,
+          `LIVE BUY $${res.notionalUsd.toFixed(2)} (${res.filledShares.toFixed(2)} sh @ ${(res.effectivePrice * 100).toFixed(1)}c, limit ${(entry.limitPrice * 100).toFixed(1)}c${entry.bumpedToMinimum ? ", sized up to the market minimum" : ""}) following ${trade.traderName} - order ${res.orderId ?? "?"} [${res.status ?? "posted"}].`,
           market,
           now,
-          buyEdge,
+          { ...buyEdge, feeUsd, effectivePrice: costPerShare, referencePrice: entry.bestAsk },
         );
         record.txOrOrderId = res.orderId ?? "";
         record.reconciliationStatus = "pending";
@@ -2166,8 +2480,7 @@ export class CopyBotEngine {
       };
     }
     const refPrice = clampPrice(market?.bestBid ?? market?.midpoint ?? trade.price);
-    const requestedSellShares =
-      settings.sellBehavior === "all" ? existing.shares : Math.min(existing.shares, requestedAmountUsd / refPrice);
+    const requestedSellShares = Math.min(existing.shares, sellShares > 0 ? sellShares : existing.shares);
     const snapshot = await loadLivePositions();
     const sellSize = resolveLiveSellSize({
       position: existing,
@@ -2183,16 +2496,20 @@ export class CopyBotEngine {
     const sellPositions = positions.map((position) =>
       position.tokenId === existing.tokenId ? { ...position, shares: sellSize.bookSharesBeforeSell } : position,
     );
+    const tick = meta?.tickSize ?? 0.01;
     try {
       const res = await placeLiveMarketOrder({
         tokenId: trade.tokenId,
+        conditionId: trade.conditionId,
         side: "SELL",
         shares: sellSize.shares,
         referencePrice: refPrice,
+        limitPrice: roundToTick(refPrice - 3 * tick, tick, "up"),
       });
       clearLiveBalanceCache();
-      if (!res.success) return fail(`Live SELL rejected: ${res.error ?? "unknown error"}.`);
-      const sold = applySell(sellPositions, trade, res.filledShares, res.effectivePrice, 0, refPrice, now);
+      if (!res.success || res.filledShares <= 0) return fail(`Live SELL rejected: ${res.error ?? "unknown error"}.`);
+      const feeUsd = meta ? res.filledShares * takerFeeFraction(meta, res.effectivePrice) * res.effectivePrice : 0;
+      const sold = applySell(sellPositions, trade, res.filledShares, res.effectivePrice, feeUsd, refPrice, now);
       const record = makeRecord(
         trade,
         "copied",
@@ -2203,6 +2520,7 @@ export class CopyBotEngine {
         `LIVE SELL $${sold.copyAmountUsd.toFixed(2)} (${formatLiveSellShares(sold.copiedShares)} sh @ ${(res.effectivePrice * 100).toFixed(1)}c) following ${trade.traderName} - order ${res.orderId ?? "?"} [${res.status ?? "posted"}].`,
         market,
         now,
+        { feeUsd },
       );
       record.txOrOrderId = res.orderId ?? "";
       record.reconciliationStatus = "pending";
@@ -2501,11 +2819,12 @@ export class CopyBotEngine {
     const now = Date.now();
     const tradeAgeSec = Math.max(0, Math.floor(now / 1000) - trade.timestamp);
     let market: Market | null = null;
-    try {
-      market = await fetchMarketById(trade.tokenId);
-    } catch {
-      market = null;
-    }
+    const [gammaMarket, outcomeBook, tokenMeta] = await Promise.all([
+      fetchMarketById(trade.tokenId).catch(() => null),
+      tryGetOutcomeBook(trade.tokenId),
+      getTokenMarketMeta(trade.tokenId, trade.conditionId).catch((): TokenMarketMeta | null => null),
+    ]);
+    market = withOutcomeQuotes(gammaMarket, outcomeBook);
     // Analytics capture (observational only — reads computed values; no effect on
     // any decision below).
     if (capture) {
@@ -2570,6 +2889,25 @@ export class CopyBotEngine {
     // leader's fill. Pure; missing/invalid prices don't trip it.
     if (adverse?.reason) return skip(adverse.reason);
 
+    if (trade.side === "BUY") {
+      if (
+        settings.maxHoursToResolution > 0 &&
+        market?.timeToResolutionMs != null &&
+        market.timeToResolutionMs > settings.maxHoursToResolution * 3600 * 1000
+      ) {
+        return skip(
+          `Skipped BUY: market resolves in ${(market.timeToResolutionMs / 86_400_000).toFixed(0)} days; limit is ${(settings.maxHoursToResolution / 24).toFixed(0)} days (money would be tied up too long).`,
+        );
+      }
+      const alreadyHeld = positions.some((position) => position.tokenId === trade.tokenId);
+      if (settings.maxOpenPositions > 0 && !alreadyHeld && positions.length >= settings.maxOpenPositions) {
+        return skip(`Skipped BUY: already holding the maximum of ${settings.maxOpenPositions} positions.`);
+      }
+      if (state.drawdownPauseUntil && state.drawdownPauseUntil > now) {
+        return skip("Skipped BUY: new buys are paused after a drawdown (resumes automatically).");
+      }
+    }
+
     // Per-copied-wallet controls (entries only - never block exits). These keep a
     // single hot wallet from dominating the session regardless of global caps.
     if (trade.side === "BUY") {
@@ -2623,9 +2961,16 @@ export class CopyBotEngine {
     // only scales the base and is hard-clamped to maxTradeAmountUsd inside
     // applyConvictionSizing; every other cap (live max order, exposure, available
     // balance) is still enforced by the requestedAmountUsd clamp below.
-    const baseStrategyAmountUsd = calculateNextTradeSize(settings, availableBalanceUsd);
-    const strategyAmountUsd =
+    const baseStrategyAmountUsd = calculateNextTradeSize(settings, availableBalanceUsd, equityUsd);
+    let strategyAmountUsd =
       trade.side === "BUY" ? applyConvictionSizing(baseStrategyAmountUsd, trade, trader, settings) : baseStrategyAmountUsd;
+    const consensusWallets = trade.side === "BUY" ? this.consensusWallets(trade, now) : 0;
+    if (trade.side === "BUY" && settings.consensusBoost && consensusWallets > 0) {
+      strategyAmountUsd = Math.min(
+        strategyAmountUsd * CONSENSUS_SIZE_MULTIPLIER,
+        settings.maxTradeAmountUsd * CONSENSUS_SIZE_MULTIPLIER,
+      );
+    }
     const perMarketCapUsd = dollarCapFromPercent(equityUsd, settings.maxExposurePerMarketPercent);
     const totalCapUsd = dollarCapFromPercent(equityUsd, settings.maxTotalExposurePercent);
     const dailyLossCapUsd = dollarCapFromPercent(state.dailyStartEquityUsd, settings.maxDailyLossPercent);
@@ -2634,11 +2979,23 @@ export class CopyBotEngine {
     const remainingPerMarketUsd = Math.max(0, perMarketCapUsd - marketExposureUsd);
     const remainingTotalExposureUsd = Math.max(0, totalCapUsd - exposureUsd);
     const remainingAllowedExposureUsd = Math.min(remainingPerMarketUsd, remainingTotalExposureUsd);
-    // Apply the same order-size constraints in both modes so sim sizing matches live.
+    // Cash cushion: never spend below max(reserve % of account value, min balance).
+    const reserveUsd = Math.max(
+      dollarCapFromPercent(equityUsd, settings.cashReservePercent ?? 0),
+      settings.minAvailableBalanceUsd,
+    );
+    const walletCapUsd =
+      settings.maxExposurePerWalletPercent > 0
+        ? Math.max(0, dollarCapFromPercent(equityUsd, settings.maxExposurePerWalletPercent) - walletExposure(positions, trade.wallet))
+        : Number.POSITIVE_INFINITY;
+    // Largest BUY every cap still allows. The same constraints apply in both
+    // modes so simulation sizing matches live.
+    const maxAllowedBuyUsd = Math.max(
+      0,
+      Math.min(availableBalanceUsd - reserveUsd, config.liveMaxOrderUsd, remainingAllowedExposureUsd, walletCapUsd),
+    );
     const requestedAmountUsd =
-      trade.side === "BUY"
-        ? Math.min(strategyAmountUsd, availableBalanceUsd, config.liveMaxOrderUsd, remainingAllowedExposureUsd)
-        : strategyAmountUsd;
+      trade.side === "BUY" ? Math.min(strategyAmountUsd, maxAllowedBuyUsd) : strategyAmountUsd;
     if (capture) {
       capture.availableCashUsd = availableBalanceUsd;
       capture.equityUsd = equityUsd;
@@ -2688,61 +3045,63 @@ export class CopyBotEngine {
         return skip("Skipped LIVE BUY (readiness): " + readiness.blockers.map((b) => b.detail).join(" | "));
       }
     }
-    if (settings.mode === "real" && trade.side === "BUY" && liveBalance && liveBalance.usdcBalance <= settings.minAvailableBalanceUsd) {
-      return skip(
-        "Skipped LIVE BUY: live USDC balance $" +
-          liveBalance.usdcBalance.toFixed(2) +
-          " is at or below the minimum available balance $" +
-          settings.minAvailableBalanceUsd.toFixed(2) +
-          ".",
-      );
-    }
-    if (settings.mode === "real" && trade.side === "BUY" && remainingPerMarketUsd <= 0) {
-      return skip("Skipped LIVE BUY: per-market exposure cap " + settings.maxExposurePerMarketPercent + "% is already reached.");
-    }
-    if (settings.mode === "real" && trade.side === "BUY" && remainingTotalExposureUsd <= 0) {
-      return skip("Skipped LIVE BUY: total exposure cap " + settings.maxTotalExposurePercent + "% is already reached.");
-    }
-    if (trade.side === "BUY" && isBelowTradeMinimum(settings, requestedAmountUsd)) {
-      return skip(
-        "Skipped BUY: order $" + requestedAmountUsd.toFixed(2) +
-        " is below the configured minimum $" + settings.minTradeAmountUsd.toFixed(2) + ".",
-      );
-    }
-    if (trade.side === "BUY" && availableBalanceUsd - requestedAmountUsd < settings.minAvailableBalanceUsd) {
-      return skip(
-        settings.mode === "real"
-          ? "Skipped LIVE BUY: live USDC balance would fall below the configured minimum available balance $" +
-              settings.minAvailableBalanceUsd.toFixed(2) +
-              "."
-          : "Skipped BUY: minimum available balance would be breached.",
-      );
-    }
-    if (trade.side === "BUY" && settings.minMarketLiquidityUsd > 0 && marketLiquidity(market) < settings.minMarketLiquidityUsd) {
-      return skip("Skipped BUY: market liquidity is below the configured minimum or could not be verified.");
-    }
-    if (trade.side === "BUY" && marketExposureUsd + requestedAmountUsd > perMarketCapUsd) {
-      return skip("Skipped BUY: per-market exposure cap " + settings.maxExposurePerMarketPercent + "% would be exceeded.");
-    }
-    if (trade.side === "BUY" && exposureUsd + requestedAmountUsd > totalCapUsd) {
-      return skip("Skipped BUY: total exposure cap " + settings.maxTotalExposurePercent + "% would be exceeded.");
-    }
-    if (trade.side === "BUY" && settings.maxExposurePerWalletPercent > 0) {
-      const walletCapUsd = dollarCapFromPercent(equityUsd, settings.maxExposurePerWalletPercent);
-      const walletExposureUsd = walletExposure(positions, trade.wallet);
-      if (walletExposureUsd + requestedAmountUsd > walletCapUsd) {
-        return skip("Skipped BUY: per-wallet exposure cap " + settings.maxExposurePerWalletPercent + "% would be exceeded for this wallet.");
+    let entry: EntryPlan | null = null;
+    let sellShares = 0;
+    if (trade.side === "BUY") {
+      if (settings.minMarketLiquidityUsd > 0 && marketLiquidity(market) < settings.minMarketLiquidityUsd) {
+        return skip("Skipped BUY: market liquidity is below the configured minimum or could not be verified.");
+      }
+      if (remainingPerMarketUsd <= 0) {
+        return skip("Skipped BUY: per-market limit (" + settings.maxExposurePerMarketPercent + "% of account) already reached.");
+      }
+      if (remainingTotalExposureUsd <= 0) {
+        return skip("Skipped BUY: total invested limit (" + settings.maxTotalExposurePercent + "% of account) already reached.");
+      }
+      if (availableBalanceUsd - reserveUsd <= 0) {
+        return skip("Skipped BUY: keeping the $" + reserveUsd.toFixed(2) + " cash cushion.");
+      }
+      entry = planEntry({
+        leaderPrice: trade.price,
+        quote: outcomeBook ?? (market ? { bestBid: market.bestBid, bestAsk: market.bestAsk, midpoint: market.midpoint } : null),
+        params: tokenMeta ?? { minOrderSize: 5, tickSize: 0.01, feeRate: 0.05, feeExponent: 1 },
+        requestedUsd: requestedAmountUsd,
+        maxAllowedUsd: maxAllowedBuyUsd,
+        maxAdverseEntryMoveCents: settings.maxAdverseEntryMoveCents,
+        maxEntryCostPercent: settings.maxEntryCostPercent,
+      });
+      if (!entry.ok) return skip(entry.reason);
+      if (isBelowTradeMinimum(settings, entry.usd)) {
+        return skip("Skipped BUY: order $" + entry.usd.toFixed(2) + " is below the configured minimum $" + settings.minTradeAmountUsd.toFixed(2) + ".");
+      }
+      if (capture) capture.requestedAmountUsd = entry.usd;
+    } else {
+      const existing = positions.find((position) => position.tokenId === trade.tokenId);
+      if (existing && existing.shares > 0) {
+        sellShares =
+          settings.sellBehavior === "all"
+            ? existing.shares
+            : proportionalSellShares({
+                heldShares: existing.shares,
+                leaderSoldShares: trade.size,
+                leaderSharesBefore: await this.leaderSharesBefore(trade),
+                minOrderSize: tokenMeta?.minOrderSize ?? 5,
+              });
       }
     }
 
 
     if (settings.mode === "real") {
-      return this.executeRealTrade(trade, settings, requestedAmountUsd, market, positions, now, buyEdge);
+      return this.executeRealTrade(trade, settings, entry, sellShares, market, positions, now, buyEdge, tokenMeta);
     }
 
     const refPrice = clampPrice(trade.price);
+    const simBuyUsd = entry && entry.ok ? entry.usd : requestedAmountUsd;
+    // Simulation charges the market's real taker fee (at the expected fill price)
+    // instead of a flat setting, so paper P&L matches what live would net.
+    const feePrice = trade.side === "BUY" ? (entry && entry.ok ? entry.bestAsk : refPrice) : market?.bestBid ?? refPrice;
+    const simFeeBps = tokenMeta ? takerFeeFraction(tokenMeta, feePrice) * 10_000 : settings.takerFeeBps;
     const costSettings: FillCostSettings = {
-      takerFeeBps: settings.takerFeeBps,
+      takerFeeBps: simFeeBps,
       maxSlippageBps: settings.maxSlippageBps,
       fallbackSpreadBps: settings.fallbackSpreadBps,
     };
@@ -2756,17 +3115,17 @@ export class CopyBotEngine {
 
     if (trade.side === "BUY") {
       if (!settings.realisticFills) {
-        const shares = requestedAmountUsd / refPrice;
+        const shares = simBuyUsd / refPrice;
         return {
           positions: applyBuy(positions, trade, market, shares, refPrice, refPrice, now),
           record: makeRecord(
             trade,
             "simulated",
             settings.mode,
-            requestedAmountUsd,
+            simBuyUsd,
             shares,
             0,
-            `Simulated BUY ${requestedAmountUsd.toFixed(2)} USD following ${trade.traderName} (idealized fill).`,
+            `Simulated BUY ${simBuyUsd.toFixed(2)} USD following ${trade.traderName} (idealized fill).`,
             market,
             now,
             buyEdge,
@@ -2776,12 +3135,12 @@ export class CopyBotEngine {
 
       const fill = simulateFill({
         side: "BUY",
-        book: await fetchBookSafe(),
+        book: outcomeBook ?? (await fetchBookSafe()),
         referencePrice: refPrice,
         marketBestBid: market?.bestBid ?? null,
         marketBestAsk: market?.bestAsk ?? null,
         marketMid: market?.midpoint ?? null,
-        desiredUsd: requestedAmountUsd,
+        desiredUsd: simBuyUsd,
         settings: costSettings,
       });
       if (fill.status === "rejected" || fill.filledShares <= 0) {
@@ -2811,8 +3170,7 @@ export class CopyBotEngine {
     if (!existing || existing.shares <= 0) {
       return skip(`Observed trader SELL from ${trade.traderName}, but the bot never copied the original BUY (missed entry); nothing to sell.`);
     }
-    const sharesToSell =
-      settings.sellBehavior === "all" ? existing.shares : Math.min(existing.shares, requestedAmountUsd / refPrice);
+    const sharesToSell = Math.min(existing.shares, sellShares > 0 ? sellShares : existing.shares);
     if (sharesToSell <= 0) return skip("Skipped SELL: calculated sell size was zero.");
 
     if (!settings.realisticFills) {
@@ -2835,7 +3193,7 @@ export class CopyBotEngine {
 
     const fill = simulateFill({
       side: "SELL",
-      book: await fetchBookSafe(),
+      book: outcomeBook ?? (await fetchBookSafe()),
       referencePrice: refPrice,
       marketBestBid: market?.bestBid ?? null,
       marketBestAsk: market?.bestAsk ?? null,

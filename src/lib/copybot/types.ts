@@ -13,7 +13,18 @@ export type SizingMode = "fixed" | "percentage" | "hybrid";
 export type SizingSignalMode = "local-fixed" | "leader-size-weighted";
 /** Whether the source leader of a copied position still appears to hold it. */
 export type LeaderHoldStatus = "yes" | "no" | "unknown";
-export type RiskPresetId = "conservative" | "balanced" | "aggressive-simulation" | "action" | "live-default" | "custom";
+export type RiskPresetId =
+  | "safe"
+  | "steady"
+  | "growth"
+  | "conservative"
+  | "balanced"
+  | "aggressive-simulation"
+  | "action"
+  | "live-default"
+  | "custom";
+/** What percentage sizing is measured against: free cash or total account value. */
+export type SizingBase = "cash" | "equity";
 
 /**
  * Which Discovery v2 pool surfaced an auto-followed wallet. Manual/pinned wallets
@@ -126,6 +137,27 @@ export interface BotSettings {
   maxSlippageBps: number;
   /** Assumed spread (bps of price) used only when no live book/quote is available. */
   fallbackSpreadBps: number;
+
+  // ── Small-account strategy controls ────────────────────────────────────────
+  /** Percentage sizing is taken from free cash ("cash") or total account value ("equity"). */
+  sizingBase: SizingBase;
+  /** Maximum number of simultaneously open positions (0 = unlimited). */
+  maxOpenPositions: number;
+  /** Keep at least this % of account value as cash; BUYs that would dip below are skipped. */
+  cashReservePercent: number;
+  /**
+   * Skip BUYs whose estimated entry cost (half the spread + the taker fee, as a
+   * % of the price) exceeds this. 0 disables the check.
+   */
+  maxEntryCostPercent: number;
+  /** Pause new BUYs for 24h when account value falls this % below its peak (0 = off). */
+  maxDrawdownPausePercent: number;
+  /** Skip BUYs in markets resolving later than this many hours from now (0 = no limit). */
+  maxHoursToResolution: number;
+  /** Size up (x1.5, still capped) when 2+ followed traders bought the same outcome within an hour. */
+  consensusBoost: boolean;
+  /** What the user deposited; the home screen shows all-time P&L against it (0 = use starting balance). */
+  depositBaselineUsd: number;
 }
 
 /**
@@ -395,6 +427,16 @@ export interface BotState {
   panic: boolean;
   panicAt: number | null;
   panicReason: string | null;
+
+  /**
+   * What the operator last asked for. Survives restarts: a crash or deploy while
+   * the operator wanted the bot running brings it back automatically.
+   */
+  desiredRunState?: BotRunState;
+  /** Last time a poll finished (watchdog / health checks). */
+  lastHeartbeatAt?: number | null;
+  /** New BUYs are paused until this time after a drawdown breach (ms epoch). */
+  drawdownPauseUntil?: number | null;
 }
 
 export interface SeenTradeBook {

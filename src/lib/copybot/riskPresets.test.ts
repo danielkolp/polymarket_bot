@@ -31,16 +31,18 @@ describe("applyRiskPreset", () => {
     });
 
     // Real mode tightens these regardless of the (loose) Action preset values.
-    expect(settings.maxCopiesPerWalletPerCycle).toBe(1);
-    expect(settings.maxExposurePerWalletPercent).toBe(10);
-    expect(settings.maxTotalExposurePercent).toBe(30);
-    expect(settings.maxExposurePerMarketPercent).toBe(4);
+    expect(settings.maxCopiesPerWalletPerCycle).toBe(2);
+    expect(settings.maxExposurePerWalletPercent).toBe(25);
+    expect(settings.maxTotalExposurePercent).toBe(85);
+    expect(settings.maxExposurePerMarketPercent).toBe(15);
     expect(settings.maxMarketSpread).toBeCloseTo(0.05, 10);
-    // Adverse-entry gate forced on (0 → 2c) and freshness capped to 90s.
-    expect(settings.maxAdverseEntryMoveCents).toBe(2);
-    expect(settings.liveMaxCopyTradeAgeSec).toBe(90);
-    // Min available balance floored to 25% of bankroll.
-    expect(settings.minAvailableBalanceUsd).toBeCloseTo(25, 10);
+    // Adverse-entry gate forced on (0 → 3c) and freshness capped to 120s.
+    expect(settings.maxAdverseEntryMoveCents).toBe(3);
+    expect(settings.liveMaxCopyTradeAgeSec).toBe(120);
+    // A cash reserve is always kept in real mode; the min-balance field is no
+    // longer ratcheted up from the bankroll.
+    expect(settings.cashReservePercent).toBeGreaterThanOrEqual(10);
+    expect(settings.minAvailableBalanceUsd).toBe(0);
   });
 
   it("does not clamp simulation settings (Action Mode stays loose)", () => {
@@ -64,5 +66,33 @@ describe("applyRiskPreset", () => {
 
     expect(settings.maxCopiesPerWalletPerCycle).toBe(1);
     expect(settings.maxExposurePerWalletPercent).toBe(10);
+  });
+
+  it("Safe preset sizes a $50 account into sellable orders", () => {
+    const settings = applyRiskPreset({ ...DEFAULT_BOT_SETTINGS, mode: "real", riskPreset: "safe" });
+    expect(settings.sizingMode).toBe("hybrid");
+    expect(settings.sizingBase).toBe("equity");
+    expect(settings.percentageCopySize).toBe(6);
+    expect(settings.maxTradeAmountUsd).toBe(4);
+    expect(settings.maxTotalExposurePercent).toBe(60);
+    expect(settings.maxExposurePerMarketPercent).toBe(10);
+    expect(settings.maxOpenPositions).toBe(8);
+    expect(settings.cashReservePercent).toBe(25);
+    expect(settings.maxDailyLossPercent).toBe(8);
+    expect(settings.autoExitTakeProfitPercent).toBe(30);
+    expect(settings.autoExitStopLossPercent).toBe(25);
+    // Real-mode envelope never loosens Safe.
+    expect(settings.maxAdverseEntryMoveCents).toBe(2);
+    expect(settings.maxMarketSpread).toBeCloseTo(0.03, 10);
+  });
+
+  it("Growth is looser than Balanced which is looser than Safe", () => {
+    const safe = applyRiskPreset({ ...DEFAULT_BOT_SETTINGS, mode: "real", riskPreset: "safe" });
+    const steady = applyRiskPreset({ ...DEFAULT_BOT_SETTINGS, mode: "real", riskPreset: "steady" });
+    const growth = applyRiskPreset({ ...DEFAULT_BOT_SETTINGS, mode: "real", riskPreset: "growth" });
+    expect(steady.maxTradeAmountUsd).toBeGreaterThan(safe.maxTradeAmountUsd);
+    expect(growth.maxTradeAmountUsd).toBeGreaterThan(steady.maxTradeAmountUsd);
+    expect(steady.maxTotalExposurePercent).toBeGreaterThan(safe.maxTotalExposurePercent);
+    expect(growth.maxTotalExposurePercent).toBeGreaterThan(steady.maxTotalExposurePercent);
   });
 });

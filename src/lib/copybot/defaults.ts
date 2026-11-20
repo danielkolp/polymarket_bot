@@ -16,7 +16,7 @@ export const DEFAULT_BOT_SETTINGS: BotSettings = {
   percentageCopySize: 2,
   minTradeAmountUsd: 0.01,
   maxTradeAmountUsd: 5,
-  riskPreset: "conservative",
+  riskPreset: "safe",
   maxExposurePerMarketPercent: 10,
   maxTotalExposurePercent: 40,
   maxDailyLossPercent: 10,
@@ -52,6 +52,14 @@ export const DEFAULT_BOT_SETTINGS: BotSettings = {
   takerFeeBps: 0,
   maxSlippageBps: 500,
   fallbackSpreadBps: 200,
+  sizingBase: "cash",
+  maxOpenPositions: 0,
+  cashReservePercent: 0,
+  maxEntryCostPercent: 0,
+  maxDrawdownPausePercent: 0,
+  maxHoursToResolution: 0,
+  consensusBoost: false,
+  depositBaselineUsd: 0,
 };
 
 export function createInitialBotState(startingBalance: number, now = Date.now()): BotState {
@@ -75,5 +83,8 @@ export function createInitialBotState(startingBalance: number, now = Date.now())
     panic: false,
     panicAt: null,
     panicReason: null,
+    desiredRunState: "stopped",
+    lastHeartbeatAt: null,
+    drawdownPauseUntil: null,
   };
 }

@@ -1,20 +1,21 @@
 import type { BotSettings, RiskPresetId } from "./types";
 
-// ── Non-negotiable real-money clamps ──────────────────────────────────────────
-// These are applied to live settings on every load regardless of the selected
-// preset (so Action Mode etc. can stay loose for simulation but can never loosen
-// real-money risk). They only ever TIGHTEN — never loosen — a configured value.
-export const REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE = 1;
-export const REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT = 10;
-export const REAL_MODE_MAX_TOTAL_EXPOSURE_PERCENT = 30;
-export const REAL_MODE_MAX_PER_MARKET_EXPOSURE_PERCENT = 4;
+// ── Real-money safety envelope ────────────────────────────────────────────────
+// Applied to live settings on every load regardless of the selected preset, so
+// loose simulation presets can never loosen real-money risk. They only ever
+// TIGHTEN a configured value. The envelope is sized so a small account (e.g.
+// $50) can still place orders that clear Polymarket's 5-share minimum.
+export const REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE = 2;
+export const REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT = 25;
+export const REAL_MODE_MAX_TOTAL_EXPOSURE_PERCENT = 90;
+export const REAL_MODE_MAX_PER_MARKET_EXPOSURE_PERCENT = 15;
 export const REAL_MODE_MAX_MARKET_SPREAD = 0.05;
-/** Live floor on minimum available balance, as a fraction of configured bankroll. */
-export const REAL_MODE_MIN_AVAILABLE_BALANCE_FRACTION = 0.25;
+/** Real mode always keeps at least this % of account value in cash. */
+export const REAL_MODE_MIN_CASH_RESERVE_PERCENT = 10;
 /** Adverse-entry gate is forced on in real mode and capped at this many cents. */
-export const REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS = 2;
-/** Real-mode BUY freshness ceiling (seconds). */
-export const REAL_MODE_MAX_COPY_TRADE_AGE_SEC = 90;
+export const REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS = 3;
+/** Real-mode BUY freshness ceiling (seconds). Entries are also price-capped. */
+export const REAL_MODE_MAX_COPY_TRADE_AGE_SEC = 120;
 
 export interface RiskPreset {
   id: RiskPresetId;
@@ -38,7 +39,105 @@ export interface RiskPreset {
   extraSettings?: Partial<BotSettings>;
 }
 
+
+/** Settings shared by the three small-account live presets. */
+const SMALL_ACCOUNT_BASE: Partial<BotSettings> = {
+  sizingMode: "hybrid",
+  sizingBase: "equity",
+  sizingSignalMode: "local-fixed",
+  minTradeAmountUsd: 1,
+  minAvailableBalanceUsd: 1,
+  cashReservePercent: 25,
+  maxEntryCostPercent: 4,
+  maxDrawdownPausePercent: 20,
+  maxMarketSpread: 0.03,
+  maxAdverseEntryMoveCents: 2,
+  liveMaxCopyTradeAgeSec: 120,
+  maxTradeAgeSec: 300,
+  exitWhenLeaderNoLongerHolds: true,
+  sellBehavior: "proportional",
+  autoExitTakeProfitPercent: 30,
+  autoExitStopLossPercent: 25,
+  autoExitMaxHoldMinutes: 10 * 24 * 60,
+  pollingIntervalSec: 15,
+  traderRefreshIntervalMin: 30,
+  topTradersToFollow: 12,
+  minTraderWeeklyVolumeUsd: 1000,
+  minTraderTradeCount: 10,
+  maxTraderInactivityHours: 48,
+  minMarketLiquidityUsd: 1000,
+  maxCopiesPerWalletPerCycle: 1,
+  maxExposurePerWalletPercent: 20,
+  walletTradeCooldownSec: 300,
+  consensusBoost: true,
+  realisticFills: true,
+  sessionOnly: false,
+};
+
 export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
+  safe: {
+    id: "safe",
+    label: "Safe",
+    description:
+      "Built for small accounts: about 6% of your balance per trade (max $4), at most 60% invested and 8 open positions, a 25% cash cushion, buying pauses for the day after an 8% loss. Take-profit +30%, stop-loss -25%.",
+    totalExposurePercent: 60,
+    perMarketExposurePercent: 10,
+    minTimeToResolutionMinutes: 60,
+    minBuyTokenPrice: 0.2,
+    maxBuyTokenPrice: 0.8,
+    extraSettings: {
+      ...SMALL_ACCOUNT_BASE,
+      percentageCopySize: 6,
+      maxTradeAmountUsd: 4,
+      maxOpenPositions: 8,
+      maxDailyLossPercent: 8,
+      maxHoursToResolution: 14 * 24,
+    },
+  },
+  steady: {
+    id: "steady",
+    label: "Balanced",
+    description:
+      "About 8% of your balance per trade (max $6), up to 75% invested and 10 open positions, buying pauses for the day after a 12% loss.",
+    totalExposurePercent: 75,
+    perMarketExposurePercent: 12,
+    minTimeToResolutionMinutes: 60,
+    minBuyTokenPrice: 0.15,
+    maxBuyTokenPrice: 0.85,
+    extraSettings: {
+      ...SMALL_ACCOUNT_BASE,
+      percentageCopySize: 8,
+      maxTradeAmountUsd: 6,
+      maxOpenPositions: 10,
+      maxDailyLossPercent: 12,
+      maxHoursToResolution: 21 * 24,
+      topTradersToFollow: 15,
+    },
+  },
+  growth: {
+    id: "growth",
+    label: "Growth",
+    description:
+      "More active: about 10% of your balance per trade (max $10), up to 85% invested and 12 open positions, buying pauses for the day after a 15% loss. Bigger swings both ways.",
+    totalExposurePercent: 85,
+    perMarketExposurePercent: 15,
+    minTimeToResolutionMinutes: 30,
+    minBuyTokenPrice: 0.1,
+    maxBuyTokenPrice: 0.9,
+    extraSettings: {
+      ...SMALL_ACCOUNT_BASE,
+      percentageCopySize: 10,
+      maxTradeAmountUsd: 10,
+      maxOpenPositions: 12,
+      maxDailyLossPercent: 15,
+      maxHoursToResolution: 30 * 24,
+      topTradersToFollow: 18,
+      maxEntryCostPercent: 5,
+      maxMarketSpread: 0.04,
+      maxCopiesPerWalletPerCycle: 2,
+      autoExitStopLossPercent: 30,
+    },
+  },
   conservative: {
     id: "conservative",
     label: "Conservative",
@@ -101,17 +200,17 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     id: "live-default",
     label: "Live Default",
     description:
-      "Conservative real-money defaults: tight exposure caps, one copy per wallet per cycle, narrow spread tolerance, strict entry-edge and freshness gates. Real mode clamps to these regardless of preset.",
-    totalExposurePercent: REAL_MODE_MAX_TOTAL_EXPOSURE_PERCENT,
-    perMarketExposurePercent: REAL_MODE_MAX_PER_MARKET_EXPOSURE_PERCENT,
+      "Legacy very tight real-money caps (4% per market). Too small for accounts under ~$150 because Polymarket orders need at least 5 shares - prefer Safe.",
+    totalExposurePercent: 30,
+    perMarketExposurePercent: 4,
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.05,
     maxBuyTokenPrice: 0.85,
     extraSettings: {
-      maxCopiesPerWalletPerCycle: REAL_MODE_MAX_COPIES_PER_WALLET_PER_CYCLE,
-      maxExposurePerWalletPercent: REAL_MODE_MAX_EXPOSURE_PER_WALLET_PERCENT,
+      maxCopiesPerWalletPerCycle: 1,
+      maxExposurePerWalletPercent: 10,
       maxMarketSpread: REAL_MODE_MAX_MARKET_SPREAD,
-      maxAdverseEntryMoveCents: REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS,
+      maxAdverseEntryMoveCents: 2,
       liveMaxCopyTradeAgeSec: 60,
     },
   },
@@ -175,8 +274,7 @@ export function applyRealModeSafetyCaps(settings: BotSettings): BotSettings {
     settings.maxMarketSpread <= 0
       ? REAL_MODE_MAX_MARKET_SPREAD
       : Math.min(settings.maxMarketSpread, REAL_MODE_MAX_MARKET_SPREAD);
-  const minAvailableFloor = REAL_MODE_MIN_AVAILABLE_BALANCE_FRACTION * Math.max(0, settings.startingBalance);
-  const minAvailable = Math.max(settings.minAvailableBalanceUsd, minAvailableFloor);
+  const cashReserve = Math.max(settings.cashReservePercent ?? 0, REAL_MODE_MIN_CASH_RESERVE_PERCENT);
   // Adverse-entry gate is forced ON in real mode (0 = disabled is not allowed).
   const maxAdverse =
     settings.maxAdverseEntryMoveCents <= 0
@@ -194,7 +292,7 @@ export function applyRealModeSafetyCaps(settings: BotSettings): BotSettings {
     maxTotalExposurePercent: maxTotalExposure,
     maxExposurePerMarketPercent: maxPerMarketExposure,
     maxMarketSpread: maxSpread,
-    minAvailableBalanceUsd: minAvailable,
+    cashReservePercent: cashReserve,
     maxAdverseEntryMoveCents: maxAdverse,
     liveMaxCopyTradeAgeSec: liveMaxAge,
   };

@@ -97,12 +97,21 @@ export function dollarCapFromPercent(bankrollUsd: number, percent: number): numb
   return Math.max(0, bankrollUsd * (percent / 100));
 }
 
-export function calculateNextTradeSize(settings: BotSettings, availableBalanceUsd: number): number {
+/**
+ * Next copy size in USD. Percentage sizing is taken from free cash, or from total
+ * account value when `sizingBase` is "equity" (steadier sizing for small
+ * accounts: buying doesn't shrink the next trade). Never exceeds free cash.
+ */
+export function calculateNextTradeSize(settings: BotSettings, availableBalanceUsd: number, equityUsd?: number): number {
   let raw: number;
   if (settings.sizingMode === "fixed") {
     raw = settings.fixedCopyAmountUsd;
   } else {
-    raw = availableBalanceUsd * (settings.percentageCopySize / 100);
+    const base =
+      settings.sizingBase === "equity" && equityUsd != null && Number.isFinite(equityUsd) && equityUsd > 0
+        ? equityUsd
+        : availableBalanceUsd;
+    raw = base * (settings.percentageCopySize / 100);
   }
 
   if (settings.sizingMode === "hybrid") {
