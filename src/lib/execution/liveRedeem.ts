@@ -25,6 +25,7 @@
 import { Wallet, Contract, providers } from "ethers";
 import { config } from "@/lib/config";
 import { LiveTradingError } from "./liveClob";
+import { withTimeout } from "@/lib/util/withTimeout";
 
 /** Polygon mainnet. The hardcoded contract addresses below are Polygon-only. */
 const POLYGON_CHAIN_ID = 137;
@@ -126,8 +127,13 @@ export async function redeemConditionOnChain(conditionId: string): Promise<Redee
 
     const wallet = new Wallet(config.livePrivateKey.trim(), getProvider());
     const ctf = new Contract(CTF_ADDRESS, CTF_ABI, wallet);
-    const tx = await ctf.redeemPositions(USDC_ADDRESS, PARENT_COLLECTION_ID, conditionId, BINARY_INDEX_SETS);
-    const receipt = await tx.wait(1);
+    const tx: providers.TransactionResponse = await withTimeout(
+      ctf.redeemPositions(USDC_ADDRESS, PARENT_COLLECTION_ID, conditionId, BINARY_INDEX_SETS) as Promise<providers.TransactionResponse>,
+      30_000,
+      "redeem transaction submit",
+    );
+    // A stuck transaction must never freeze the poll loop.
+    const receipt: providers.TransactionReceipt = await withTimeout(tx.wait(1), 90_000, "redeem confirmation");
     const ok = receipt?.status === 1;
     return {
       success: ok,
