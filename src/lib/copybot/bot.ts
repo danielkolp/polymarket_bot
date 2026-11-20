@@ -922,8 +922,11 @@ export class CopyBotEngine {
     const ageSec = lastOk ? Math.round((now - lastOk) / 1000) : null;
     const staleAfterSec = settings.pollingIntervalSec * 3 + 120;
     const active = state.runState === "running" || state.runState === "draining";
+    // Persisted timestamps survive a restart, so also require that THIS process
+    // actually owns a live loop (otherwise a failed auto-resume looks healthy).
+    const loopAlive = this.loopShouldRun || this.inFlight || this.timer != null;
     return {
-      healthy: active && !state.panic && ageSec != null && ageSec <= staleAfterSec,
+      healthy: active && loopAlive && !state.panic && ageSec != null && ageSec <= staleAfterSec,
       runState: state.runState,
       mode: settings.mode,
       panic: Boolean(state.panic),
