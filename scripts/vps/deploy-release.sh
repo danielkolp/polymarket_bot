@@ -1,7 +1,7 @@
 # deploy-release: install a prebuilt release tarball and switch to it atomically.
 # Expects (exported by the workflow): RELEASE_SHA, RELEASE_TARBALL.
 # Idempotent. On the first run it migrates the old checkout's .env.local and
-# data/ into /opt/bonk/shared and stops the old process. Rolls back
+# data/ into /srv/bonk/shared and stops the old process. Rolls back
 # automatically if the new release doesn't become healthy.
 set -euo pipefail
 
@@ -25,7 +25,8 @@ fi
 echo "node $(node -v)"
 
 # ── 2. First-run migration from the old checkout ──────────────────────────────
-LEGACY_DIR="$(legacy_app_dirs | grep -v "^$BONK_ROOT" | head -n1 || true)"
+LEGACY_DIR="$(legacy_app_dir || true)"
+echo "original install: ${LEGACY_DIR:-none}"
 if [ ! -f "$BONK_SHARED/.env.local" ]; then
   if [ -n "$LEGACY_DIR" ] && [ -f "$LEGACY_DIR/.env.local" ]; then
     cp -p "$LEGACY_DIR/.env.local" "$BONK_SHARED/.env.local"
@@ -40,7 +41,13 @@ if [ -n "$LEGACY_DIR" ] && [ -d "$LEGACY_DIR/data" ] && [ ! -f "$BONK_SHARED/dat
   if [ -z "$(ls -A "$BONK_SHARED/data" 2>/dev/null)" ]; then
     # Copy runtime state but not old logs/analytics bulk (they're rebuilt).
     (cd "$LEGACY_DIR/data" && find . -maxdepth 1 -type f -name '*.json' -exec cp -p {} "$BONK_SHARED/data/" \;)
-    echo "migrated bot state (settings, traders, positions, trades) from the old checkout"
+    # Arrive stopped: going live is a separate, deliberate step (go-live task).
+    if [ -f "$BONK_SHARED/data/bot-state.json" ]; then
+      node -e '
+        const fs=require("fs");const f=process.argv[1];
+        try{const s=JSON.parse(fs.readFileSync(f,"utf8"));s.runState="stopped";s.desiredRunState="stopped";s.nextPollAt=null;fs.writeFileSync(f,JSON.stringify(s))}catch(e){console.log("could not normalize bot-state.json: "+e.message)}' "$BONK_SHARED/data/bot-state.json"
+    fi
+    echo "migrated bot state (settings, traders, positions, trades) from the old checkout; bot left stopped"
   fi
   date -u +%FT%TZ > "$BONK_SHARED/data/.migrated"
 fi
@@ -86,25 +93,22 @@ fi
 systemctl daemon-reload
 
 # ── 5. Stop the old way of running the app (first run only) ──────────────────
-if [ -n "$LEGACY_DIR" ]; then
-  if have pm2; then
-    for name in $(pm2 jlist 2>/dev/null | node -e '
-      let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{for(const p of JSON.parse(s)){const cwd=(p.pm2_env&&p.pm2_env.pm_cwd)||"";if(cwd.startsWith(process.argv[1]))console.log(p.name)}}catch{}})' "$LEGACY_DIR"); do
-      echo "stopping pm2 app '$name' (old checkout)"
-      pm2 delete "$name" >/dev/null 2>&1 || true
-      pm2 save >/dev/null 2>&1 || true
-    done
-  fi
-  for unit in $(systemctl list-units --type=service --state=running --no-legend 2>/dev/null | awk '{print $1}' | grep -v '^bonk'); do
-    wd="$(systemctl show -p WorkingDirectory --value "$unit" 2>/dev/null || true)"
-    if [ -n "$wd" ] && [ "${wd#"$LEGACY_DIR"}" != "$wd" ]; then
-      echo "stopping and disabling old service $unit"
-      systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    fi
+# pm2 apps are only STOPPED here; they are deleted after the new release is
+# healthy, and restarted if the first deploy fails (so the box is never left
+# without a running app).
+LEGACY_PM2_APPS=""
+if [ -n "$LEGACY_DIR" ] && have pm2; then
+  LEGACY_PM2_APPS="$(pm2 jlist 2>/dev/null | node -e '
+    let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{for(const p of JSON.parse(s)){const cwd=(p.pm2_env&&p.pm2_env.pm_cwd)||"";if(cwd===process.argv[1]||cwd.startsWith(process.argv[1]+"/"))console.log(p.name)}}catch{}})' "$LEGACY_DIR")"
+  for name in $LEGACY_PM2_APPS; do
+    echo "stopping pm2 app '$name' (original install)"
+    pm2 stop "$name" >/dev/null 2>&1 || true
   done
+fi
+if [ -n "$LEGACY_DIR" ]; then
   for pid in $(pgrep -f 'next|node' 2>/dev/null || true); do
     cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
-    if [ -n "$cwd" ] && [ "${cwd#"$LEGACY_DIR"}" != "$cwd" ]; then
+    if [ -n "$cwd" ] && { [ "$cwd" = "$LEGACY_DIR" ] || [ "${cwd#"$LEGACY_DIR"/}" != "$cwd" ]; }; then
       echo "stopping old process $pid"
       kill "$pid" 2>/dev/null || true
     fi
@@ -148,11 +152,25 @@ else
     echo "rolling back to $(basename "$PREVIOUS")"
     ln -sfn "$PREVIOUS" "$BONK_ROOT/current.new" && mv -Tf "$BONK_ROOT/current.new" "$BONK_CURRENT"
     systemctl restart bonk
+  elif [ -n "$LEGACY_PM2_APPS" ]; then
+    echo "first deploy failed: restoring the original pm2 app"
+    systemctl disable --now bonk >/dev/null 2>&1 || true
+    for name in $LEGACY_PM2_APPS; do pm2 start "$name" >/dev/null 2>&1 || true; done
   fi
   exit 1
 fi
 
 # ── 7. Housekeeping ──────────────────────────────────────────────────────────
+if [ -n "$LEGACY_PM2_APPS" ]; then
+  for name in $LEGACY_PM2_APPS; do pm2 delete "$name" >/dev/null 2>&1 && echo "removed pm2 app '$name'"; done
+  pm2 save --force >/dev/null 2>&1 || true
+  if [ "$(pm2 jlist 2>/dev/null | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{console.log(JSON.parse(s).length)}catch{console.log(1)}})')" = "0" ]; then
+    pm2 kill >/dev/null 2>&1 || true
+    for u in $(systemctl list-unit-files --no-legend 'pm2-*.service' 2>/dev/null | awk '{print $1}'); do
+      systemctl disable --now "$u" >/dev/null 2>&1 && echo "disabled $u (no pm2 apps left)"
+    done
+  fi
+fi
 cd "$BONK_ROOT/releases"
 ls -1t | tail -n +$((KEEP_RELEASES + 1)) | while read -r old; do
   [ "$BONK_ROOT/releases/$old" = "$REL_DIR" ] && continue

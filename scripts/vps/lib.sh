@@ -5,7 +5,8 @@ set -u
 export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 
-BONK_ROOT=/opt/bonk
+# New layout lives in /srv/bonk; the original install (pm2) is /opt/bonk.
+BONK_ROOT=/srv/bonk
 BONK_SHARED=$BONK_ROOT/shared
 BONK_CURRENT=$BONK_ROOT/current
 BONK_PORT_DEFAULT=3000
@@ -54,13 +55,38 @@ app_port() {
   echo "$BONK_PORT_DEFAULT"
 }
 
+# The original (pre-systemd) checkout: the cwd of the pm2 "bonk" app, else of
+# whatever node process listens on the app port, else a checkout that has an
+# .env.local. Never a /srv/bonk release or a stray staging copy.
+legacy_app_dir() {
+  local d=""
+  if have pm2; then
+    d="$(pm2 jlist 2>/dev/null | node -e '
+      let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{
+        const apps=JSON.parse(s);const a=apps.find(p=>p.name==="bonk")||apps[0];
+        if(a&&a.pm2_env&&a.pm2_env.pm_cwd)console.log(a.pm2_env.pm_cwd)}catch{}})' 2>/dev/null)"
+  fi
+  if [ -z "$d" ]; then
+    local pid
+    pid="$(ss -ltnpH "sport = :$(app_port)" 2>/dev/null | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2)"
+    [ -n "$pid" ] && d="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+  fi
+  if [ -z "$d" ]; then
+    local c
+    for c in $(legacy_app_dirs); do
+      [ -f "$c/.env.local" ] && { d="$c"; break; }
+    done
+  fi
+  case "$d" in ""|"$BONK_ROOT"|"$BONK_ROOT"/*) d="" ;; esac
+  [ -n "$d" ] && [ -f "$d/package.json" ] && echo "$d"
+}
+
 # Env file the running app uses.
 app_env_file() {
   if [ -f "$BONK_SHARED/.env.local" ]; then echo "$BONK_SHARED/.env.local"; return; fi
   local d
-  for d in $(legacy_app_dirs); do
-    [ -f "$d/.env.local" ] && { echo "$d/.env.local"; return; }
-  done
+  d="$(legacy_app_dir)"
+  [ -n "$d" ] && [ -f "$d/.env.local" ] && echo "$d/.env.local"
 }
 
 # curl the local app (bypasses nginx Basic auth). Adds the dashboard token
@@ -85,6 +111,7 @@ status_summary() {
   printf '%s' "$json" | node -e '
     let s = ""; process.stdin.on("data", c => s += c).on("end", () => {
       let j; try { j = JSON.parse(s); } catch { console.log("non-JSON status: " + s.slice(0, 200)); return; }
+      if (j && j.data && j.data.state) j = j.data; // API envelope {ok, data}
       const st = j.state || {}, set = j.settings || {}, br = j.buyReadiness || {};
       const out = {
         runState: st.runState, desiredRunState: st.desiredRunState, mode: set.mode,

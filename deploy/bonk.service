@@ -8,10 +8,10 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# /opt/bonk/current -> /opt/bonk/releases/<sha>; each release links
-# .env.local and data/ to /opt/bonk/shared, which survive deploys.
-WorkingDirectory=/opt/bonk/current
-EnvironmentFile=-/opt/bonk/shared/runtime.env
+# /srv/bonk/current -> /srv/bonk/releases/<sha>; each release links
+# .env.local and data/ to /srv/bonk/shared, which survive deploys.
+WorkingDirectory=/srv/bonk/current
+EnvironmentFile=-/srv/bonk/shared/runtime.env
 Environment=NODE_ENV=production
 Environment=NEXT_TELEMETRY_DISABLED=1
 Environment=NODE_OPTIONS=--max-old-space-size=320

@@ -4,4 +4,4 @@ After=bonk.service
 
 [Service]
 Type=oneshot
-ExecStart=/opt/bonk/current/scripts/vps/watchdog.sh
+ExecStart=/srv/bonk/current/scripts/vps/watchdog.sh

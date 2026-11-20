@@ -35,7 +35,7 @@ The bot restarts itself after crashes, deploys and reboots, and resumes if it wa
 Pushes to `main` (and the working branch) run `.github/workflows/deploy.yml`:
 
 1. GitHub builds a self-contained server bundle (`output: "standalone"`, ~8 MB compressed), runs typecheck and tests.
-2. It uploads the bundle over SSH to `/opt/bonk/releases/<sha>`, links `/opt/bonk/shared/{.env.local,data}`, installs the `bonk` systemd service, the health watchdog timer and a journald size cap, and restarts.
+2. It uploads the bundle over SSH to `/srv/bonk/releases/<sha>`, links `/srv/bonk/shared/{.env.local,data}`, installs the `bonk` systemd service, the health watchdog timer and a journald size cap, and restarts.
 3. It waits for `/api/health` to report a fresh heartbeat and **rolls back automatically** if the new release is unhealthy. Two releases are kept.
 
 The first deploy migrates `.env.local` and the bot's JSON state from the old checkout, stops the old process, and deletes the old checkout's `node_modules`/`.next`.
