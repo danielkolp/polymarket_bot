@@ -25,7 +25,7 @@ describe("applyRiskPreset", () => {
       maxExposurePerMarketPercent: 20,
       maxMarketSpread: 0.15,
       maxAdverseEntryMoveCents: 0,
-      liveMaxCopyTradeAgeSec: 300,
+      liveMaxCopyTradeAgeSec: 3600,
       startingBalance: 100,
       minAvailableBalanceUsd: 0,
     });
@@ -36,9 +36,10 @@ describe("applyRiskPreset", () => {
     expect(settings.maxTotalExposurePercent).toBe(85);
     expect(settings.maxExposurePerMarketPercent).toBe(15);
     expect(settings.maxMarketSpread).toBeCloseTo(0.05, 10);
-    // Adverse-entry gate forced on (0 → 3c) and freshness capped to 120s.
+    // Adverse-entry gate forced on (0 → 3c) and freshness capped to 480s
+    // (Polymarket's public trade feed runs ~4 minutes behind).
     expect(settings.maxAdverseEntryMoveCents).toBe(3);
-    expect(settings.liveMaxCopyTradeAgeSec).toBe(120);
+    expect(settings.liveMaxCopyTradeAgeSec).toBe(480);
     // A cash reserve is always kept in real mode; the min-balance field is no
     // longer ratcheted up from the bankroll.
     expect(settings.cashReservePercent).toBeGreaterThanOrEqual(10);

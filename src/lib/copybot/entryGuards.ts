@@ -9,8 +9,14 @@
 import type { Market, TraderTrade } from "@/lib/polymarket/types";
 import type { BotSettings } from "./types";
 
-/** Hard absolute ceiling on copyable trade age (engine-enforced, 5 minutes). */
-export const MAX_COPY_TRADE_AGE_SEC = 300;
+/**
+ * Hard absolute ceiling on copyable trade age (engine-enforced, 15 minutes).
+ * Polymarket's public trade feed (Data API v2 /trades) publishes fills about
+ * 4 minutes late, so tighter ceilings would reject almost every signal — and
+ * would make the bot miss leaders' exits. Entries stay protected by the
+ * adverse-price cap (never pay more than a couple of cents over the leader).
+ */
+export const MAX_COPY_TRADE_AGE_SEC = 900;
 
 function validPrice(p: number | null | undefined): number | null {
   return typeof p === "number" && Number.isFinite(p) && p > 0 && p < 1 ? p : null;

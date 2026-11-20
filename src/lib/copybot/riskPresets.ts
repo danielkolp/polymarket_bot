@@ -14,8 +14,12 @@ export const REAL_MODE_MAX_MARKET_SPREAD = 0.05;
 export const REAL_MODE_MIN_CASH_RESERVE_PERCENT = 10;
 /** Adverse-entry gate is forced on in real mode and capped at this many cents. */
 export const REAL_MODE_MAX_ADVERSE_ENTRY_MOVE_CENTS = 3;
-/** Real-mode BUY freshness ceiling (seconds). Entries are also price-capped. */
-export const REAL_MODE_MAX_COPY_TRADE_AGE_SEC = 120;
+/**
+ * Real-mode BUY freshness ceiling (seconds). Polymarket's public trade feed runs
+ * ~4 minutes behind, so this allows ~8 minutes; every entry is still capped at
+ * the leader's price + maxAdverseEntryMoveCents.
+ */
+export const REAL_MODE_MAX_COPY_TRADE_AGE_SEC = 480;
 
 export interface RiskPreset {
   id: RiskPresetId;
@@ -52,8 +56,8 @@ const SMALL_ACCOUNT_BASE: Partial<BotSettings> = {
   maxDrawdownPausePercent: 20,
   maxMarketSpread: 0.03,
   maxAdverseEntryMoveCents: 2,
-  liveMaxCopyTradeAgeSec: 120,
-  maxTradeAgeSec: 300,
+  liveMaxCopyTradeAgeSec: 480,
+  maxTradeAgeSec: 900,
   exitWhenLeaderNoLongerHolds: true,
   sellBehavior: "proportional",
   autoExitTakeProfitPercent: 30,

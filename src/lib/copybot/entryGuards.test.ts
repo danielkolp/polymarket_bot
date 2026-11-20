@@ -102,8 +102,8 @@ describe("effectiveMaxCopyAgeSec", () => {
     expect(effectiveMaxCopyAgeSec(s, "SELL")).toBe(300);
   });
 
-  it("never exceeds the hard 5-minute absolute cap", () => {
+  it("never exceeds the hard 15-minute absolute cap", () => {
     const s = makeSettings({ mode: "simulation", maxTradeAgeSec: 86400, liveMaxCopyTradeAgeSec: 60 });
-    expect(effectiveMaxCopyAgeSec(s, "BUY")).toBe(300);
+    expect(effectiveMaxCopyAgeSec(s, "BUY")).toBe(900);
   });
 });

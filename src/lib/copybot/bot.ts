@@ -253,7 +253,7 @@ function sanitizeSettings(current: BotSettings, patch: Partial<BotSettings>): Bo
     minTimeToResolutionMinutes: sanitizeNumber(next.minTimeToResolutionMinutes, current.minTimeToResolutionMinutes, 0, 525600),
     maxTradeAgeSec: sanitizeNumber(next.maxTradeAgeSec, current.maxTradeAgeSec, 5, 86400),
     maxAdverseEntryMoveCents: sanitizeNumber(next.maxAdverseEntryMoveCents, current.maxAdverseEntryMoveCents, 0, 100),
-    liveMaxCopyTradeAgeSec: sanitizeNumber(next.liveMaxCopyTradeAgeSec, current.liveMaxCopyTradeAgeSec, 5, 300),
+    liveMaxCopyTradeAgeSec: sanitizeNumber(next.liveMaxCopyTradeAgeSec, current.liveMaxCopyTradeAgeSec, 5, 900),
     exitWhenLeaderNoLongerHolds:
       typeof next.exitWhenLeaderNoLongerHolds === "boolean" ? next.exitWhenLeaderNoLongerHolds : current.exitWhenLeaderNoLongerHolds,
     traderRefreshIntervalMin: sanitizeNumber(next.traderRefreshIntervalMin, current.traderRefreshIntervalMin, 1, 1440),
