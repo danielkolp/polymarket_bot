@@ -192,6 +192,56 @@ function presetNumbers(id: RiskPresetId, equity: number) {
   };
 }
 
+/** Plain-English bucket for a skipped BUY (for the "why no trades" card). */
+function skipBucket(reason: string): string {
+  const r = reason.toLowerCase();
+  if (/too costly|entry cost/.test(r)) return "Too costly to copy (fees + price)";
+  if (/price already moved/.test(r)) return "Price moved before the bot could copy";
+  if (/resolves in .*days|tied up/.test(r)) return "Market resolves too far in the future";
+  if (/resolves within/.test(r)) return "Market resolves too soon";
+  if (/token price/.test(r)) return "Price outside the 20–80¢ range";
+  if (/spread/.test(r)) return "Spread too wide (hard to sell later)";
+  if (/liquidity/.test(r)) return "Market too thin";
+  if (/needs at least|minimum/.test(r)) return "Too small for your balance";
+  if (/cash cushion|already reached|maximum of|exposure|per-wallet/.test(r)) return "Your limits are full";
+  if (/s old|stale|freshness/.test(r)) return "Trade too old by the time it was seen";
+  if (/daily loss|drawdown|panic|readiness|on hold/.test(r)) return "Buying is paused";
+  if (/kept only to mirror exits/.test(r)) return "Trader followed for exits only";
+  if (/resolved|closed/.test(r)) return "Market already closed";
+  if (/no sellers/.test(r)) return "Nobody selling right now";
+  return "Other";
+}
+
+function WhyNoTrades({ trades, now }: { trades: CopyTradeRecord[]; now: number }) {
+  const hourAgo = now - 3600_000;
+  const recent = trades.filter((t) => t.processedAt >= hourAgo && t.side === "BUY");
+  if (recent.some((t) => t.status === "copied" || t.status === "simulated")) return null;
+  const skipped = recent.filter((t) => t.status === "skipped" || t.status === "failed");
+  if (skipped.length === 0) return null;
+  const counts = new Map<string, number>();
+  for (const t of skipped) {
+    const k = t.status === "failed" ? "Order failed (see Advanced → log)" : skipBucket(t.reason);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  return (
+    <section className="rounded-lg border border-border bg-card p-5">
+      <h2 className="font-semibold">Why no trades in the last hour</h2>
+      <p className="mt-1 text-sm text-muted-foreground">
+        Your traders made {skipped.length} buy{skipped.length === 1 ? "" : "s"}; none passed your safety limits yet.
+      </p>
+      <ul className="mt-3 space-y-1.5 text-sm">
+        {rows.map(([label, n]) => (
+          <li key={label} className="flex items-center justify-between gap-3">
+            <span className="min-w-0">{label}</span>
+            <span className="shrink-0 tabular-nums text-muted-foreground">{n}×</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function describeRecord(r: CopyTradeRecord): { text: string; tone: "buy" | "sell" | "skip" | "fail" } {
   const price = `${(r.price * 100).toFixed(0)}¢`;
   const what = `${r.outcome ? `${r.outcome} · ` : ""}${r.marketTitle}`;
@@ -362,6 +412,8 @@ export function Home({
           {!status.realTradingEnabled && <span className="text-xs text-muted-foreground">Real trading is off on the server.</span>}
         </div>
       </section>
+
+      {running && <WhyNoTrades trades={status.recentTrades} now={now} />}
 
       {/* Risk level */}
       <section className="rounded-lg border border-border bg-card p-5">

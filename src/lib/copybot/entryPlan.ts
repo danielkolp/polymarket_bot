@@ -5,9 +5,10 @@
  *
  *  1. Price cap: never pay more than `leaderPrice + maxAdverseEntryMoveCents`.
  *     The order is a FAK limit at that price, so it can never sweep a thin book.
- *  2. Cost check: half the spread + Polymarket's taker fee (as % of price) must
- *     stay under `maxEntryCostPercent` — expensive entries need a bigger edge
- *     than copy trading reliably provides.
+ *  2. Cost check: what copying costs on top of the trader's own entry — the
+ *     taker fee at the ask plus any premium paid over the trader's price — must
+ *     stay under `maxEntryCostPercent`. (Exit liquidity is handled separately by
+ *     the max-spread filter; positions held to resolution pay no exit fee.)
  *  3. Sellable size: the order must buy at least the market's minimum order
  *     size (usually 5 shares), otherwise the position could never be sold. If
  *     the strategy size is smaller, it is bumped up to the minimum — but only
@@ -46,7 +47,7 @@ export type EntryPlan =
       usd: number;
       limitPrice: number;
       bestAsk: number;
-      /** Half-spread + taker fee as a fraction of the ask (0.03 = 3%). */
+      /** Taker fee + premium over the trader's price, as a fraction of the ask (0.03 = 3%). */
       entryCostFraction: number;
       feeFraction: number;
       bumpedToMinimum: boolean;
@@ -77,14 +78,17 @@ export function planEntry(input: EntryPlanInput): EntryPlan {
   }
   const limitPrice = roundToTick(Math.max(ask, capPrice), tick, "down");
 
-  const mid = quote?.midpoint ?? (quote?.bestBid != null ? (quote.bestBid + ask) / 2 : ask);
-  const halfSpreadFraction = mid > 0 && ask > mid ? (ask - mid) / ask : 0;
+  // Extra cost of copying vs. the trader's own fill: Polymarket's taker fee at
+  // the price we pay plus whatever we pay above the trader's price. (The old
+  // half-spread term double-counted the adverse cap and rejected nearly every
+  // 20-50c entry once fees were added.)
+  const premiumFraction = ask > input.leaderPrice ? (ask - input.leaderPrice) / ask : 0;
   const feeFraction = takerFeeFraction(params, ask);
-  const entryCostFraction = halfSpreadFraction + feeFraction;
+  const entryCostFraction = premiumFraction + feeFraction;
   if (input.maxEntryCostPercent > 0 && entryCostFraction * 100 > input.maxEntryCostPercent + 1e-9) {
     return {
       ok: false,
-      reason: `Skipped BUY: entry cost ${(entryCostFraction * 100).toFixed(1)}% (spread ${(halfSpreadFraction * 100).toFixed(1)}% + fee ${(feeFraction * 100).toFixed(1)}%) is above the ${input.maxEntryCostPercent}% limit.`,
+      reason: `Skipped BUY: too costly to copy — fee ${(feeFraction * 100).toFixed(1)}% + ${(premiumFraction * 100).toFixed(1)}% above the trader's price is over the ${input.maxEntryCostPercent}% limit.`,
     };
   }
 

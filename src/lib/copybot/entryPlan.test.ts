@@ -27,11 +27,34 @@ describe("planEntry", () => {
     expect(plan.ok).toBe(false);
   });
 
-  it("uses the outcome book, not the leader price, for cost", () => {
-    // 5% fee rate at p=0.5 is 2.5% of price; wide 6c spread adds ~5.7%.
+  it("counts fee + premium over the trader, not the half-spread", () => {
+    // Wide 6c spread but we pay the trader's own price: only the 2.5% fee counts.
     const plan = planEntry({ ...base, quote: { bestBid: 0.44, bestAsk: 0.5, midpoint: 0.47 } });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) expect(plan.entryCostFraction).toBeCloseTo(0.025, 3);
+  });
+
+  it("passes a typical 30c entry on Safe (live case: ~2.7% fee + 1c premium)", () => {
+    const plan = planEntry({
+      ...base,
+      leaderPrice: 0.31,
+      quote: { bestBid: 0.31, bestAsk: 0.32, midpoint: 0.315 },
+      params: { ...params, feeRate: 0.04 },
+      maxEntryCostPercent: 6,
+    });
+    expect(plan.ok).toBe(true);
+  });
+
+  it("still rejects an entry that costs too much to copy", () => {
+    // 2c premium on a 22c ask is ~9%, plus a ~3.9% fee.
+    const plan = planEntry({
+      ...base,
+      leaderPrice: 0.2,
+      quote: { bestBid: 0.21, bestAsk: 0.22, midpoint: 0.215 },
+      maxEntryCostPercent: 6,
+    });
     expect(plan.ok).toBe(false);
-    if (!plan.ok) expect(plan.reason).toMatch(/entry cost/);
+    if (!plan.ok) expect(plan.reason).toMatch(/too costly/);
   });
 
   it("bumps a too-small order up to the 5-share minimum when caps allow", () => {
