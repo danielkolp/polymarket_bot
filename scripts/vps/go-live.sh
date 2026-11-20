@@ -36,7 +36,7 @@ if [ "$changed" = 1 ]; then
 fi
 
 hr "switch to Safe + real money"
-app_curl POST /api/settings '{"riskPreset":"safe","mode":"real","depositBaselineUsd":50}' | head -c 0
+app_curl POST /api/settings '{"riskPreset":"safe","mode":"real","depositBaselineUsd":50}' >/dev/null
 echo "settings applied"
 hr "start"
 out="$(app_curl POST /api/bot/start)"
