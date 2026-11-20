@@ -1,4 +1,4 @@
-status 2
+status 3
 # First word = task to run on the VPS via .github/workflows/vps-ops.yml.
 # Change this file (e.g. bump the number) and push to trigger the task.
 # Tasks: diagnose | status | logs | restart | cleanup | migrate | go-live | pause
