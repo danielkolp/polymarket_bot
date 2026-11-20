@@ -1,0 +1,80 @@
+name: VPS ops
+
+# Runs one maintenance task on the VPS over SSH and prints REDACTED output.
+# The repo is public, so every line is filtered through scripts/vps/redact.sh
+# and scripts never print env values, keys, balances or wallet addresses.
+#
+# Trigger:
+#   - manually (Actions tab -> VPS ops -> Run workflow), or
+#   - by pushing a change to ops/task whose first word is the task name.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: Task to run on the VPS
+        required: true
+        type: choice
+        options: [diagnose, status, logs, restart, cleanup, migrate, go-live, pause]
+  push:
+    branches: [main, claude/affectionate-keller-63b6b2]
+    paths: [ops/task]
+
+concurrency:
+  group: vps
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve task
+        id: t
+        env:
+          INPUT_TASK: ${{ inputs.task }}
+        run: |
+          T="${INPUT_TASK:-}"
+          if [ -z "$T" ]; then T="$(head -n1 ops/task | awk '{print $1}')"; fi
+          case "$T" in
+            diagnose|status|logs|restart|cleanup|migrate|go-live|pause) ;;
+            *) echo "Unknown task: $T"; exit 1 ;;
+          esac
+          echo "task=$T" >> "$GITHUB_OUTPUT"
+          echo "Running task: $T"
+
+      - name: Check secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          missing=""
+          [ -n "$VPS_HOST" ] || missing="$missing VPS_HOST"
+          [ -n "$VPS_USER" ] || missing="$missing VPS_USER"
+          [ -n "$VPS_PASSWORD" ] || missing="$missing VPS_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings -> Secrets and variables -> Actions)"
+            exit 1
+          fi
+
+      - name: Install sshpass
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Run on VPS
+        env:
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          TASK: ${{ steps.t.outputs.task }}
+        run: |
+          set -o pipefail
+          cat scripts/vps/lib.sh "scripts/vps/${TASK}.sh" \
+            | sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=25 \
+                -o ServerAliveInterval=15 -o LogLevel=ERROR "$VPS_USER@$VPS_HOST" 'bash -s' 2>&1 \
+            | bash scripts/vps/redact.sh "$VPS_HOST"
