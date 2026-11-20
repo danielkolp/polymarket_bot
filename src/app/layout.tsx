@@ -11,8 +11,15 @@ const spaceMono = Space_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Polymarket Copy Bot",
-  description: "Private local dashboard for discovering, simulating, and safely scaffolding Polymarket copy trading.",
+  title: "Bonk",
+  description: "Private Polymarket copy-trading bot dashboard.",
+  robots: { index: false, follow: false },
+};
+
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: "#141A16",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -8,7 +8,7 @@ export const DEFAULT_BOT_SETTINGS: BotSettings = {
   mode: "simulation",
   // Seed-only — only used if data/settings.json doesn't exist yet.
   // To change the bankroll: edit data/settings.json directly (key: "startingBalance"), then reset the sim.
-  startingBalance: 15,
+  startingBalance: 50,
   pollingIntervalSec: 30,
   topTradersToFollow: 25,
   sizingMode: "percentage",

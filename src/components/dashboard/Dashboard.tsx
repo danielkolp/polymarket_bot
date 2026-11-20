@@ -1080,7 +1080,7 @@ function BotStatusCard({ status }: { status: BotStatus }) {
 
 export function Dashboard() {
   const { data: status, error, isLoading, mutate } = useSWR<BotStatus>("/api/bot/status", jsonFetcher, {
-    refreshInterval: 2000,
+    refreshInterval: 5000,
     revalidateOnFocus: true,
   });
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1107,7 +1107,8 @@ export function Dashboard() {
 
   // Session-only mode: auto-liquidate when the dashboard window/tab is closed so
   // no unsettled simulated positions are left behind. sendBeacon survives unload.
-  const sessionOnly = status?.settings.sessionOnly;
+  // Never in real mode: closing or backgrounding a tab must not sell real positions.
+  const sessionOnly = status?.settings.sessionOnly && status?.settings.mode === "simulation";
   const lifecycleActive = status?.state.runState === "running" || status?.state.runState === "draining";
   useEffect(() => {
     if (!sessionOnly || !lifecycleActive) return;
@@ -1125,9 +1126,10 @@ export function Dashboard() {
     return () => window.removeEventListener("pagehide", onHide);
   }, [sessionOnly, lifecycleActive]);
 
-  // Stop always liquidates: sell every open position at current mark price, then stop.
+  // Stop just stops polling; positions are kept. Selling everything is a
+  // separate, confirmed action on the Home screen's danger zone.
   const handleStopClick = () => {
-    void runAction("stop", "/api/bot/stop", { liquidate: true, source: "session-close" });
+    void runAction("stop", "/api/bot/stop");
   };
 
   if (isLoading && !status) {
@@ -1155,7 +1157,7 @@ export function Dashboard() {
             {status.state.runState === "running" ? (
               <>
                 <span className="live-dot inline-block size-2 rounded-full bg-success" />
-                Live - polling
+                Running · {status.settings.mode === "real" ? "real money" : "paper"}
               </>
             ) : (
               <>
@@ -1187,10 +1189,10 @@ export function Dashboard() {
             </label>
             <Button size="sm" onClick={() => runAction("start", "/api/bot/start")} disabled={busy !== null || status.state.runState === "running" || status.state.runState === "draining"}><Play className="size-3" /> Start</Button>
             <Button size="sm" variant="outline" onClick={() => runAction("pause", "/api/bot/pause")} disabled={busy !== null || status.state.runState !== "running"}><Pause className="size-3" /> Pause</Button>
-            <Button size="sm" variant="outline" onClick={handleStopClick} disabled={busy !== null || status.state.runState === "stopped"}><Square className="size-3" /> Stop</Button>
+            <Button size="sm" variant="outline" onClick={handleStopClick} disabled={busy !== null || status.state.runState === "stopped"} title="Stop the bot. Open positions are kept."><Square className="size-3" /> Stop</Button>
             <Button size="sm" variant="outline" onClick={() => runAction("marks", "/api/bot/marks")} disabled={busy !== null || status.positions.length === 0} title="Pull live Polymarket prices for your open positions now."><Activity className="size-3" /> {busy === "marks" ? "Updating..." : "Update prices"}</Button>
             <Button size="sm" variant="ghost" onClick={() => mutate()}><RefreshCcw className="size-3" /> Refresh</Button>
-            <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setResetOpen(true)} disabled={busy !== null} title="Clear positions, trades, and P&L back to the starting balance."><RotateCcw className="size-3" /> Reset</Button>
+            <Button size="sm" variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setResetOpen(true)} disabled={busy !== null} title="Clear the local history and P&L. Does not sell anything."><RotateCcw className="size-3" /> Reset</Button>
             {status.metrics.panic ? (
               <Button
                 size="sm"
@@ -1282,25 +1284,20 @@ export function Dashboard() {
         </div>
       )}
 
-      {!status.bullpen.available && (
-        <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm text-muted-foreground">
-          Bullpen CLI was not detected with <span className="font-mono">bullpen --help</span>. Simulation mode remains fully functional.
-        </div>
-      )}
 
       {actionError && <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{actionError}</div>}
       {status.metrics.buyExposurePaused && (
-        <div className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning-foreground">
+        <div className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning">
           Exposure paused: BUY trades are being observed but not processed until total exposure falls below {status.settings.maxTotalExposurePercent}%.
         </div>
       )}
       {status.settings.mode === "real" && (status.metrics.liveBalanceStatus === "warning" || status.metrics.liveBalanceStatus === "error") && (
-        <div className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning-foreground">
+        <div className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning">
           Live balance {status.metrics.liveBalanceStatus}: {status.metrics.liveBalanceError ?? "live equity differs from local mirror equity by " + signedMoney(status.metrics.balanceDifference ?? 0)}. Local P&amp;L history was not changed.
         </div>
       )}
       {status.state.runState === "draining" && (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning-foreground">
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm text-warning">
           <span>
             Auto-exit mode: holding {status.positions.length} position{status.positions.length === 1 ? "" : "s"} and selling on
             {" "}

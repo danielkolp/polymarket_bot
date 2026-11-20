@@ -19,8 +19,8 @@
   :root {
     /* Dark mossy console. Solid surfaces, no gradients. Lime is the single
        accent; lavender is a quieter secondary. Text stays soft green-white.
-       Palette: bg #141A16 Â· surface #1D2520 Â· primary #C7D98B (lime) Â·
-       secondary #B7A3FF (lavender) Â· text #DCE4D5 Â· muted #7A8678. */
+       Palette: bg #141A16 / surface #1D2520 / primary #C7DA8B (lime) /
+       secondary #302B46 + #CFC2FF (lavender) / text #DBE3D3 / muted #8A9688. */
     --background: 140 13% 9%;
     --foreground: 92 22% 86%;
 
