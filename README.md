@@ -15,6 +15,7 @@ The bot restarts itself after crashes, deploys and reboots, and resumes if it wa
 
 ## Strategy in one page
 
+- **How fast:** checks the followed traders every 5 seconds (start to start).
 - **Who it copies:** Polymarket's 7-day and 30-day P&L leaderboards (Data API v2), filtered to traders who are profitable on both windows, earn ≥2% on volume (skips market makers), trade at a human pace (≤150 trades/day, skips bots), use normal trade sizes ($20–$5,000, skips whales), and mostly trade prices the bot can copy. About 12 are followed; the roster refreshes every 30 minutes with hysteresis. Wallets whose copies lose money are benched.
 - **When it buys:** a followed trader's new BUY (including their limit-order fills), within 2 minutes, only if:
   - the price hasn't run more than 2¢ past the trader's;

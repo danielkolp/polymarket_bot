@@ -59,7 +59,9 @@ const SMALL_ACCOUNT_BASE: Partial<BotSettings> = {
   autoExitTakeProfitPercent: 30,
   autoExitStopLossPercent: 25,
   autoExitMaxHoldMinutes: 10 * 24 * 60,
-  pollingIntervalSec: 15,
+  // Fast detection = entries closer to the trader's price. 12 wallets every 5s
+  // is ~24 req/10s against Polymarket's 300 req/10s limit for /v2/trades.
+  pollingIntervalSec: 5,
   traderRefreshIntervalMin: 30,
   topTradersToFollow: 12,
   minTraderWeeklyVolumeUsd: 1000,

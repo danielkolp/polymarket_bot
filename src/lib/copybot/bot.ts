@@ -683,6 +683,8 @@ async function liveExitPricing(
 /** A poll running longer than this is considered hung and is abandoned. */
 const MIN_STUCK_TICK_MS = 120_000;
 const WATCHDOG_INTERVAL_MS = 30_000;
+/** Minimum pause between the end of one poll and the start of the next. */
+const MIN_POLL_GAP_MS = 1_000;
 const RESUME_RETRY_MS = 60_000;
 
 /** Fields only the operator controls; a running poll must never overwrite them. */
@@ -1609,10 +1611,15 @@ export class CopyBotEngine {
     }, Math.max(0, delayMs));
   }
 
-  /** Schedule the next poll if the operator still wants the loop running. */
+  /**
+   * Schedule the next poll if the operator still wants the loop running. The
+   * interval is measured start-to-start (a 3s poll on a 5s cadence waits 2s),
+   * with a short floor so a slow poll never causes back-to-back hammering.
+   */
   private scheduleNext(): void {
     if (this.desired === "running" || this.desired === "draining") {
-      this.schedule(this.pollIntervalMs);
+      const elapsed = Date.now() - this.tickStartedAt;
+      this.schedule(Math.max(MIN_POLL_GAP_MS, this.pollIntervalMs - elapsed));
     }
   }
 
