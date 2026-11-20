@@ -16,12 +16,12 @@ The bot restarts itself after crashes, deploys and reboots, and resumes if it wa
 ## Strategy in one page
 
 - **How fast:** checks the followed traders every 5 seconds (start to start).
-- **Who it copies:** Polymarket's 7-day and 30-day P&L leaderboards (Data API v2), filtered to traders who are profitable on both windows, earn ≥2% on volume (skips market makers), trade at a human pace (≤150 trades/day, skips bots), use normal trade sizes ($20–$5,000, skips whales), and mostly trade prices the bot can copy. About 12 are followed; the roster refreshes every 30 minutes with hysteresis. Wallets whose copies lose money are benched.
+- **Who it copies:** Polymarket's 7-day and 30-day P&L leaderboards (Data API v2), filtered to traders who are profitable on both windows, earn ≥2% on volume (skips market makers), trade at a human pace (≤150 trades/day, skips bots), use normal trade sizes ($20–$5,000, skips whales), and mostly trade prices the bot can copy. About 16 are followed; the roster refreshes every 30 minutes with hysteresis. Wallets whose copies lose money are benched.
 - **When it buys:** a followed trader's new BUY (including their limit-order fills), within 2 minutes, only if:
   - the price hasn't run more than 2¢ past the trader's;
   - entry cost (half the spread plus Polymarket's taker fee) is ≤4%;
   - the market resolves in 1 hour to 14 days;
-  - the price is 20–80¢;
+  - the price is 20–90¢;
   - liquidity is enough.
 - **How much:** Safe = ~6% of account value per trade (max $4), always at least the market's minimum of 5 shares so it can be sold. Up to 60% invested, 10% per market, 8 positions, 25% cash kept.
 - **Orders:** price-capped fill-and-kill orders on Polymarket CLOB V2. A buy never pays more than the cap, and fills are read back from the exchange.
@@ -274,8 +274,3 @@ The legacy `bullpen --help` probe still runs and is shown in the dashboard for r
 - The bot loop is a singleton in the Next.js server process so dashboard refreshes do not create duplicate loops. Because the singleton is held on `globalThis` to survive HMR, **changes to the engine require a full `npm run dev` restart** (not just a hot reload) to take effect.
 - Open-position marks come from Gamma `outcomePrices`. Markets that have already resolved/closed drop out of the lookup, so those positions keep their last mark until you liquidate them.
 - Public Polymarket APIs can change; skipped/failed trades are logged and the loop continues.
-
-
-#   p o l y m a r k e t _ b o t 
- 
- 

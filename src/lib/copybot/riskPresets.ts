@@ -90,9 +90,12 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     perMarketExposurePercent: 10,
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.2,
-    maxBuyTokenPrice: 0.8,
+    // Up to 90c: favorites carry the lowest taker fees (~r*(1-p)) and are a
+    // large share of the followed traders' buys.
+    maxBuyTokenPrice: 0.9,
     extraSettings: {
       ...SMALL_ACCOUNT_BASE,
+      topTradersToFollow: 16,
       percentageCopySize: 6,
       maxTradeAmountUsd: 4,
       maxOpenPositions: 8,
@@ -109,7 +112,7 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     perMarketExposurePercent: 12,
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.15,
-    maxBuyTokenPrice: 0.85,
+    maxBuyTokenPrice: 0.9,
     extraSettings: {
       ...SMALL_ACCOUNT_BASE,
       percentageCopySize: 8,
@@ -117,7 +120,7 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
       maxOpenPositions: 10,
       maxDailyLossPercent: 12,
       maxHoursToResolution: 21 * 24,
-      topTradersToFollow: 15,
+      topTradersToFollow: 18,
       maxEntryCostPercent: 7,
     },
   },
@@ -130,7 +133,7 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     perMarketExposurePercent: 15,
     minTimeToResolutionMinutes: 30,
     minBuyTokenPrice: 0.1,
-    maxBuyTokenPrice: 0.9,
+    maxBuyTokenPrice: 0.93,
     extraSettings: {
       ...SMALL_ACCOUNT_BASE,
       percentageCopySize: 10,
@@ -138,7 +141,7 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
       maxOpenPositions: 12,
       maxDailyLossPercent: 15,
       maxHoursToResolution: 30 * 24,
-      topTradersToFollow: 18,
+      topTradersToFollow: 20,
       maxEntryCostPercent: 8,
       maxMarketSpread: 0.04,
       maxCopiesPerWalletPerCycle: 2,

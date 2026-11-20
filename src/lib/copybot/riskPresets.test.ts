@@ -78,6 +78,9 @@ describe("applyRiskPreset", () => {
     expect(settings.maxTotalExposurePercent).toBe(60);
     expect(settings.maxExposurePerMarketPercent).toBe(10);
     expect(settings.maxOpenPositions).toBe(8);
+    expect(settings.maxBuyTokenPrice).toBeCloseTo(0.9, 10);
+    expect(settings.minBuyTokenPrice).toBeCloseTo(0.2, 10);
+    expect(settings.topTradersToFollow).toBe(16);
     expect(settings.cashReservePercent).toBe(25);
     expect(settings.maxDailyLossPercent).toBe(8);
     expect(settings.autoExitTakeProfitPercent).toBe(30);
@@ -95,5 +98,9 @@ describe("applyRiskPreset", () => {
     expect(growth.maxTradeAmountUsd).toBeGreaterThan(steady.maxTradeAmountUsd);
     expect(steady.maxTotalExposurePercent).toBeGreaterThan(safe.maxTotalExposurePercent);
     expect(growth.maxTotalExposurePercent).toBeGreaterThan(steady.maxTotalExposurePercent);
+    expect(steady.maxBuyTokenPrice).toBeGreaterThanOrEqual(safe.maxBuyTokenPrice);
+    expect(growth.maxBuyTokenPrice).toBeGreaterThanOrEqual(steady.maxBuyTokenPrice);
+    expect(steady.topTradersToFollow).toBeGreaterThan(safe.topTradersToFollow);
+    expect(growth.topTradersToFollow).toBeGreaterThan(steady.topTradersToFollow);
   });
 });
