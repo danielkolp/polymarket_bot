@@ -22,14 +22,89 @@ Simulation mode is the default. No private keys are used by the frontend and no 
 - Lets you **Reset** the simulation back to a clean starting balance at any time.
 - **Live Mode Portfolio Recovery**: before any future live session, reads the connected account's existing Polymarket positions, analyzes each (cost basis, live bid/ask/mid, liquidity, spread, time to resolution, price-history trend), classifies them, and recommends an action — without ever placing an order.
 
+## November 2026 overhaul — what changed and why
+
+**The bot was effectively dead.** Polymarket retired Data API v1 and `lb-api` (both now return HTTP 410). Every trader-trade, position, and leaderboard request failed, but failures were swallowed, so the bot "ran" while seeing zero trades, and discovery dropped every auto-followed wallet. All fetchers now use **Data API v2** (`src/lib/polymarket/dataApi.ts`), and a 410 now produces a clear "endpoint retired" error.
+
+**Why it stopped "randomly"** — each of these is fixed:
+
+- **Restarts left it stopped.** Any crash, deploy, reboot or dev reload marked the bot stopped until someone clicked Start. It now **auto-resumes on server boot** (`src/instrumentation.ts`). Panic stops are never auto-resumed, and a same-day resume never clears a daily-loss lockout.
+- **Resolved markets never settled.** Gamma hides closed markets unless `closed=true` is passed, so resolved positions kept stale marks, filled the exposure cap, and paused all BUYs. The lookup now falls back to closed markets (with a short cache).
+- **The trade ledger silently dropped P&L.** Truncating to 1,000 rows (mostly skipped trades) erased realized P&L from old fills. That shifted equity and could trip the daily-loss lockout. Compaction now preserves realized P&L exactly (`ledgerCompaction.ts`).
+- **A Stop/Pause pressed mid-poll could be undone.** Polls wrote back a stale run state. Control fields now always come from the latest saved state.
+- **Hung requests or a lost timer froze the loop.** A **watchdog** now releases polls stuck longer than `BOT_TICK_WATCHDOG_MS` and restarts a loop with no scheduled poll. Errors back off exponentially instead of hammering, rate limits (429) honour `Retry-After`, and stray promise rejections are logged instead of crashing the process.
+- **Failures were invisible.** An all-wallets-failed poll is now an error, not "no trades". `GET /api/bot/heartbeat` returns 503 when the bot is unhealthy, and optional **Discord/Slack/Telegram alerts** cover failures, auto-resumes, lockouts, panic, and a daily P&L summary.
+
+**Strategy fixes:**
+
+- **Discovery v3** (`discovery.ts`). Blindly copying the top of the leaderboard loses money (see below). Discovery now samples the 7d and 30d profit boards and rejects:
+  - market makers (rebates and rewards above 30% of realized P&L),
+  - HFT bots (100 trades in under 12h, or more than 150 markets/day),
+  - lifetime losers, and "great months" that are mostly unrealized marks,
+  - wallets trading mostly 5–15 min crypto markets,
+  - wallets whose BUYs mostly fall outside the bot's price band.
+
+  Survivors are ranked by same-window P&L/volume, multi-window consistency, copyability, lifetime realized P&L, and **the bot's own net-of-cost copy results**. The roster is kept stable instead of rotating wallets out every refresh.
+- **Proportional sells now mirror the leader.** Before, "proportional" sold `trade-size USD / price` shares, unrelated to what the leader did. Now it sells the same *fraction* of the position the leader sold. Leftovers under $1 are sold in full.
+- **Only the wallets that opened a position can trigger its copied SELL.**
+- **Opposite-side guard.** A BUY on the other outcome of a market we already hold is skipped, because holding both sides pays the spread twice.
+- **Exchange $1 minimum respects caps.** Live mode used to bump sub-$1 BUYs to $1 *after* the cap checks, so small accounts over-sized every trade. The bump now happens before the caps, in both modes.
+- **Exit rules run in simulation too.** TP/SL/max-hold, plus the new **trailing stop**, run every poll in both modes, and simulated exits fill against the real order book. Paper results now reflect what live would do.
+- **Leader-exit checks query only the markets we hold**, so a whale's paginated long tail can't look like an exit.
+- **Losing wallets are cut faster.** A wallet down 15%+ after 12 copied BUYs is auto-disabled (the 40-fill rule still applies too).
+- **Long-dated markets skipped.** BUYs in markets resolving more than `maxTimeToResolutionDays` (default 30) out are skipped, so a small bankroll isn't locked up for months.
+
+### Why "just copy the top traders" doesn't work
+
+Checked against live data (Nov 2026), the weekly top 3 by P&L were:
+
+1. A 3-month-old wallet whose big week was mostly open marks (only $16k realized all-time).
+2. An automated bot that has traded 126k markets.
+3. A professional market maker earning about $2.6M in rebates and rewards.
+
+None of those edges survive being copied 30+ seconds later with taker orders:
+
+- **Leaderboards reward variance.** Short-window P&L barely predicts the next window.
+- **Market makers profit from the spread; copiers pay it.**
+- **You always enter late and at a worse price**, and the most informed trades move fastest.
+- **You only see one leg** of hedged or arbitrage positions.
+- **Popular wallets are crowded** by other copy bots.
+
+The bot now filters for these. Still, **no copy strategy is guaranteed to make money**. Run it in simulation for a couple of weeks and judge it by *net* P&L (after the cost drag shown on the dashboard) before going live.
+
+## Recommended setup for a $50 account
+
+The defaults are tuned for a ~$50 bankroll:
+
+- **Sizing.** `hybrid` sizing at 2.5% of cash, floored at Polymarket's $1 minimum and capped at $2.50. That is about $1.25 per copy.
+- **Limits.** Daily loss cap of 10% ($5). Real mode additionally clamps to 30% total exposure ($15), 4% per market ($2), and 10% per wallet, and keeps 25% of the bankroll in reserve.
+
+Suggested `.env.local` for live: `LIVE_MAX_ORDER_USD=2`.
+
+> Defaults only seed a fresh install. If you already have `data/settings.json`, apply these in **Settings**: sizing mode Hybrid, 2.5%, min $1, max $2.50, max trader inactivity 24h, max time to resolution 30 days.
+
+Exit rules default to off: positions follow the leader's exits and resolution. To lock in gains, try a 25% trailing stop in simulation first.
+
+## Keeping it running 24/7
+
+The bot loop lives inside the Next.js server process, so keep that process alive:
+
+```bash
+npm run build
+npx pm2 start ecosystem.config.cjs   # auto-restarts on crash; bot auto-resumes on boot
+npx pm2 save && npx pm2 startup      # survive machine reboots
+```
+
+Point an uptime monitor at `GET /api/bot/heartbeat` (200 = healthy, 503 = stopped, panicked, or polls failing). Set `ALERT_WEBHOOK_URL` (Discord/Slack) or `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` for push alerts.
+
 ## Position sizing
 
 Default sizing is percentage based:
 
-- `sizingMode`: `percentage`
-- `percentageCopySize`: `2`
-- `$10` available balance -> `$0.20` calculated next buy
-- `$100` available balance -> `$2.00` calculated next buy
+- `sizingMode`: `hybrid`
+- `percentageCopySize`: `2.5`, clamped to `minTradeAmountUsd` `$1` .. `maxTradeAmountUsd` `$2.50`
+- `$50` available balance -> `$1.25` calculated next buy
+- `$20` available balance -> `$1.00` (floored at the minimum)
 
 Supported modes:
 
@@ -37,7 +112,7 @@ Supported modes:
 - `percentage`: use `percentageCopySize` percent of current available balance.
 - `hybrid`: percentage sizing with `minTradeAmountUsd` and `maxTradeAmountUsd` caps.
 
-Simulation does not force oversized trades. If the calculated buy amount is below `minTradeAmountUsd`, the trade is skipped and logged.
+Polymarket rejects market BUYs under $1. A smaller request is raised to $1 only if the $1 order still passes every exposure, balance, and wallet cap. Otherwise it is skipped. The same rule applies in simulation and live.
 
 Simulation mode uses local/fake accounting: available balance is derived from `startingBalance`, copied trade records, realized P&L, and open simulated positions. Real mode does not use that simulated cash for order sizing. Before each live decision, the server reads the connected Polymarket CLOB collateral balance and sizes BUYs from actual USDC.
 
@@ -132,6 +207,7 @@ data/bot-state.json
 
 ```text
 GET  /api/bot/status
+GET  /api/bot/heartbeat   # 200 healthy / 503 not running or polls failing (for uptime monitors)
 POST /api/bot/start
 POST /api/bot/stop      # body { liquidate?: boolean } — liquidate flattens all open positions, then stops
 POST /api/bot/drain     # body { autoExitTakeProfitPercent?, autoExitStopLossPercent?, autoExitMaxHoldMinutes? }
@@ -173,8 +249,7 @@ After you click **Start**, the bot loop runs in the Next.js server process, not 
 | `NEXT_PUBLIC_APP_NAME` | `Polymarket Copy Bot` | UI/app display name |
 | `POLYMARKET_GAMMA_URL` | `https://gamma-api.polymarket.com` | Market metadata |
 | `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | CLOB/read-only tooling compatibility |
-| `POLYMARKET_LB_URL` | `https://lb-api.polymarket.com` | Leaderboard discovery |
-| `POLYMARKET_DATA_URL` | `https://data-api.polymarket.com` | Per-wallet trade history |
+| `POLYMARKET_DATA_URL` | `https://data-api.polymarket.com` | Data API v2 base (trades, positions, leaderboard, user stats) |
 | `POLY_REQUEST_TIMEOUT_MS` | `8000` | Upstream timeout |
 | `ENABLE_REAL_TRADING` | `false` | Master real-money guard |
 | `POLYMARKET_PRIVATE_KEY` | _(empty)_ | Trading wallet signing key (server-only); required for live orders |
@@ -183,6 +258,11 @@ After you click **Start**, the bot loop runs in the Next.js server process, not 
 | `POLYMARKET_CHAIN_ID` | `137` | Polygon mainnet 137, Amoy testnet 80002 |
 | `LIVE_MAX_ORDER_USD` | `5` | Hard per-order USD cap applied to every live BUY |
 | `LIVE_BALANCE_WARNING_THRESHOLD_USD` | `5` | Warn when local tracked equity and live USDC differ by more than this amount |
+| `BOT_AUTO_RESUME` | `true` | Resume a bot that was running when the server stopped (never after panic) |
+| `BOT_TICK_WATCHDOG_MS` | `300000` | Release a poll stuck longer than this and start a fresh one |
+| `BOT_MAX_ERROR_BACKOFF_MS` | `300000` | Ceiling for exponential backoff after consecutive poll errors |
+| `ALERT_WEBHOOK_URL` | _(empty)_ | Discord/Slack incoming webhook for alerts |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | _(empty)_ | Telegram alerts |
 
 ## Real trading (Polymarket CLOB)
 
@@ -214,10 +294,6 @@ The legacy `bullpen --help` probe still runs and is shown in the dashboard for r
 
 - This is for private local use.
 - Keep private keys out of the frontend and out of localStorage.
-- The bot loop is a singleton in the Next.js server process so dashboard refreshes do not create duplicate loops. Because the singleton is held on `globalThis` to survive HMR, **changes to the engine require a full `npm run dev` restart** (not just a hot reload) to take effect.
-- Open-position marks come from Gamma `outcomePrices`. Markets that have already resolved/closed drop out of the lookup, so those positions keep their last mark until you liquidate them.
+- The bot loop is a singleton in the Next.js server process so dashboard refreshes do not create duplicate loops. Because the singleton is held on `globalThis` to survive HMR, **changes to the engine require a full `npm run dev` restart** (not just a hot reload) to take effect. A bot that was running resumes automatically after that restart.
+- Open-position marks come from Gamma `outcomePrices`. Resolved markets are looked up with `closed=true`, so simulated positions settle at $1/$0 automatically.
 - Public Polymarket APIs can change; skipped/failed trades are logged and the loop continues.
-
-
-#   p o l y m a r k e t _ b o t  
- 

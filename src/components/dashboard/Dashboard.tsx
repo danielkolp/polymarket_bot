@@ -498,12 +498,14 @@ function SettingsPanel({ status, onSave }: { status: BotStatus; onSave: (setting
           <NumberField label="Max BUY price (c)" value={draft.maxBuyTokenPrice * 100} step={0.5} min={0} max={100} onChange={(value) => updateRiskCap("maxBuyTokenPrice", value / 100)} />
           <NumberField label="Max market spread (c)" value={draft.maxMarketSpread * 100} step={0.5} min={0} max={100} onChange={(value) => update("maxMarketSpread", value / 100)} />
           <NumberField label="Min time to resolution (min)" value={draft.minTimeToResolutionMinutes} step={15} min={0} onChange={(value) => updateRiskCap("minTimeToResolutionMinutes", value)} />
+          <NumberField label="Max time to resolution (days, 0=off)" value={draft.maxTimeToResolutionDays ?? 0} step={5} min={0} onChange={(value) => update("maxTimeToResolutionDays", value)} />
           <NumberField label="Max trade age (sec)" value={draft.maxTradeAgeSec} step={30} min={5} onChange={(value) => update("maxTradeAgeSec", value)} />
           <NumberField label="Max adverse entry move (c)" value={draft.maxAdverseEntryMoveCents} step={0.5} min={0} onChange={(value) => update("maxAdverseEntryMoveCents", value)} />
           <NumberField label="Live BUY freshness (sec)" value={draft.liveMaxCopyTradeAgeSec} step={15} min={5} onChange={(value) => update("liveMaxCopyTradeAgeSec", value)} />
           <NumberField label="Auto-exit take-profit (%)" value={draft.autoExitTakeProfitPercent} step={1} onChange={(value) => update("autoExitTakeProfitPercent", value)} />
           <NumberField label="Auto-exit stop-loss (%)" value={draft.autoExitStopLossPercent} step={1} onChange={(value) => update("autoExitStopLossPercent", value)} />
           <NumberField label="Auto-exit max hold (min)" value={draft.autoExitMaxHoldMinutes} step={5} onChange={(value) => update("autoExitMaxHoldMinutes", value)} />
+          <NumberField label="Trailing stop from peak (%)" value={draft.autoExitTrailingStopPercent ?? 0} step={1} min={0} max={100} onChange={(value) => update("autoExitTrailingStopPercent", value)} />
           <NumberField label="Taker fee (bps)" value={draft.takerFeeBps} step={1} onChange={(value) => update("takerFeeBps", value)} />
           <NumberField label="Max slippage (bps)" value={draft.maxSlippageBps} step={25} min={1} onChange={(value) => update("maxSlippageBps", value)} />
           <NumberField label="Fallback spread (bps)" value={draft.fallbackSpreadBps} step={25} onChange={(value) => update("fallbackSpreadBps", value)} />
@@ -528,6 +530,13 @@ function SettingsPanel({ status, onSave }: { status: BotStatus; onSave: (setting
             <span className="block text-xs text-muted-foreground">When a copied position&rsquo;s source leader no longer holds it, sell it (sim: at mark; real: only bot-opened positions, gated by live-data health). Manual/unknown positions are never touched.</span>
           </span>
           <Switch checked={draft.exitWhenLeaderNoLongerHolds} onCheckedChange={(value) => update("exitWhenLeaderNoLongerHolds", value)} aria-label="Exit when leader exits" />
+        </label>
+        <label className="flex items-center justify-between rounded-md border border-border p-3">
+          <span className="space-y-0.5">
+            <span className="block text-sm font-medium text-foreground">Skip opposite-side BUYs</span>
+            <span className="block text-xs text-muted-foreground">Don&rsquo;t copy a BUY on the other outcome of a market the bot already holds (two followed wallets disagreeing). Holding both sides just pays the spread twice.</span>
+          </span>
+          <Switch checked={draft.skipOppositeOutcomeBuys ?? true} onCheckedChange={(value) => update("skipOppositeOutcomeBuys", value)} aria-label="Skip opposite-side BUYs" />
         </label>
         <div className="flex justify-end">
           <Button onClick={save} disabled={saving}>{saving ? "Saving..." : "Save settings"}</Button>
@@ -1304,7 +1313,7 @@ export function Dashboard() {
           <span>
             Auto-exit mode: holding {status.positions.length} position{status.positions.length === 1 ? "" : "s"} and selling on
             {" "}
-            TP {status.settings.autoExitTakeProfitPercent || "off"}% / SL {status.settings.autoExitStopLossPercent || "off"}% / max-hold {status.settings.autoExitMaxHoldMinutes || "off"}m. No new entries.
+            TP {status.settings.autoExitTakeProfitPercent || "off"}% / SL {status.settings.autoExitStopLossPercent || "off"}% / trail {status.settings.autoExitTrailingStopPercent || "off"}% / max-hold {status.settings.autoExitMaxHoldMinutes || "off"}m. No new entries.
           </span>
           <Button size="sm" variant="outline" onClick={() => runAction("flatten", "/api/bot/stop", { liquidate: true, source: "auto-exit" })} disabled={busy !== null}>
             Sell all now

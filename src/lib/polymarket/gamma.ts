@@ -78,11 +78,57 @@ export async function fetchMarkets(query: MarketQuery = {}): Promise<Market[]> {
   return normalizeMarkets(Array.isArray(raws) ? raws : []);
 }
 
-export async function fetchMarketById(conditionId: string): Promise<Market | null> {
-  // Gamma supports lookup by clob token / condition via the list endpoint filter.
-  const raws = await gammaRequest<RawGammaMarket[]>("/markets", {
-    query: { clob_token_ids: conditionId, limit: 1 },
+const MARKET_CACHE_TTL_MS = 10_000;
+const MARKET_CACHE_MAX = 2000;
+const marketCache = new Map<string, { at: number; market: Market | null }>();
+const marketInFlight = new Map<string, Promise<Market | null>>();
+
+async function lookupMarketByToken(tokenId: string): Promise<Market | null> {
+  // Gamma's list endpoint hides closed markets by default, so a resolved market
+  // returns []. Fall back to closed=true — otherwise resolved positions never
+  // settle and keep their last (stale) mark forever.
+  const open = await gammaRequest<RawGammaMarket[]>("/markets", {
+    query: { clob_token_ids: tokenId, limit: 1 },
   });
-  const markets = normalizeMarkets(Array.isArray(raws) ? raws : []);
-  return markets[0] ?? null;
+  const openMarkets = normalizeMarkets(Array.isArray(open) ? open : []);
+  if (openMarkets[0]) return openMarkets[0];
+  const closed = await gammaRequest<RawGammaMarket[]>("/markets", {
+    query: { clob_token_ids: tokenId, closed: true, limit: 1 },
+  });
+  return normalizeMarkets(Array.isArray(closed) ? closed : [])[0] ?? null;
+}
+
+/**
+ * Look up the market containing a CLOB token id (open OR resolved). Results are
+ * cached briefly and concurrent lookups for the same token share one request,
+ * which keeps per-poll mark/settlement refreshes well under Gamma's rate limits.
+ * Pass `maxAgeMs: 0` when a decision needs the freshest quote (e.g. entry gates).
+ */
+export async function fetchMarketById(tokenId: string, opts: { maxAgeMs?: number } = {}): Promise<Market | null> {
+  const maxAgeMs = opts.maxAgeMs ?? MARKET_CACHE_TTL_MS;
+  const cached = marketCache.get(tokenId);
+  if (cached && Date.now() - cached.at <= maxAgeMs) return cached.market;
+
+  const pending = marketInFlight.get(tokenId);
+  if (pending) return pending;
+
+  const request = lookupMarketByToken(tokenId)
+    .then((market) => {
+      if (marketCache.size >= MARKET_CACHE_MAX) {
+        const oldest = marketCache.keys().next().value;
+        if (oldest !== undefined) marketCache.delete(oldest);
+      }
+      marketCache.set(tokenId, { at: Date.now(), market });
+      return market;
+    })
+    .finally(() => {
+      marketInFlight.delete(tokenId);
+    });
+  marketInFlight.set(tokenId, request);
+  return request;
+}
+
+/** Test hook: drop cached market lookups. */
+export function clearMarketCache(): void {
+  marketCache.clear();
 }

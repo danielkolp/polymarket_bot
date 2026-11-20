@@ -55,6 +55,27 @@ async function doFetch<T>(url: string, options: RequestOptions): Promise<T> {
       });
       clearTimeout(timer);
 
+      // Rate limited (or a retryable 503): honour Retry-After, capped so a single
+      // call can never stall the bot loop for long.
+      if (res.status === 429 || res.status === 503) {
+        lastError = new PolymarketError(`Upstream ${res.status} (rate limited) for ${url}`, res.status);
+        if (attempt < retries) {
+          const retryAfterSec = Number(res.headers.get("retry-after"));
+          const waitMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : 500 * (attempt + 1);
+          await sleep(Math.min(5000, waitMs));
+          continue;
+        }
+        throw lastError;
+      }
+      // 410 Gone = Polymarket retired this endpoint. Say so plainly instead of a
+      // generic upstream error so the operator knows a code update is needed.
+      if (res.status === 410) {
+        const text = await res.text().catch(() => "");
+        throw new PolymarketError(
+          `Polymarket retired this API endpoint (HTTP 410) — the bot needs a code update: ${url}${text ? ` ${text.slice(0, 200)}` : ""}`,
+          410,
+        );
+      }
       if (res.status >= 500) {
         lastError = new PolymarketError(`Upstream ${res.status} for ${url}`, 502);
         if (attempt < retries) {
@@ -76,7 +97,7 @@ async function doFetch<T>(url: string, options: RequestOptions): Promise<T> {
       clearTimeout(timer);
       lastError = err;
       const isAbort = err instanceof Error && err.name === "AbortError";
-      const isPolyClientErr = err instanceof PolymarketError && err.status < 500;
+      const isPolyClientErr = err instanceof PolymarketError && err.status < 500 && err.status !== 429;
       // Don't retry clean 4xx errors; do retry timeouts/network/5xx.
       if (isPolyClientErr) throw err;
       if (attempt < retries) {
@@ -106,9 +127,6 @@ export const gammaRequest = <T>(path: string, options: RequestOptions = {}): Pro
 
 export const clobRequest = <T>(path: string, options: RequestOptions = {}): Promise<T> =>
   doFetch<T>(buildUrl(config.clobUrl, path, options.query), options);
-
-export const lbRequest = <T>(path: string, options: RequestOptions = {}): Promise<T> =>
-  doFetch<T>(buildUrl(config.lbApiUrl, path, options.query), options);
 
 export const dataRequest = <T>(path: string, options: RequestOptions = {}): Promise<T> =>
   doFetch<T>(buildUrl(config.dataApiUrl, path, options.query), options);

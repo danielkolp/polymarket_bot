@@ -22,6 +22,7 @@ export type RiskPresetId = "conservative" | "balanced" | "aggressive-simulation"
 export type DiscoverySource =
   | "profit-1d"
   | "profit-7d"
+  | "profit-30d"
   | "volume"
   | "high-frequency"
   | "manual"
@@ -94,7 +95,7 @@ export interface BotSettings {
 
   /**
    * Per-copied-wallet risk controls. These stop any single followed wallet from
-   * dominating the session â€” independent of the global exposure caps.
+   * dominating the session - independent of the global exposure caps.
    */
   /** Max BUYs copied from one wallet within a single poll cycle. 0 = unlimited. */
   maxCopiesPerWalletPerCycle: number;
@@ -113,10 +114,26 @@ export interface BotSettings {
   autoExitTakeProfitPercent: number;
   autoExitStopLossPercent: number;
   autoExitMaxHoldMinutes: number;
+  /**
+   * Trailing stop (% giveback from the peak mark) that only arms once a position
+   * has traded above its entry. Locks in gains; 0 disables.
+   */
+  autoExitTrailingStopPercent: number;
+  /**
+   * Skip BUYs in markets that resolve more than this many days out. Long-dated
+   * markets tie up a small bankroll for months; 0 disables.
+   */
+  maxTimeToResolutionDays: number;
+  /**
+   * Skip a BUY when the bot already holds the OTHER outcome of the same market
+   * (two followed wallets on opposite sides). Copying both just pays the spread
+   * twice for a guaranteed-flat position.
+   */
+  skipOppositeOutcomeBuys: boolean;
 
   /**
    * Realistic execution-cost model. When true (default), copies fill against the
-   * live order book with spread, slippage, partial fills, and fees â€” so the
+   * live order book with spread, slippage, partial fills, and fees - so the
    * equity curve reflects net-of-cost P&L rather than idealized fills.
    */
   realisticFills: boolean;
@@ -129,7 +146,7 @@ export interface BotSettings {
 }
 
 /**
- * Score derived from the bot's OWN copied results for a wallet â€” not public
+ * Score derived from the bot's OWN copied results for a wallet - not public
  * leaderboard PnL. This is what should decide which wallets survive into live
  * mode. All component metrics are computed from the local copy-trade ledger and
  * current positions, so they reflect realistic (post-fill) outcomes.
@@ -225,6 +242,10 @@ export interface BotPosition {
   leaderHolds?: LeaderHoldStatus;
   /** When leaderHolds was last evaluated (ms epoch). */
   leaderCheckedAt?: number;
+  /** Highest mark seen since entry (for the trailing stop). */
+  peakMarkPrice?: number;
+  /** Parent event slug, when known (groups related markets). */
+  eventSlug?: string;
 }
 
 export interface CopyTradeRecord {
@@ -270,7 +291,7 @@ export interface CopyTradeRecord {
   /** botExecPrice − leaderPrice, in cents (positive = bot paying up vs leader). */
   adverseMoveCents?: number;
 
-  // â”€â”€ Authoritative live-fill reconciliation (real mode only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Authoritative live-fill reconciliation (real mode only) -
   /** When this record was last reconciled against CLOB trade history (ms epoch). */
   reconciledAt?: number;
   /** Result of matching this live order to authoritative CLOB fills. */
@@ -283,6 +304,8 @@ export interface CopyTradeRecord {
   actualNotionalUsd?: number;
   /** On-chain settlement transaction hashes for the matched fills. */
   txHashes?: string[];
+  /** Ledger compaction: number of older filled trades folded into this carry record. */
+  foldedTradeCount?: number;
 }
 
 export interface BotLogEntry {
@@ -342,7 +365,7 @@ export interface BotMetrics {
   /** Count of live orders not yet reconciled against authoritative CLOB fills. */
   unreconciledLiveOrders: number;
 
-  // â”€â”€ Authoritative-vs-mirror accounting (real mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Authoritative-vs-mirror accounting (real mode) -
   /** Cash computed purely from local mirror estimates (copyAmountUsd). */
   cashUsdLocalMirror: number;
   /** Cash used by dashboard accounting after applying authoritative fills and open cost basis. */
@@ -355,7 +378,7 @@ export interface BotMetrics {
    * Confidence in the money ledger:
    *  - "high": no unsafe real orders (or simulation).
    *  - "degraded": some real orders are pending reconciliation.
-   *  - "blocked": some real orders are unmatched/errored â€” new BUYs are blocked.
+   *  - "blocked": some real orders are unmatched/errored - new BUYs are blocked.
    */
   accountingConfidence: "high" | "degraded" | "blocked";
 }
@@ -384,7 +407,7 @@ export interface BotState {
   /**
    * Latched daily-loss lockout. Set true once the daily-loss cap is breached;
    * cleared only at the local day boundary (or on reset). While true, no new BUY
-   * is opened in any mode â€” sells/flattening stay allowed.
+   * is opened in any mode - sells/flattening stay allowed.
    */
   dailyLossLockout: boolean;
   /**
@@ -395,6 +418,13 @@ export interface BotState {
   panic: boolean;
   panicAt: number | null;
   panicReason: string | null;
+
+  /** Consecutive failed polls (drives backoff + alerts); 0 when healthy. */
+  consecutiveErrors?: number;
+  /** Last poll that completed without error (ms epoch). */
+  lastSuccessfulPollAt?: number | null;
+  /** Last time the bot resumed itself after a server restart (ms epoch). */
+  lastAutoResumeAt?: number | null;
 }
 
 export interface SeenTradeBook {
@@ -438,7 +468,7 @@ export interface WalletCopyStat {
 /**
  * Aggregated, session-oriented snapshot rendered in the scoreboard panel.
  * Derived on demand from settings, state, metrics, the full trade ledger, and
- * the followed-trader list â€” it holds no independent persisted state.
+ * the followed-trader list - it holds no independent persisted state.
  */
 export interface SessionScoreboard {
   activePreset: RiskPresetId;
@@ -493,7 +523,7 @@ export interface LivePositionEntry {
   /** True when the source wallet of this token is a known copied wallet. */
   attributionKnown: boolean;
   redeemable: boolean;
-  /** Neg-risk (multi-outcome) market â€” redeemed via the NegRiskAdapter, not the CTF. */
+  /** Neg-risk (multi-outcome) market - redeemed via the NegRiskAdapter, not the CTF. */
   negativeRisk: boolean;
 }
 
@@ -516,7 +546,7 @@ export interface RedeemableItem {
   negativeRisk: boolean;
   /**
    * Why this item cannot be auto-redeemed by the bot (proxy/safe wallet, neg-risk,
-   * unknown attribution, â€¦). null = the bot can redeem it directly. Such items are
+   * unknown attribution, -). null = the bot can redeem it directly. Such items are
    * still surfaced so the operator can redeem them manually on Polymarket.
    */
   blockedReason: string | null;
@@ -568,14 +598,14 @@ export interface RedeemedEntry {
   mode: BotMode;
 }
 
-/** Persisted ledger of redeemed positions â€” the double-redeem guard. */
+/** Persisted ledger of redeemed positions - the double-redeem guard. */
 export interface RedeemBook {
   entries: RedeemedEntry[];
 }
 
 /**
  * Snapshot of authoritative live positions reconciled against the local ledger.
- * Built on real-mode start (and refreshed on demand); read-only â€” never trades.
+ * Built on real-mode start (and refreshed on demand); read-only - never trades.
  */
 export interface LivePositionReconciliation {
   fetchedAt: number;

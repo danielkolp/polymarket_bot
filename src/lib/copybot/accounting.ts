@@ -1,6 +1,7 @@
 import type { TraderTrade } from "@/lib/polymarket/types";
 import { todayKey } from "./defaults";
 import { isFilled, tradeIsUnsafeForAccounting, tradeNotionalUsd } from "./ledger";
+import { isCarryRecord } from "./ledgerCompaction";
 import type { BotMetrics, BotPosition, BotSettings, BotState, CopyTradeRecord, FollowedTrader } from "./types";
 
 export function clampPrice(price: number): number {
@@ -202,7 +203,9 @@ export function buildMetrics(
   const retainedTradeCashUsd = calculateCash(settings, trades);
   const cashUsdLocalMirror = calculateCash(settings, trades, { mirrorOnly: true });
   const roi = settings.startingBalance > 0 ? (realizedPnlUsd + unrealizedPnlUsd) / settings.startingBalance : 0;
-  const settledFilled = trades.filter(filledForSettledPnl);
+  // Carry records (archived P&L from ledger compaction) count toward realized
+  // P&L above but are not individual trades for win-rate / trade counts.
+  const settledFilled = trades.filter((t) => filledForSettledPnl(t) && !isCarryRecord(t));
   const winners = settledFilled.filter((t) => t.realizedPnlUsd > 0).length;
   const losers = settledFilled.filter((t) => t.realizedPnlUsd < 0).length;
   const closed = winners + losers;
@@ -284,7 +287,9 @@ export function buildMetrics(
       winners,
       losers,
       nextTradeSizeUsd: calculateNextTradeSize(settings, availableBalanceUsd),
-      totalTrades: trades.filter((t) => t.status === "simulated" || t.status === "copied" || t.status === "dry-run").length,
+      totalTrades: trades.filter(
+        (t) => (t.status === "simulated" || t.status === "copied" || t.status === "dry-run") && !isCarryRecord(t),
+      ).length,
       failedTrades: trades.filter((t) => t.status === "failed").length,
       skippedTrades: trades.filter((t) => t.status === "skipped").length,
       openPositions: positions.length,

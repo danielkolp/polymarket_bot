@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import { DEFAULT_BOT_SETTINGS, createInitialBotState } from "./defaults";
 import { applyRiskPreset } from "./riskPresets";
+import { compactTrades } from "./ledgerCompaction";
 import type {
   BotLogEntry,
   BotPosition,
@@ -28,7 +29,6 @@ const STATE_FILE = path.join(DATA_DIR, "bot-state.json");
 const LIVE_POSITIONS_FILE = path.join(DATA_DIR, "live-positions.json");
 const REDEEMED_FILE = path.join(DATA_DIR, "redeemed.json");
 
-const MAX_TRADES = 1000;
 const MAX_LOGS = 500;
 const MAX_EQUITY_POINTS = 1500;
 const JSON_READ_RETRY_DELAYS_MS = [20, 50, 100];
@@ -185,7 +185,9 @@ export async function loadTrades(): Promise<CopyTradeRecord[]> {
 }
 
 export async function saveTrades(trades: CopyTradeRecord[]): Promise<void> {
-  await enqueueWrite(() => writeJson(TRADES_FILE, trades.slice(0, MAX_TRADES)));
+  // P&L-preserving compaction (see ledgerCompaction.ts) — never a blind slice,
+  // which used to drop realized P&L and shift cash/equity.
+  await enqueueWrite(() => writeJson(TRADES_FILE, compactTrades(trades)));
 }
 
 export async function prependTrade(record: CopyTradeRecord): Promise<void> {

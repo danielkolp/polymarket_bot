@@ -1,5 +1,5 @@
 /**
- * GET /api/leaderboard?metric=profit|volume&window=1d|7d|all&limit=
+ * GET /api/leaderboard?metric=profit|volume&window=1d|7d|30d|all&limit=
  */
 import { NextRequest, NextResponse } from "next/server";
 import { fetchLeaders, type LeaderMetric, type LeaderWindow } from "@/lib/polymarket/leaderboard";
@@ -12,7 +12,7 @@ export async function GET(req: NextRequest): Promise<NextResponse<ApiEnvelope<Le
   const sp = req.nextUrl.searchParams;
   const metric = (sp.get("metric") === "volume" ? "volume" : "profit") as LeaderMetric;
   const w = sp.get("window");
-  const window = (w === "1d" || w === "7d" || w === "all" ? w : "7d") as LeaderWindow;
+  const window = (w === "1d" || w === "7d" || w === "30d" || w === "all" ? w : "7d") as LeaderWindow;
   const limit = Math.min(50, Math.max(1, Number(sp.get("limit")) || 20));
 
   try {

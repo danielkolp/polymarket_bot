@@ -125,9 +125,13 @@ export interface OrderBook {
 export interface Leader {
   wallet: string;
   name: string;
-  /** Profit ($) or volume ($) depending on the leaderboard metric. */
+  /** Profit ($) or volume depending on the leaderboard metric. */
   amount: number;
   rank: number;
+  /** Window P&L in USD (v2 returns this on every board). */
+  pnlUsd?: number;
+  /** Window volume (v2 reports this in shares, not USDC). */
+  volume?: number;
 }
 
 export interface TraderTrade {
@@ -143,6 +147,12 @@ export interface TraderTrade {
   title: string;
   outcome: string;
   txHash: string;
+  /** Market slug (v2). */
+  slug?: string;
+  /** Parent event slug (v2) — groups related markets, e.g. every candidate in one election. */
+  eventSlug?: string;
+  /** Outcome index within the market (v2); undefined when unlabeled. */
+  outcomeIndex?: number;
 }
 
 // Standard API envelope returned by all internal /api routes.

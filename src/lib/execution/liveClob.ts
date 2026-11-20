@@ -124,10 +124,7 @@ function readCashBalance(obj: Record<string, unknown>): number | null {
 /** Try Polymarket's public REST APIs for the user's cash/pUSD balance. */
 async function fetchPusdBalanceFromApi(funderAddress: string): Promise<number | null> {
   const candidates = [
-    `${config.dataApiUrl}/value?user=${funderAddress}`,
     `${config.gammaUrl}/profiles?id=${funderAddress}`,
-    `${config.lbApiUrl}/portfolio?user=${funderAddress}`,
-    `${config.lbApiUrl}/value?user=${funderAddress}`,
   ];
   for (const url of candidates) {
     try {

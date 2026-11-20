@@ -10,10 +10,17 @@ import { positionUnrealizedPnl } from "./accounting";
 import { isFilled as ledgerIsFilled, tradeAvgPrice, tradeFilledShares, tradeNotionalUsd } from "./ledger";
 import type { BotPosition, CopyScore, CopyTradeRecord, FollowedTrader } from "./types";
 
-/** Minimum filled copies before ROI-based auto-disable can fire. */
+/** Minimum filled copies before the slow ROI-based auto-disable can fire. */
 const MIN_AUTO_DISABLE_FILLED_COPIES = 40;
 /** ROI must be materially negative before a wallet is auto-disabled. */
 const NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD = -0.05;
+/**
+ * Fast cut: a wallet that has lost a clear chunk of what we put behind it after
+ * a modest number of copied BUYs is disabled early. With a small bankroll,
+ * waiting for 40 fills (≈20 round trips) on a losing wallet is expensive.
+ */
+const FAST_CUT_MIN_COPIED_BUYS = 12;
+const FAST_CUT_ROI_THRESHOLD = -0.15;
 /** Minimum attempts (filled + skipped) before the skip-ratio review rule can fire. */
 const MIN_ATTEMPTS = 8;
 const HIGH_SKIP_RATIO = 0.85;
@@ -83,6 +90,8 @@ export function computeCopyScore(
   let reviewReason: string | null = null;
   if (filled.length >= MIN_AUTO_DISABLE_FILLED_COPIES && copyRoi <= NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD) {
     autoDisableReason = `Negative copy ROI (${(copyRoi * 100).toFixed(1)}%) after ${filled.length} copied trades.`;
+  } else if (buys.length >= FAST_CUT_MIN_COPIED_BUYS && copyRoi <= FAST_CUT_ROI_THRESHOLD) {
+    autoDisableReason = `Copy ROI ${(copyRoi * 100).toFixed(1)}% after ${buys.length} copied BUYs (fast cut at ${(FAST_CUT_ROI_THRESHOLD * 100).toFixed(0)}%).`;
   } else if (filled.length > 0 && copyRoi < 0) {
     const roiText = `${(copyRoi * 100).toFixed(1)}%`;
     if (copyRoi <= NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD) {

@@ -27,7 +27,6 @@ export const config = {
 
   gammaUrl: (process.env.POLYMARKET_GAMMA_URL ?? "https://gamma-api.polymarket.com").replace(/\/+$/, ""),
   clobUrl: (process.env.POLYMARKET_CLOB_URL ?? "https://clob.polymarket.com").replace(/\/+$/, ""),
-  lbApiUrl: (process.env.POLYMARKET_LB_URL ?? "https://lb-api.polymarket.com").replace(/\/+$/, ""),
   dataApiUrl: (process.env.POLYMARKET_DATA_URL ?? "https://data-api.polymarket.com").replace(/\/+$/, ""),
 
   requestTimeoutMs: num(process.env.POLY_REQUEST_TIMEOUT_MS, 8000),
@@ -118,6 +117,22 @@ export const config = {
   // route refuses to serve token-less requests, so leaving this blank keeps the
   // endpoint private even if its nginx Basic Auth is removed.
   analyticsExportToken: process.env.ANALYTICS_EXPORT_TOKEN ?? "",
+
+  // ── Reliability / supervision ──────────────────────────────────────────────
+  // When true (default), a bot that was running when the server stopped/crashed
+  // resumes automatically on the next boot (panic stops are never auto-resumed).
+  autoResumeOnBoot: bool(process.env.BOT_AUTO_RESUME, true),
+  // A poll taking longer than this is treated as hung: the watchdog releases it
+  // and schedules a fresh poll so one stuck network call can't freeze the bot.
+  tickWatchdogMs: num(process.env.BOT_TICK_WATCHDOG_MS, 5 * 60 * 1000),
+  // Ceiling for the exponential backoff applied after consecutive poll errors.
+  maxErrorBackoffMs: num(process.env.BOT_MAX_ERROR_BACKOFF_MS, 5 * 60 * 1000),
+
+  // ── Alerts (optional) ─────────────────────────────────────────────────────
+  // Discord/Slack incoming webhook URL for bot alerts (errors, restarts, daily summary).
+  alertWebhookUrl: process.env.ALERT_WEBHOOK_URL ?? "",
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
+  telegramChatId: process.env.TELEGRAM_CHAT_ID ?? "",
 } as const;
 
 export type AppConfig = typeof config;
