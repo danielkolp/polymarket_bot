@@ -118,3 +118,14 @@ describe("fresh-position grace period", () => {
     expect(snapshot.stalePositionCount).toBe(1);
   });
 });
+
+describe("Data API v2 resolved positions", () => {
+  it("drops resolved losers entirely (not open, not claimable)", () => {
+    const lost = makeAccountPosition({ tokenId: "lost", redeemable: false, lost: true, curPrice: 0, size: 600 });
+    const won = makeAccountPosition({ tokenId: "won", redeemable: true, curPrice: 1, size: 10 });
+    const { snapshot, positions } = reconcileAccountPositions([lost, won], [], []);
+    expect(snapshot.entries.map((e) => e.tokenId)).toEqual(["won"]);
+    expect(snapshot.redeemableCount).toBe(1);
+    expect(positions).toHaveLength(0);
+  });
+});

@@ -60,6 +60,9 @@ export function buildRedeemablePlan(
   for (const entry of snapshot.entries) {
     if (!entry.redeemable) continue; // only resolved/redeemable winnings
     if (entry.liveShares <= 0) continue;
+    // A resolved position only pays out if it won (priced ~$1). Never count a
+    // resolved loser as $1/share of winnings.
+    if (!(entry.markPrice >= 0.5)) continue;
     if (redeemedTokens.has(entry.tokenId)) continue; // double-redeem guard
 
     const blockedReason = redeemBlockedReason({ negativeRisk: entry.negativeRisk });

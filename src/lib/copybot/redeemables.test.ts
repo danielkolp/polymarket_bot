@@ -135,3 +135,15 @@ describe("makeRedeemRecord — ledger correctness", () => {
     expect(calculateCash(settings, [rec])).toBe(110); // SELL adds proceeds
   });
 });
+
+describe("resolved losers are never counted as winnings", () => {
+  it("excludes a resolved position priced at ~$0", () => {
+    const plan = buildRedeemablePlan(
+      snapshot([entry({ tokenId: "won", markPrice: 0.99, liveShares: 10 }), entry({ tokenId: "lost", markPrice: 0.01, liveShares: 600 })]),
+      noRedeemed,
+      "real",
+    );
+    expect(plan.items.map((i) => i.tokenId)).toEqual(["won"]);
+    expect(plan.totalExpectedPayoutUsd).toBe(10);
+  });
+});

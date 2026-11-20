@@ -81,6 +81,8 @@ export function reconcileAccountPositions(
 
   for (const accPos of account) {
     if (accPos.size <= DUST) continue;
+    // Resolved losers are worth $0: not open risk and not winnings to claim.
+    if (accPos.lost) continue;
     const local = localByToken.get(accPos.tokenId);
     const attributionKnown = Boolean(local && local.sourceWallets.some((w) => followed.has(w.toLowerCase())));
 

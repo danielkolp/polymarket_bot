@@ -80,19 +80,25 @@ function normalizePosition(raw: RawPosition): AccountPosition | null {
   if (!tokenId) return null;
   const size = toNumOrNull(raw.current_size ?? raw.size) ?? 0;
   const status = String(raw.status ?? "").toUpperCase();
+  const curPrice = toNumOrNull(raw.current_price ?? raw.curPrice);
+  const resolved = Boolean(raw.redeemable) || status === "REDEEMABLE" || status === "REDEEMABLE_LOST";
+  // Data API v2 marks EVERY resolved, still-held position "REDEEMABLE" — losers
+  // included (worth $0). Only a resolved position priced near $1 is a winning
+  // claim; everything else resolved is a loss.
+  const lost = status === "REDEEMABLE_LOST" || (resolved && (curPrice == null || curPrice < 0.5));
   return {
     wallet: (raw.proxy_wallet ?? raw.proxyWallet ?? "").toLowerCase(),
     tokenId,
     conditionId: raw.condition_id ?? raw.conditionId ?? "",
     size,
     avgPrice: toNumOrNull(raw.avg_price ?? raw.avgPrice),
-    curPrice: toNumOrNull(raw.current_price ?? raw.curPrice),
+    curPrice,
     initialValueUsd: toNumOrNull(raw.entry_cost_usdc ?? raw.initialValue),
     currentValueUsd: toNumOrNull(raw.current_value ?? raw.currentValue),
     cashPnlUsd: toNumOrNull(raw.unrealized_pnl ?? raw.cashPnl),
     percentPnl: toNumOrNull(raw.percent_pnl ?? raw.percentPnl),
-    redeemable: Boolean(raw.redeemable) || status === "REDEEMABLE",
-    lost: status === "REDEEMABLE_LOST",
+    redeemable: resolved && !lost,
+    lost,
     title: raw.title ?? "(market)",
     slug: raw.slug ?? "",
     outcome: raw.outcome ?? "",
