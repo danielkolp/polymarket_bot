@@ -33,6 +33,7 @@ export type SizingBase = "cash" | "equity";
 export type DiscoverySource =
   | "profit-1d"
   | "profit-7d"
+  | "profit-30d"
   | "volume"
   | "high-frequency"
   | "manual"
@@ -230,6 +231,16 @@ export interface FollowedTrader {
 
   /** Discovery v2: which candidate pool primarily surfaced this auto wallet. */
   discoverySource?: DiscoverySource;
+  /**
+   * Kept on the roster only so the bot sees this wallet's SELLs for positions it
+   * copied earlier; new BUYs from it are not copied.
+   */
+  exitOnly?: boolean;
+  /** Recent behaviour used for ranking (from the last ~100 trades). */
+  tradesPerDay?: number;
+  avgTradeUsd?: number;
+  monthlyPnlUsd?: number;
+  monthlyRoi?: number;
   /** Discovery v2: composite ranking score (0..100) from the last refresh. */
   discoveryScore?: number;
 }

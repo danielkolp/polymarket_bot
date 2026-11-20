@@ -26,6 +26,8 @@ export interface AccountPosition {
   percentPnl: number | null;
   /** True once the market has resolved and the position can be redeemed. */
   redeemable: boolean;
+  /** Resolved against this outcome (worth $0). Data API v2 `REDEEMABLE_LOST`. */
+  lost?: boolean;
   title: string;
   slug: string;
   outcome: string;
@@ -34,6 +36,21 @@ export interface AccountPosition {
 }
 
 interface RawPosition {
+  // Data API v2 (snake_case)
+  proxy_wallet?: string;
+  token_id?: string;
+  condition_id?: string;
+  current_size?: number | string;
+  avg_price?: number | string;
+  current_price?: number | string;
+  entry_cost_usdc?: number | string;
+  current_value?: number | string;
+  unrealized_pnl?: number | string;
+  percent_pnl?: number | string;
+  status?: string;
+  end_date?: string;
+  negative_risk?: boolean;
+  // Data API v1 (camelCase) — kept for tolerance in tests/fixtures.
   proxyWallet?: string;
   asset?: string;
   conditionId?: string;
@@ -59,26 +76,28 @@ function toNumOrNull(value: unknown): number | null {
 }
 
 function normalizePosition(raw: RawPosition): AccountPosition | null {
-  const tokenId = raw.asset ?? "";
+  const tokenId = raw.token_id ?? raw.asset ?? "";
   if (!tokenId) return null;
-  const size = toNumOrNull(raw.size) ?? 0;
+  const size = toNumOrNull(raw.current_size ?? raw.size) ?? 0;
+  const status = String(raw.status ?? "").toUpperCase();
   return {
-    wallet: (raw.proxyWallet ?? "").toLowerCase(),
+    wallet: (raw.proxy_wallet ?? raw.proxyWallet ?? "").toLowerCase(),
     tokenId,
-    conditionId: raw.conditionId ?? "",
+    conditionId: raw.condition_id ?? raw.conditionId ?? "",
     size,
-    avgPrice: toNumOrNull(raw.avgPrice),
-    curPrice: toNumOrNull(raw.curPrice),
-    initialValueUsd: toNumOrNull(raw.initialValue),
-    currentValueUsd: toNumOrNull(raw.currentValue),
-    cashPnlUsd: toNumOrNull(raw.cashPnl),
-    percentPnl: toNumOrNull(raw.percentPnl),
-    redeemable: Boolean(raw.redeemable),
+    avgPrice: toNumOrNull(raw.avg_price ?? raw.avgPrice),
+    curPrice: toNumOrNull(raw.current_price ?? raw.curPrice),
+    initialValueUsd: toNumOrNull(raw.entry_cost_usdc ?? raw.initialValue),
+    currentValueUsd: toNumOrNull(raw.current_value ?? raw.currentValue),
+    cashPnlUsd: toNumOrNull(raw.unrealized_pnl ?? raw.cashPnl),
+    percentPnl: toNumOrNull(raw.percent_pnl ?? raw.percentPnl),
+    redeemable: Boolean(raw.redeemable) || status === "REDEEMABLE",
+    lost: status === "REDEEMABLE_LOST",
     title: raw.title ?? "(market)",
     slug: raw.slug ?? "",
     outcome: raw.outcome ?? "",
-    endDate: raw.endDate ?? null,
-    negativeRisk: Boolean(raw.negativeRisk),
+    endDate: raw.end_date ?? raw.endDate ?? null,
+    negativeRisk: Boolean(raw.negative_risk ?? raw.negativeRisk),
   };
 }
 
@@ -87,15 +106,43 @@ function normalizePosition(raw: RawPosition): AccountPosition | null {
  * keep anything with a positive size by default. Resolved-but-redeemable
  * positions are included so recovery can surface them for manual redemption.
  */
-export async function fetchUserPositions(wallet: string, limit = 500): Promise<AccountPosition[]> {
-  const raws = await dataRequest<RawPosition[]>("/positions", {
-    query: { user: wallet, limit, sizeThreshold: 0.01 },
-  });
-  const list = Array.isArray(raws) ? raws : [];
+export type PositionStatus = "OPEN" | "REDEEMABLE" | "REDEEMABLE_LOST";
+
+/** Max positions read per status (cursor pages of up to 500). */
+const MAX_POSITIONS_PER_STATUS = 2000;
+
+/**
+ * Fetch a wallet's positions from Data API v2 (`/v2/positions`), following the
+ * cursor so wallets with more than one page are read completely (a truncated
+ * read would make a leader look like they exited when they did not).
+ *
+ * `statuses` defaults to OPEN only. The bot's own account also reads
+ * REDEEMABLE (won, unclaimed) so winnings to claim are surfaced.
+ */
+export async function fetchUserPositions(
+  wallet: string,
+  limit = 500,
+  statuses: PositionStatus[] = ["OPEN"],
+): Promise<AccountPosition[]> {
   const out: AccountPosition[] = [];
-  for (const r of list) {
-    const p = normalizePosition(r);
-    if (p && p.size > 0) out.push(p);
+  for (const status of statuses) {
+    let cursor: string | undefined;
+    let read = 0;
+    for (let page = 0; page < 10; page += 1) {
+      const res = await dataRequest<{ data?: RawPosition[] | null; pagination?: { next_cursor?: string | null } }>(
+        "/v2/positions",
+        { query: { user: wallet, status, limit: Math.min(500, Math.max(1, limit)), cursor } },
+      );
+      const list = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? (res as RawPosition[]) : [];
+      for (const r of list) {
+        const p = normalizePosition(r);
+        if (p && p.size > 0) out.push(p);
+      }
+      read += list.length;
+      const next = res && !Array.isArray(res) ? res.pagination?.next_cursor : null;
+      if (!next || read >= MAX_POSITIONS_PER_STATUS) break;
+      cursor = next;
+    }
   }
   return out;
 }

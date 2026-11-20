@@ -118,8 +118,5 @@ export const gammaRequest = <T>(path: string, options: RequestOptions = {}): Pro
 export const clobRequest = <T>(path: string, options: RequestOptions = {}): Promise<T> =>
   doFetch<T>(buildUrl(config.clobUrl, path, options.query), options);
 
-export const lbRequest = <T>(path: string, options: RequestOptions = {}): Promise<T> =>
-  doFetch<T>(buildUrl(config.lbApiUrl, path, options.query), options);
-
 export const dataRequest = <T>(path: string, options: RequestOptions = {}): Promise<T> =>
   doFetch<T>(buildUrl(config.dataApiUrl, path, options.query), options);

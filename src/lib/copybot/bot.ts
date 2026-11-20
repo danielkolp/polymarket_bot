@@ -1626,9 +1626,11 @@ export class CopyBotEngine {
       now - state.lastDiscoveryAt > settings.traderRefreshIntervalMin * 60 * 1000;
     if (!due) return;
 
-    const [traders, trades] = await Promise.all([loadTraders(), loadTrades()]);
+    const [traders, trades, heldPositions] = await Promise.all([loadTraders(), loadTrades(), loadPositions()]);
     const previousWallets = new Set(traders.map((trader) => trader.wallet));
-    const discovered = await discoverTraders(settings, traders, trades, now);
+    const heldSourceWallets = new Set(heldPositions.flatMap((position) => position.sourceWallets));
+    // Throws when the leaderboards are unreachable; callers keep the old roster.
+    const discovered = await discoverTraders(settings, traders, trades, now, heldSourceWallets);
     await saveTraders(discovered);
 
     const newWallets = discovered
@@ -2912,6 +2914,9 @@ export class CopyBotEngine {
     if (adverse?.reason) return skip(adverse.reason);
 
     if (trade.side === "BUY") {
+      if (trader?.exitOnly) {
+        return skip("Skipped BUY: this trader is kept only to mirror exits of positions copied earlier.");
+      }
       if (
         settings.maxHoursToResolution > 0 &&
         market?.timeToResolutionMs != null &&

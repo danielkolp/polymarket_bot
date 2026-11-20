@@ -136,6 +136,9 @@ export interface Leader {
   /** Profit ($) or volume ($) depending on the leaderboard metric. */
   amount: number;
   rank: number;
+  /** Data API v2 returns both on every board row. */
+  pnlUsd?: number | null;
+  volumeUsd?: number | null;
 }
 
 export interface TraderTrade {

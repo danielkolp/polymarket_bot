@@ -54,7 +54,7 @@ export async function reconcileLivePositions(
   now = Date.now(),
 ): Promise<LivePositionResult> {
   const address = getLiveAccountAddress();
-  const account = await fetchUserPositions(address);
+  const account = await fetchUserPositions(address, 500, ["OPEN", "REDEEMABLE"]);
   return reconcileAccountPositions(account, localPositions, traders, now);
 }
 

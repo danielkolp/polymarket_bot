@@ -53,7 +53,7 @@ describe("computeCopyScore", () => {
     const score = computeCopyScore(WALLET, trades, []);
     expect(score.copyRoi).toBeCloseTo(-0.5);
     expect(score.autoDisableReason).toBeNull();
-    expect(score.reviewReason).toMatch(/1\/40 copied trades/i);
+    expect(score.reviewReason).toMatch(/1\/12 copied trades/i);
   });
 
   it("marks high skip ratios under review without auto-disable", () => {

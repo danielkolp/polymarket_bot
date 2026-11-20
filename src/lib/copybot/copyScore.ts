@@ -11,7 +11,7 @@ import { isFilled as ledgerIsFilled, tradeAvgPrice, tradeFilledShares, tradeNoti
 import type { BotPosition, CopyScore, CopyTradeRecord, FollowedTrader } from "./types";
 
 /** Minimum filled copies before ROI-based auto-disable can fire. */
-const MIN_AUTO_DISABLE_FILLED_COPIES = 40;
+const MIN_AUTO_DISABLE_FILLED_COPIES = 12;
 /** ROI must be materially negative before a wallet is auto-disabled. */
 const NEGATIVE_ROI_AUTO_DISABLE_THRESHOLD = -0.05;
 /** Minimum attempts (filled + skipped) before the skip-ratio review rule can fire. */

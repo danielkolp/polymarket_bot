@@ -27,7 +27,6 @@ export const config = {
 
   gammaUrl: (process.env.POLYMARKET_GAMMA_URL ?? "https://gamma-api.polymarket.com").replace(/\/+$/, ""),
   clobUrl: (process.env.POLYMARKET_CLOB_URL ?? "https://clob.polymarket.com").replace(/\/+$/, ""),
-  lbApiUrl: (process.env.POLYMARKET_LB_URL ?? "https://lb-api.polymarket.com").replace(/\/+$/, ""),
   dataApiUrl: (process.env.POLYMARKET_DATA_URL ?? "https://data-api.polymarket.com").replace(/\/+$/, ""),
 
   requestTimeoutMs: num(process.env.POLY_REQUEST_TIMEOUT_MS, 8000),
@@ -58,9 +57,9 @@ export const config = {
   // Polygon mainnet = 137, Amoy testnet = 80002.
   liveChainId: num(process.env.POLYMARKET_CHAIN_ID, 137),
   // Hard per-order USD backstop. Every live BUY is clamped to this regardless of
-  // the percentage sizing / exposure caps. Defaults to $1 — start tiny; raise
-  // deliberately via LIVE_MAX_ORDER_USD.
-  liveMaxOrderUsd: num(process.env.LIVE_MAX_ORDER_USD, 1),
+  // the percentage sizing / exposure caps. Defaults to $10 (Polymarket needs
+  // ~5 shares per order, i.e. $1-$5 for most prices); lower via LIVE_MAX_ORDER_USD.
+  liveMaxOrderUsd: num(process.env.LIVE_MAX_ORDER_USD, 10),
 
   /**
    * On-chain redemption of resolved (won) positions. Redeeming is NOT part of the

@@ -233,7 +233,7 @@ export async function recoverPortfolio(wallet: string, settings: BotSettings): P
   const notes: string[] = [];
   const realTradingEnabled = config.enableRealTrading;
 
-  let accountPositions = await fetchUserPositions(wallet);
+  let accountPositions = await fetchUserPositions(wallet, 500, ["OPEN", "REDEEMABLE"]);
 
   if (accountPositions.length === 0) {
     return {
