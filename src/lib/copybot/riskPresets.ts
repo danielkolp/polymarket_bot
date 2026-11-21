@@ -85,9 +85,13 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     id: "safe",
     label: "Safe",
     description:
-      "Built for small accounts: about 6% of your balance per trade (max $4), at most 60% invested and 8 open positions, a 25% cash cushion, buying pauses for the day after an 8% loss. Take-profit +30%, stop-loss -25%.",
+      "Built for small accounts: about 3% of your balance per trade (at $50 that is usually Polymarket's 5-share minimum, about $1-2.50), never more than 5% in one market, at most 60% invested and 8 open positions, a 25% cash cushion, buying pauses for the day after an 8% loss. Take-profit +30%, stop-loss -25%.",
     totalExposurePercent: 60,
-    perMarketExposurePercent: 10,
+    // 5% per market (and the 5-share minimum may not exceed it): simulating a
+    // $50 account over 300 copied trades, 6-10% per trade halved the account
+    // in 48% of runs even with the followed traders' measured edge, and in 82%
+    // with the wider leaderboard's; 3% (skip above 5%) cut that to 15% / 22%.
+    perMarketExposurePercent: 5,
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.2,
     // Capped at 85c from data, not taste: replaying ~15k resolved buys by
@@ -99,8 +103,8 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     extraSettings: {
       ...SMALL_ACCOUNT_BASE,
       topTradersToFollow: 16,
-      percentageCopySize: 6,
-      maxTradeAmountUsd: 4,
+      percentageCopySize: 3,
+      maxTradeAmountUsd: 3,
       maxOpenPositions: 8,
       maxDailyLossPercent: 8,
       maxHoursToResolution: 14 * 24,

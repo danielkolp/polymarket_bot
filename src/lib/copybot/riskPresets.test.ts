@@ -73,10 +73,10 @@ describe("applyRiskPreset", () => {
     const settings = applyRiskPreset({ ...DEFAULT_BOT_SETTINGS, mode: "real", riskPreset: "safe" });
     expect(settings.sizingMode).toBe("hybrid");
     expect(settings.sizingBase).toBe("equity");
-    expect(settings.percentageCopySize).toBe(6);
-    expect(settings.maxTradeAmountUsd).toBe(4);
+    expect(settings.percentageCopySize).toBe(3);
+    expect(settings.maxTradeAmountUsd).toBe(3);
     expect(settings.maxTotalExposurePercent).toBe(60);
-    expect(settings.maxExposurePerMarketPercent).toBe(10);
+    expect(settings.maxExposurePerMarketPercent).toBe(5);
     expect(settings.maxOpenPositions).toBe(8);
     expect(settings.maxBuyTokenPrice).toBeCloseTo(0.85, 10);
     expect(settings.minBuyTokenPrice).toBeCloseTo(0.2, 10);

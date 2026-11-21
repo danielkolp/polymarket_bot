@@ -26,7 +26,7 @@ import { cn } from "@/lib/utils";
 type Run = (name: string, url: string, body?: unknown) => Promise<boolean>;
 
 const SIMPLE_PRESETS: { id: RiskPresetId; label: string; tagline: string }[] = [
-  { id: "safe", label: "Safe", tagline: "Small bets, big cash cushion. Recommended." },
+  { id: "safe", label: "Safe", tagline: "Smallest bets Polymarket allows, big cash cushion. Recommended." },
   { id: "steady", label: "Balanced", tagline: "A bit more per trade and more positions." },
   { id: "growth", label: "Growth", tagline: "Bigger bets, bigger swings both ways." },
 ];
@@ -183,9 +183,14 @@ function Stat({ label, value, className }: { label: string; value: string; class
 function presetNumbers(id: RiskPresetId, equity: number) {
   const p = RISK_PRESETS[id];
   const x = p.extraSettings ?? {};
-  const perTrade = Math.min(x.maxTradeAmountUsd ?? 5, (equity * (x.percentageCopySize ?? 5)) / 100);
+  const perTrade = Math.max(1, Math.min(x.maxTradeAmountUsd ?? 5, (equity * (x.percentageCopySize ?? 5)) / 100));
+  // Orders are bumped up to the market's 5-share minimum (up to ~$4.50 at 85c),
+  // but never past the per-market cap.
+  const perMarketCap = (equity * p.perMarketExposurePercent) / 100;
+  const perTradeMax = Math.max(perTrade, Math.min(perMarketCap, 4.5));
   return {
-    perTrade: Math.max(1, perTrade),
+    perTrade,
+    perTradeMax,
     invested: (equity * p.totalExposurePercent) / 100,
     dailyStop: (equity * (x.maxDailyLossPercent ?? 10)) / 100,
     positions: x.maxOpenPositions ?? 0,
@@ -443,7 +448,7 @@ export function Home({
                 </div>
                 <div className="mt-1 text-xs text-muted-foreground">{p.tagline}</div>
                 <ul className="mt-2 space-y-0.5 text-xs tabular-nums text-foreground/80">
-                  <li>≈ {money(n.perTrade)} per trade</li>
+                  <li>≈ {n.perTradeMax - n.perTrade >= 0.5 ? `${money(n.perTrade)}–${money(n.perTradeMax)}` : money(n.perTrade)} per trade</li>
                   <li>Up to {money(n.invested, 0)} invested, {n.positions} positions</li>
                   <li>Stops buying for the day after −{money(n.dailyStop)}</li>
                 </ul>
