@@ -37,6 +37,8 @@ export interface EntryPlanInput {
   requestedUsd: number;
   /** The largest order every cap/reserve still allows (USD). */
   maxAllowedUsd: number;
+  /** Which limit sets maxAllowedUsd, for skip messages (e.g. "per-market cap"). */
+  limitedBy?: string;
   maxAdverseEntryMoveCents: number;
   maxEntryCostPercent: number;
 }
@@ -103,7 +105,7 @@ export function planEntry(input: EntryPlanInput): EntryPlan {
     } else {
       return {
         ok: false,
-        reason: `Skipped BUY: this market needs at least $${minimumUsd.toFixed(2)} (${params.minOrderSize} shares minimum) but your limits allow $${maxAllowed.toFixed(2)} right now.`,
+        reason: `Skipped BUY: this market needs at least $${minimumUsd.toFixed(2)} (${params.minOrderSize} shares minimum) but your limits allow $${maxAllowed.toFixed(2)} right now${input.limitedBy ? ` (${input.limitedBy})` : ""}.`,
       };
     }
   }
@@ -111,7 +113,7 @@ export function planEntry(input: EntryPlanInput): EntryPlan {
   if (usd < minimumUsd) {
     return {
       ok: false,
-      reason: `Skipped BUY: your limits allow $${maxAllowed.toFixed(2)}, below this market's $${minimumUsd.toFixed(2)} minimum.`,
+      reason: `Skipped BUY: your limits allow $${maxAllowed.toFixed(2)}${input.limitedBy ? ` (${input.limitedBy})` : ""}, below this market's $${minimumUsd.toFixed(2)} minimum.`,
     };
   }
 

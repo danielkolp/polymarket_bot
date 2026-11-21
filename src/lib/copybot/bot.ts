@@ -3197,10 +3197,15 @@ export class CopyBotEngine {
         : Number.POSITIVE_INFINITY;
     // Largest BUY every cap still allows. The same constraints apply in both
     // modes so simulation sizing matches live.
-    const maxAllowedBuyUsd = Math.max(
-      0,
-      Math.min(availableBalanceUsd - reserveUsd, config.liveMaxOrderUsd, remainingAllowedExposureUsd, walletCapUsd),
-    );
+    const limits: [string, number][] = [
+      ["cash after the cushion", availableBalanceUsd - reserveUsd],
+      ["max order size", config.liveMaxOrderUsd],
+      ["per-market cap", remainingPerMarketUsd],
+      ["total invested cap", remainingTotalExposureUsd],
+      ["per-trader cap", walletCapUsd],
+    ];
+    const bindingLimit = limits.reduce((a, b) => (b[1] < a[1] ? b : a));
+    const maxAllowedBuyUsd = Math.max(0, bindingLimit[1]);
     const requestedAmountUsd =
       trade.side === "BUY" ? Math.min(strategyAmountUsd, maxAllowedBuyUsd) : strategyAmountUsd;
     if (capture) {
@@ -3273,6 +3278,7 @@ export class CopyBotEngine {
         params: tokenMeta ?? { minOrderSize: 5, tickSize: 0.01, feeRate: 0.05, feeExponent: 1 },
         requestedUsd: requestedAmountUsd,
         maxAllowedUsd: maxAllowedBuyUsd,
+        limitedBy: bindingLimit[0],
         maxAdverseEntryMoveCents: settings.maxAdverseEntryMoveCents,
         maxEntryCostPercent: settings.maxEntryCostPercent,
       });
