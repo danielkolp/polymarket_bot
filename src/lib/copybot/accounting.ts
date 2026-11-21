@@ -187,6 +187,27 @@ export function applyConvictionSizing(
   return Math.min(scaled, settings.maxTradeAmountUsd);
 }
 
+/**
+ * Fresh performance baselines for a new book (switching paper/real, or a new
+ * paper bankroll): today's start, the peak and any drawdown pause restart from
+ * the current equity so old numbers can't trigger pauses or skew "today".
+ */
+export function resetPerformanceBaselines(
+  state: BotState,
+  metrics: Pick<BotMetrics, "equityUsd" | "realizedPnlUsd" | "unrealizedPnlUsd">,
+  now = Date.now(),
+): BotState {
+  return {
+    ...state,
+    dailyDate: todayKey(now),
+    dailyStartEquityUsd: metrics.equityUsd,
+    dailyStartBotPnlUsd: metrics.realizedPnlUsd + metrics.unrealizedPnlUsd,
+    peakEquityUsd: metrics.equityUsd,
+    drawdownPauseUntil: null,
+    dailyLossLockout: false,
+  };
+}
+
 export function buildMetrics(
   settings: BotSettings,
   state: BotState,

@@ -312,7 +312,8 @@ export function Home({
   const [depositDraft, setDepositDraft] = useState<string | null>(null);
 
   const equity = metrics.equityUsd;
-  const baseline = settings.depositBaselineUsd > 0 ? settings.depositBaselineUsd : settings.startingBalance;
+  // Paper: measured against the paper bankroll. Live: against what was deposited.
+  const baseline = live && settings.depositBaselineUsd > 0 ? settings.depositBaselineUsd : settings.startingBalance;
   const allTime = equity - baseline;
   const today = metrics.dailyPnlUsd;
   const todayBase = state.dailyStartEquityUsd > 0 ? state.dailyStartEquityUsd : equity;

@@ -135,6 +135,7 @@ status_summary() {
           copiedTrades: m.totalTrades, winners: m.winners, losers: m.losers,
           winRatePct: m.winRate != null ? Math.round(m.winRate * 1000) / 10 : null,
           returnPctOfBankroll: m.roi != null ? Math.round(m.roi * 1000) / 10 : null,
+          equityPctOfBankroll: set.startingBalance > 0 && m.equityUsd != null ? Math.round((m.equityUsd / set.startingBalance) * 1000) / 10 : null,
         };
       }
       out.followedSkill = (j.traders || []).filter(t => t.enabled && !t.exitOnly)

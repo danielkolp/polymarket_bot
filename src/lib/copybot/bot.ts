@@ -8,6 +8,7 @@ import { simulateFill, type FillCostSettings, type FillResult } from "./fillMode
 import {
   applyConvictionSizing,
   buildMetrics,
+  resetPerformanceBaselines,
   cumulativeBotPnlUsd,
   calculateAvailableBalance,
   calculateNextTradeSize,
@@ -423,9 +424,15 @@ function reconcileLiveBalanceMetrics(settings: BotSettings, metrics: BotMetrics,
   };
 }
 
+/** Paper mode shows the paper book; only real mode is re-anchored to the wallet. */
+export function usesLiveWalletForMetrics(mode: BotSettings["mode"]): boolean {
+  return mode === "real";
+}
+
 async function buildStatusMetrics(settings: BotSettings, metrics: BotMetrics, knownBalance?: LiveUsdcBalance | null): Promise<BotMetrics> {
-  // Show live balance info in both real and simulation mode so sim acts as a
-  // live-mode preview. A funder address is enough for read-only pUSD balance.
+  // Paper account value and cash must never mix in the real wallet (that showed
+  // a "paper" value of real cash + paper positions).
+  if (!usesLiveWalletForMetrics(settings.mode)) return metrics;
   if (!config.livePrivateKey.trim() && !config.liveFunderAddress.trim()) {
     return settings.mode === "real"
       ? {
@@ -1559,12 +1566,42 @@ export class CopyBotEngine {
     return { positions: remaining, settled };
   }
 
+  /** Restart today's start, the peak, the drawdown pause and the chart from current equity. */
+  private async resetBaselines(settings: BotSettings): Promise<void> {
+    try {
+      const [state, positions, trades] = await Promise.all([loadBotState(settings), loadPositions(), loadTrades()]);
+      let live: number | undefined;
+      if (usesLiveWalletForMetrics(settings.mode)) {
+        live = (await getLiveUsdcBalance().catch(() => null))?.usdcBalance;
+      }
+      const { metrics } = buildMetrics(settings, state, positions, trades, Date.now(), live);
+      await saveBotState(resetPerformanceBaselines(state, metrics));
+      await saveEquityCurve([
+        { ts: Date.now(), equityUsd: metrics.equityUsd, cashUsd: metrics.cashUsd, exposureUsd: metrics.totalExposureUsd },
+      ]);
+      await appendLog(
+        "info",
+        settings.mode === "simulation"
+          ? `Paper account reset to $${metrics.equityUsd.toFixed(2)}: today's start, the peak and the chart restart from here.`
+          : "Real account baselines reset from the live balance.",
+      );
+    } catch (err) {
+      await appendLog("warning", `Could not reset account baselines: ${messageFromUnknown(err)}.`);
+    }
+  }
+
   async updateSettings(patch: Partial<BotSettings>): Promise<BotStatus> {
     const current = await loadSettings();
     const next = sanitizeSettings(current, patch);
     await saveSettings(next);
+    const bankrollChanged = next.mode === "simulation" && next.startingBalance !== current.startingBalance;
+    if (next.mode !== current.mode || bankrollChanged) {
+      // Let an in-flight poll finish so it can't re-save the old book's numbers.
+      for (let waited = 0; this.inFlight && waited < 45_000; waited += 250) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
     if (next.mode !== current.mode) {
-      // Let an in-flight poll finish so it can't re-save the old mode's book.
       for (let waited = 0; this.inFlight && waited < 45_000; waited += 250) {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
@@ -1579,6 +1616,9 @@ export class CopyBotEngine {
       } else {
         await appendLog("info", `Switched to real money.${moved.restored > 0 ? ` ${moved.restored} real position(s) from before are managed again.` : ""}`);
       }
+    }
+    if (next.mode !== current.mode || bankrollChanged) {
+      await this.resetBaselines(next);
     }
     if (isRiskPresetId(patch.riskPreset) && patch.riskPreset !== "custom") {
       await appendLog("info", `Risk preset applied: ${RISK_PRESETS[next.riskPreset].label}.`);
@@ -2278,14 +2318,13 @@ export class CopyBotEngine {
       await this.refreshCopyScores();
 
       const trades = await loadTrades();
+      // Paper equity is the paper book only; the live wallet anchors real mode.
       let loopLiveBalance: LiveUsdcBalance | null = null;
-      if (config.livePrivateKey.trim() || config.liveFunderAddress.trim()) {
+      if (usesLiveWalletForMetrics(settings.mode) && (config.livePrivateKey.trim() || config.liveFunderAddress.trim())) {
         try {
-          loopLiveBalance = await getLiveUsdcBalance({ forceRefresh: settings.mode === "real" });
+          loopLiveBalance = await getLiveUsdcBalance({ forceRefresh: true });
         } catch (err) {
-          if (settings.mode === "real") {
-            throw new Error("Live balance fetch failed during poll metrics: " + messageFromUnknown(err));
-          }
+          throw new Error("Live balance fetch failed during poll metrics: " + messageFromUnknown(err));
         }
       }
       const metrics = buildMetrics(settings, state, positions, trades, Date.now(), loopLiveBalance?.usdcBalance);

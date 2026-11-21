@@ -185,3 +185,16 @@ describe("daily-loss lockout", () => {
     expectAccountingInvariant(settings, metrics);
   });
 });
+
+describe("resetPerformanceBaselines", () => {
+  it("restarts today's start, the peak and any drawdown pause from current equity", async () => {
+    const { resetPerformanceBaselines } = await import("./accounting");
+    const state = makeState({ dailyStartEquityUsd: 48, peakEquityUsd: 142, drawdownPauseUntil: DAY2, dailyLossLockout: true });
+    const next = resetPerformanceBaselines(state, { equityUsd: 500, realizedPnlUsd: -1, unrealizedPnlUsd: 3 }, DAY1);
+    expect(next.dailyStartEquityUsd).toBe(500);
+    expect(next.peakEquityUsd).toBe(500);
+    expect(next.dailyStartBotPnlUsd).toBe(2);
+    expect(next.drawdownPauseUntil).toBeNull();
+    expect(next.dailyLossLockout).toBe(false);
+  });
+});
