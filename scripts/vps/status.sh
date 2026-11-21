@@ -24,5 +24,5 @@ node -e '
 ' "$BONK_SHARED/data"
 hr "run-state changes (bot log)"
 f="$BONK_SHARED/data/errors.log"
-[ -f "$f" ] && grep -E '"message":"(Bot (started|paused|stopped|resumed)|Server restarted|PANIC|Panic|Daily loss|Account is|Drawdown|Discovery v2 refreshed)' "$f" | tail -n 12 | node -e '
+[ -f "$f" ] && grep -E '"message":"(Bot (started|paused|stopped|resumed)|Server restarted|PANIC|Panic|Daily loss|Account is|Drawdown|Discovery v2 refreshed|Real-time trade feed)' "$f" | tail -n 12 | node -e '
   let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{for(const l of s.split("\n")){if(!l)continue;try{const j=JSON.parse(l);console.log(new Date(j.ts).toISOString().slice(5,19),String(j.message).slice(0,160))}catch{}}})'
