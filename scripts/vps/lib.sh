@@ -128,6 +128,17 @@ status_summary() {
         lastError: st.lastError ? String(st.lastError).slice(0, 300) : null,
         realTradingEnabled: j.realTradingEnabled ?? j.enableRealTrading,
       };
+      const m = j.metrics || {};
+      if (set.mode === "simulation") {
+        // Paper results as percentages/counts only (no dollar balances in public logs).
+        out.paperResults = {
+          copiedTrades: m.totalTrades, winners: m.winners, losers: m.losers,
+          winRatePct: m.winRate != null ? Math.round(m.winRate * 1000) / 10 : null,
+          returnPctOfBankroll: m.roi != null ? Math.round(m.roi * 1000) / 10 : null,
+        };
+      }
+      out.followedSkill = (j.traders || []).filter(t => t.enabled && !t.exitOnly)
+        .map(t => `${String(t.name || "").slice(0, 18)}: ${t.skill6hCents != null ? (t.skill6hCents >= 0 ? "+" : "") + t.skill6hCents + "c" : "n/a"} (n=${t.skillSamples ?? 0})`);
       console.log(JSON.stringify(out, null, 2));
     });'
 }
