@@ -28,7 +28,7 @@ import {
   selectLeaderExitedPositions,
   sourceWalletsOf,
 } from "./leaderPositions";
-import { fetchUserPositions } from "@/lib/polymarket/positions";
+import { fetchUserMarketPositions, fetchUserPositions, type AccountPosition } from "@/lib/polymarket/positions";
 import {
   applyRiskPreset,
   isRiskPresetId,
@@ -58,6 +58,8 @@ import {
   loadLogs,
   loadLivePositions,
   loadPositions,
+  loadParkedPositions,
+  alignPositionsToMode,
   loadRecentDecisions,
   loadRedeemBook,
   loadSeenTrades,
@@ -97,6 +99,8 @@ const MAX_TRADERS_TO_FOLLOW = 100;
 const MAX_WALLETS_PER_POLL = 100;
 /** Cap on how many leader wallets we fetch positions for per leader-holdings pass. */
 const MAX_LEADER_HOLDINGS_WALLETS = 40;
+/** Leader-holdings backstop cadence (leader SELLs are copied in real time anyway). */
+const LEADER_CHECK_INTERVAL_MS = 60_000;
 // The hard 5-minute absolute copy-age ceiling lives in entryGuards
 // (MAX_COPY_TRADE_AGE_SEC) and is enforced via effectiveMaxCopyAgeSec().
 
@@ -603,12 +607,14 @@ function applyBuy(
   avgPrice: number,
   markPrice: number,
   now: number,
+  mode: BotMode,
 ): BotPosition[] {
   const existing = positions.find((position) => position.tokenId === trade.tokenId);
   if (!existing) {
     return [
       ...positions,
       {
+        mode,
         tokenId: trade.tokenId,
         conditionId: trade.conditionId,
         marketSlug: marketSlug(market, trade),
@@ -736,6 +742,7 @@ function withControlFields(next: BotState, fresh: BotState): BotState {
 export class CopyBotEngine {
   private timer: NodeJS.Timeout | null = null;
   private inFlight = false;
+  private lastLeaderCheckAt = 0;
   /** When the in-flight poll started (ms epoch). */
   private tickStartedAt = 0;
   /** Incremented per poll; an abandoned (hung) poll sees a newer value and stops writing. */
@@ -774,6 +781,7 @@ export class CopyBotEngine {
       loadLivePositions(),
       loadRedeemBook(),
     ]);
+    const parkedPositions = await loadParkedPositions();
     // Fetch live balance so buildMetrics anchors equity to the real wallet in
     // both real and sim mode (sim acts as a live-mode preview when key is set).
     let statusLiveBalance: LiveUsdcBalance | null = null;
@@ -810,6 +818,7 @@ export class CopyBotEngine {
       metrics: statusMetrics,
       scoreboard,
       buyReadiness,
+      parkedPositions,
       realTradingEnabled: config.enableRealTrading,
       simulationOnly: !config.enableRealTrading || settings.mode === "simulation",
       bullpen,
@@ -1553,6 +1562,23 @@ export class CopyBotEngine {
     const current = await loadSettings();
     const next = sanitizeSettings(current, patch);
     await saveSettings(next);
+    if (next.mode !== current.mode) {
+      // Let an in-flight poll finish so it can't re-save the old mode's book.
+      for (let waited = 0; this.inFlight && waited < 45_000; waited += 250) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      const moved = await alignPositionsToMode(next.mode, current.mode);
+      if (next.mode === "simulation") {
+        await appendLog(
+          "info",
+          moved.parked > 0
+            ? `Switched to paper trading. ${moved.parked} real-money position(s) are kept exactly as they are (held until their market resolves) and kept out of paper results.`
+            : "Switched to paper trading: no real orders will be placed.",
+        );
+      } else {
+        await appendLog("info", `Switched to real money.${moved.restored > 0 ? ` ${moved.restored} real position(s) from before are managed again.` : ""}`);
+      }
+    }
     if (isRiskPresetId(patch.riskPreset) && patch.riskPreset !== "custom") {
       await appendLog("info", `Risk preset applied: ${RISK_PRESETS[next.riskPreset].label}.`);
     } else if (current.riskPreset !== "custom" && next.riskPreset === "custom") {
@@ -2103,6 +2129,9 @@ export class CopyBotEngine {
 
       const seen = await loadSeenTrades();
       const seenIds = new Set(seen.ids);
+      // Keep only this mode's positions in play (also undoes a write that raced
+      // a paper/real switch).
+      await alignPositionsToMode(settings.mode);
       let positions = await loadPositions();
       let processedCount = 0;
       let pausedBuyCount = 0;
@@ -2548,7 +2577,7 @@ export class CopyBotEngine {
         }
         const feeUsd = meta ? res.filledShares * takerFeeFraction(meta, res.effectivePrice) * res.effectivePrice : 0;
         const costPerShare = (res.notionalUsd + feeUsd) / res.filledShares;
-        const nextPositions = applyBuy(positions, trade, market, res.filledShares, costPerShare, entry.bestAsk, now);
+        const nextPositions = applyBuy(positions, trade, market, res.filledShares, costPerShare, entry.bestAsk, now, "real");
         const record = makeRecord(
           trade,
           "copied",
@@ -2772,24 +2801,36 @@ export class CopyBotEngine {
 
     const wallets = sourceWalletsOf(botOpened).slice(0, MAX_LEADER_HOLDINGS_WALLETS);
     if (wallets.length === 0) return positions;
+    const now = Date.now();
+    if (now - this.lastLeaderCheckAt < LEADER_CHECK_INTERVAL_MS) return positions;
+    this.lastLeaderCheckAt = now;
 
-    // Read-only fetch of each leader's current positions. A failed fetch becomes
-    // "no data" (→ unknown), never a false "exited" that could trigger a sale.
-    const results = await Promise.all(
-      wallets.map(async (wallet) => {
+    // Read-only, per-market lookups (exact even for leaders with 10k+ open
+    // positions). Any failed lookup makes that wallet "no data" (→ unknown),
+    // never a false "exited" that could trigger a sale.
+    const pairs = botOpened.flatMap((p) =>
+      p.conditionId ? p.sourceWallets.slice(0, 3).map((w) => ({ wallet: w.toLowerCase(), conditionId: p.conditionId })) : [],
+    );
+    const unique = [...new Map(pairs.map((x) => [`${x.wallet}|${x.conditionId}`, x])).values()].filter((x) => wallets.includes(x.wallet));
+    const lookups = await Promise.all(
+      unique.map(async ({ wallet, conditionId }) => {
         try {
-          return { wallet, positions: await fetchUserPositions(wallet) };
+          return { wallet, positions: await fetchUserMarketPositions(wallet, conditionId) };
         } catch {
           return { wallet, positions: null };
         }
       }),
     );
-    const holdings = buildLeaderHoldings(results);
-    const now = Date.now();
+    const merged = new Map<string, AccountPosition[] | null>();
+    for (const { wallet, positions: list } of lookups) {
+      const prev = merged.get(wallet);
+      merged.set(wallet, list == null || prev === null ? null : [...(prev ?? []), ...list]);
+    }
+    const holdings = buildLeaderHoldings([...merged.entries()].map(([wallet, list]) => ({ wallet, positions: list })));
     let annotated = reconcileLeaderHoldings(positions, holdings, now);
 
     if (!settings.exitWhenLeaderNoLongerHolds) return annotated;
-    const toExit = selectLeaderExitedPositions(annotated);
+    const toExit = selectLeaderExitedPositions(annotated, now);
     if (toExit.length === 0) return annotated;
 
     annotated =
@@ -3239,7 +3280,7 @@ export class CopyBotEngine {
       if (!settings.realisticFills) {
         const shares = simBuyUsd / refPrice;
         return {
-          positions: applyBuy(positions, trade, market, shares, refPrice, refPrice, now),
+          positions: applyBuy(positions, trade, market, shares, refPrice, refPrice, now, "simulation"),
           record: makeRecord(
             trade,
             "simulated",
@@ -3271,7 +3312,7 @@ export class CopyBotEngine {
       const cashOut = fill.notionalUsd + fill.feeUsd;
       const effPrice = cashOut / fill.filledShares;
       return {
-        positions: applyBuy(positions, trade, market, fill.filledShares, effPrice, fill.referenceMid, now),
+        positions: applyBuy(positions, trade, market, fill.filledShares, effPrice, fill.referenceMid, now, "simulation"),
         record: makeRecord(
           trade,
           "simulated",

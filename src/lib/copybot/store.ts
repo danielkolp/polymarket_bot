@@ -3,6 +3,7 @@ import path from "path";
 import { DEFAULT_BOT_SETTINGS, createInitialBotState } from "./defaults";
 import { applyRiskPreset } from "./riskPresets";
 import type {
+  BotMode,
   BotLogEntry,
   BotPosition,
   BotSettings,
@@ -28,6 +29,7 @@ const STATE_FILE = path.join(DATA_DIR, "bot-state.json");
 const LIVE_POSITIONS_FILE = path.join(DATA_DIR, "live-positions.json");
 const REDEEMED_FILE = path.join(DATA_DIR, "redeemed.json");
 const SKIPS_FILE = path.join(DATA_DIR, "skips.json");
+const PARKED_POSITIONS_FILE = path.join(DATA_DIR, "parked-positions.json");
 
 /** Real copies/exits only (skips live in their own small ring). */
 const MAX_TRADES = 2000;
@@ -240,6 +242,41 @@ export async function loadPositions(): Promise<BotPosition[]> {
 export async function savePositions(positions: BotPosition[]): Promise<void> {
   const open = positions.filter((p) => p.shares > 0.000001);
   await enqueueWrite(() => writeJson(POSITIONS_FILE, open));
+}
+
+export async function loadParkedPositions(): Promise<BotPosition[]> {
+  return readJson<BotPosition[]>(PARKED_POSITIONS_FILE, []);
+}
+
+/**
+ * Positions belong to the mode that opened them. Paper trading must never
+ * "sell" or settle a real-money holding in its own bookkeeping (and real mode
+ * must not count paper positions), so positions of the other mode are parked
+ * in their own file and the current mode's parked positions are brought back.
+ * Idempotent; cheap when nothing needs to move.
+ */
+export async function alignPositionsToMode(
+  mode: BotMode,
+  /** Mode that untagged active positions belong to (the previous mode on a switch). */
+  untaggedMode: BotMode = mode,
+): Promise<{ parked: number; restored: number }> {
+  return enqueueWrite(async () => {
+    const [rawActive, parked] = await Promise.all([
+      readJson<BotPosition[]>(POSITIONS_FILE, []),
+      readJson<BotPosition[]>(PARKED_POSITIONS_FILE, []),
+    ]);
+    const active = rawActive.map((p) => (p.mode ? p : { ...p, mode: untaggedMode }));
+    const belongs = (p: BotPosition) => (p.mode ?? mode) === mode;
+    const toPark = active.filter((p) => !belongs(p));
+    const toRestore = parked.filter(belongs);
+    if (toPark.length === 0 && toRestore.length === 0) return { parked: 0, restored: 0 };
+    const keep = active.filter(belongs);
+    const held = new Set(keep.map((p) => p.tokenId));
+    const restored = toRestore.filter((p) => !held.has(p.tokenId));
+    await writeJson(POSITIONS_FILE, [...keep, ...restored]);
+    await writeJson(PARKED_POSITIONS_FILE, [...parked.filter((p) => !belongs(p)), ...toPark]);
+    return { parked: toPark.length, restored: restored.length };
+  });
 }
 
 export async function loadEquityCurve(settings?: BotSettings): Promise<EquityPoint[]> {

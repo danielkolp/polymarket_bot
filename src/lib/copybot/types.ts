@@ -268,6 +268,17 @@ export interface BotPosition {
   leaderHolds?: LeaderHoldStatus;
   /** When leaderHolds was last evaluated (ms epoch). */
   leaderCheckedAt?: number;
+  /**
+   * True once a holdings check has seen a source leader holding this token.
+   * A leader-exit sale needs this: Polymarket's positions feed lags fresh
+   * fills, so "not holding" before it was ever seen holding means nothing.
+   */
+  leaderSeenHolding?: boolean;
+  /**
+   * Which mode opened it. Absent on positions from before tagging; those are
+   * treated as belonging to the mode that was active when they were found.
+   */
+  mode?: BotMode;
 }
 
 export interface CopyTradeRecord {
@@ -688,4 +699,6 @@ export interface BotStatus {
   redeemables: RedeemablePlan;
   /** Structured "can the bot BUY right now?" readiness checklist. */
   buyReadiness: BuyReadiness;
+  /** Positions opened in the other mode (e.g. real holdings while paper trading); left untouched. */
+  parkedPositions?: BotPosition[];
 }

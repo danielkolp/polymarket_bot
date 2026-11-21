@@ -153,6 +153,18 @@ export async function fetchUserPositions(
   return out;
 }
 
+/**
+ * A wallet's open positions in ONE market. Exact and cheap even for wallets
+ * holding tens of thousands of positions (the full list is paged and capped).
+ */
+export async function fetchUserMarketPositions(wallet: string, conditionId: string): Promise<AccountPosition[]> {
+  const res = await dataRequest<{ data?: RawPosition[] | null }>("/v2/positions", {
+    query: { user: wallet, condition_id: conditionId, status: "OPEN", limit: 50 },
+  });
+  const list = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? (res as RawPosition[]) : [];
+  return list.map(normalizePosition).filter((p): p is AccountPosition => p != null && p.size > 0);
+}
+
 export interface PricePoint {
   /** Unix seconds. */
   t: number;

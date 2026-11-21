@@ -68,21 +68,35 @@ export function reconcileLeaderHoldings(
   holdings: LeaderHoldings,
   now = Date.now(),
 ): BotPosition[] {
-  return positions.map((p) => ({
-    ...p,
-    leaderHolds: leaderHoldStatus(p, holdings),
-    leaderCheckedAt: now,
-  }));
+  return positions.map((p) => {
+    const leaderHolds = leaderHoldStatus(p, holdings);
+    return {
+      ...p,
+      leaderHolds,
+      leaderCheckedAt: now,
+      leaderSeenHolding: Boolean(p.leaderSeenHolding) || leaderHolds === "yes",
+    };
+  });
 }
 
+/** A copy must be at least this old before a holdings check may exit it. */
+export const LEADER_EXIT_MIN_AGE_MS = 15 * 60 * 1000;
+
 /**
- * Positions eligible for a leader-exit sale: bot-opened (≥1 source wallet) AND
- * confirmed leaderHolds === "no". Manual/unknown positions are never included.
+ * Positions eligible for a leader-exit sale: bot-opened (≥1 source wallet),
+ * confirmed leaderHolds === "no", a source leader WAS seen holding it on an
+ * earlier check (yes → no), and the copy is old enough that feed lag can't
+ * explain the gap. Manual/unknown positions are never included.
  * Pure selection — the caller performs the actual (mode-gated) sale.
  */
-export function selectLeaderExitedPositions(positions: BotPosition[]): BotPosition[] {
+export function selectLeaderExitedPositions(positions: BotPosition[], now = Date.now()): BotPosition[] {
   return positions.filter(
-    (p) => p.shares > DUST && p.sourceWallets.length > 0 && p.leaderHolds === "no",
+    (p) =>
+      p.shares > DUST &&
+      p.sourceWallets.length > 0 &&
+      p.leaderHolds === "no" &&
+      p.leaderSeenHolding === true &&
+      now - (p.openedAt ?? now) >= LEADER_EXIT_MIN_AGE_MS,
   );
 }
 

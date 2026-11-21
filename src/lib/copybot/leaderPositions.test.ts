@@ -64,17 +64,35 @@ describe("leaderHoldStatus", () => {
 });
 
 describe("selectLeaderExitedPositions", () => {
-  it("selects only bot-opened positions whose leader has exited", () => {
-    const holdings = buildLeaderHoldings([{ wallet: LEADER, positions: [acct("held")] }]);
-    const exited = reconcileLeaderHoldings(
+  const OLD = Date.now() - 60 * 60 * 1000;
+
+  it("selects only bot-opened positions whose leader was seen holding and has now exited", () => {
+    const before = buildLeaderHoldings([{ wallet: LEADER, positions: [acct("exited"), acct("held")] }]);
+    const after = buildLeaderHoldings([{ wallet: LEADER, positions: [acct("held")] }]);
+    const seen = reconcileLeaderHoldings(
       [
-        makePosition({ tokenId: "exited", sourceWallets: [LEADER] }), // leader no longer holds → "no"
-        makePosition({ tokenId: "held", sourceWallets: [LEADER] }), // leader still holds → "yes"
+        makePosition({ tokenId: "exited", sourceWallets: [LEADER], openedAt: OLD }),
+        makePosition({ tokenId: "held", sourceWallets: [LEADER], openedAt: OLD }),
       ],
-      holdings,
+      before,
     );
+    const exited = reconcileLeaderHoldings(seen, after);
     const selected = selectLeaderExitedPositions(exited);
     expect(selected.map((p) => p.tokenId)).toEqual(["exited"]);
+  });
+
+  it("never exits a position the leader was never seen holding (feed lag / paging gaps)", () => {
+    const holdings = buildLeaderHoldings([{ wallet: LEADER, positions: [] }]);
+    const annotated = reconcileLeaderHoldings([makePosition({ tokenId: "fresh", sourceWallets: [LEADER], openedAt: OLD })], holdings);
+    expect(annotated[0].leaderHolds).toBe("no");
+    expect(selectLeaderExitedPositions(annotated)).toHaveLength(0);
+  });
+
+  it("never exits a copy younger than 15 minutes, even after a yes -> no flip", () => {
+    const now = Date.now();
+    const p = makePosition({ tokenId: "t", sourceWallets: [LEADER], openedAt: now - 60_000, leaderSeenHolding: true, leaderHolds: "no" });
+    expect(selectLeaderExitedPositions([p], now)).toHaveLength(0);
+    expect(selectLeaderExitedPositions([p], now + 20 * 60_000)).toHaveLength(1);
   });
 
   it("NEVER selects manual/unknown positions even if marked 'no'", () => {

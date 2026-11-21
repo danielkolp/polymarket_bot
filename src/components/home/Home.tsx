@@ -471,6 +471,15 @@ export function Home({
               ))}
             </div>
           )}
+          {(status.parkedPositions?.length ?? 0) > 0 && (
+            <p className="mt-3 rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+              {status.settings.mode === "simulation"
+                ? `You also hold ${status.parkedPositions!.length} real-money position(s) worth about ${money(
+                    status.parkedPositions!.reduce((sum, p) => sum + p.shares * p.markPrice, 0),
+                  )} from before paper mode. They are left exactly as they are; see them or claim winnings on polymarket.com.`
+                : `${status.parkedPositions!.length} paper position(s) are set aside while trading real money.`}
+            </p>
+          )}
         </section>
 
         {/* Health */}

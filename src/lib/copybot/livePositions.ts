@@ -131,6 +131,7 @@ export function reconcileAccountPositions(
     // real-mode P&L; local cost basis is only a fallback when the API omits it.
     const avgPrice = clampPrice(accPos.avgPrice ?? local?.avgPrice ?? markPrice);
     positions.push({
+      mode: "real",
       tokenId: accPos.tokenId,
       conditionId: accPos.conditionId || local?.conditionId || "",
       marketSlug: local?.marketSlug || accPos.slug,
