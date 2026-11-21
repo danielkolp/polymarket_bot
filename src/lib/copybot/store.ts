@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import { DEFAULT_BOT_SETTINGS, createInitialBotState } from "./defaults";
 import { applyRiskPreset } from "./riskPresets";
+import type { SkillCache } from "./traderSkill";
 import type {
   BotMode,
   BotLogEntry,
@@ -30,6 +31,7 @@ const LIVE_POSITIONS_FILE = path.join(DATA_DIR, "live-positions.json");
 const REDEEMED_FILE = path.join(DATA_DIR, "redeemed.json");
 const SKIPS_FILE = path.join(DATA_DIR, "skips.json");
 const PARKED_POSITIONS_FILE = path.join(DATA_DIR, "parked-positions.json");
+const SKILL_FILE = path.join(DATA_DIR, "trader-skill.json");
 
 /** Real copies/exits only (skips live in their own small ring). */
 const MAX_TRADES = 2000;
@@ -242,6 +244,15 @@ export async function loadPositions(): Promise<BotPosition[]> {
 export async function savePositions(positions: BotPosition[]): Promise<void> {
   const open = positions.filter((p) => p.shares > 0.000001);
   await enqueueWrite(() => writeJson(POSITIONS_FILE, open));
+}
+
+/** Cached per-trader 6-hour price moves (see traderSkill.ts). */
+export async function loadSkillCache(): Promise<SkillCache> {
+  return readJson<SkillCache>(SKILL_FILE, {});
+}
+
+export async function saveSkillCache(cache: SkillCache): Promise<void> {
+  await enqueueWrite(() => writeJson(SKILL_FILE, cache));
 }
 
 export async function loadParkedPositions(): Promise<BotPosition[]> {

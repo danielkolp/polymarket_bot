@@ -48,7 +48,7 @@ import { emptyLiveReconciliation, reconcileLivePositions } from "./livePositions
 import { evaluateBuyReadiness } from "./liveReadiness";
 import { LIVE_SELL_DUST, formatLiveSellShares, resolveLiveSellSize } from "./liveSellSizing";
 import { applyCopyScores } from "./copyScore";
-import { discoverTraders } from "./discovery";
+import { discoverTraders, lastRanking } from "./discovery";
 import { analytics, type DecisionCapture } from "@/lib/analytics";
 import {
   appendLog,
@@ -1746,9 +1746,14 @@ export class CopyBotEngine {
       poolCounts.set(key, (poolCounts.get(key) ?? 0) + 1);
     }
     const poolSummary = [...poolCounts.entries()].map(([pool, count]) => `${pool}:${count}`).join(", ");
+    const rankingNote = lastRanking
+      ? lastRanking.useSkill
+        ? ` Ranked by skill (price move 6h after their buys): ${lastRanking.positive} of ${lastRanking.measured} measured traders show an edge.`
+        : ` Skill measured for ${lastRanking.measured}/${lastRanking.candidates} traders so far; using the leaderboard ranking until more are measured.`
+      : "";
     await appendLog(
       "info",
-      `Discovery v2 refreshed ${discovered.length} tracked wallets${poolSummary ? ` (${poolSummary})` : ""}.`,
+      `Discovery refreshed ${discovered.length} tracked wallets${poolSummary ? ` (${poolSummary})` : ""}.${rankingNote}`,
     );
     await this.refreshCopyScores();
   }

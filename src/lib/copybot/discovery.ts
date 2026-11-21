@@ -1,5 +1,8 @@
 import { fetchLeaders, type LeaderWindow } from "@/lib/polymarket/leaderboard";
 import { fetchUserTrades } from "@/lib/polymarket/traderTrades";
+import { fetchPriceWindow } from "@/lib/polymarket/positions";
+import { loadSkillCache, saveSkillCache } from "./store";
+import { measureSkill, pruneSkillCache, SKILL_MIN_SAMPLES, type TraderSkill } from "./traderSkill";
 import type { Leader, TraderTrade } from "@/lib/polymarket/types";
 import type { BotSettings, CopyTradeRecord, DiscoverySource, FollowedTrader } from "./types";
 
@@ -25,7 +28,12 @@ const WEEK_SEC = 7 * 24 * 60 * 60;
 const BOARD_SIZE = 300;
 /** Wallets that pass the leaderboard pre-filter and get a trade-history lookup. */
 const MAX_TRADE_LOOKUPS = 110;
-const RECENT_TRADES = 100;
+const RECENT_TRADES = 500;
+/** Traders (by the old leaderboard score) whose 6-hour skill is measured each refresh. */
+const SKILL_CANDIDATES = 60;
+/** Time budget per refresh for new price lookups; the cache fills over a few refreshes. */
+const SKILL_BUDGET_MS = 50_000;
+const SKILL_CONCURRENCY = 8;
 const DISCOVERY_CONCURRENCY = 6;
 /** Below this monthly ROI (P&L / volume) a wallet looks like a market maker. */
 export const MIN_MONTHLY_ROI = 0.02;
@@ -67,6 +75,7 @@ export interface TraderProfile {
 
 interface Candidate extends BoardRow, TraderProfile {
   wallet: string;
+  skill?: TraderSkill;
   copiedTradeCount: number;
   copiedPnlUsd: number;
   score: number;
@@ -171,6 +180,9 @@ async function fetchBoard(window: LeaderWindow): Promise<Leader[]> {
  * stay on the roster as exit-only even if they no longer rank, so their SELLs
  * are still seen and mirrored.
  */
+/** How the last refresh ranked traders (for the engine's log line). */
+export let lastRanking: { useSkill: boolean; measured: number; candidates: number; positive: number } | null = null;
+
 export async function discoverTraders(
   settings: BotSettings,
   existing: FollowedTrader[],
@@ -215,11 +227,13 @@ export async function discoverTraders(
 
   const wallets = [...lookups];
   const candidates: Candidate[] = [];
+  const tradesByWallet = new Map<string, TraderTrade[]>();
   for (let i = 0; i < wallets.length; i += DISCOVERY_CONCURRENCY) {
     const batch = wallets.slice(i, i + DISCOVERY_CONCURRENCY);
     const results = await Promise.allSettled(
       batch.map(async (wallet): Promise<Candidate> => {
         const trades = await fetchUserTrades(wallet, RECENT_TRADES);
+        tradesByWallet.set(wallet, trades);
         const row = rows.get(wallet) ?? {
           weekPnl: existingByWallet.get(wallet)?.weeklyPnlUsd ?? null,
           weekVolume: null,
@@ -267,11 +281,43 @@ export async function discoverTraders(
   });
 
   const target = Math.max(1, settings.topTradersToFollow);
-  const ranked = [...eligible].sort((a, b) => b.score - a.score || a.rank - b.rank);
+  const byOldScore = [...eligible].sort((a, b) => b.score - a.score || a.rank - b.rank);
+  const followedAuto = new Set(existing.filter((t) => t.source !== "manual" && t.enabled && !t.exitOnly).map((t) => t.wallet.toLowerCase()));
+
+  // Skill ranking: how the price moved 6 hours after each trader's recent buys
+  // (see traderSkill.ts for the evidence). Measured for the leading candidates
+  // within a time budget; cached so later refreshes only look up new buys.
+  const toMeasure = byOldScore.slice(0, SKILL_CANDIDATES);
+  for (const c of eligible) if (followedAuto.has(c.wallet) && !toMeasure.includes(c)) toMeasure.unshift(c);
+  const nowSec = Math.floor(now / 1000);
+  const cache = pruneSkillCache(await loadSkillCache().catch(() => ({})), nowSec);
+  const band = { min: settings.minBuyTokenPrice, max: settings.maxBuyTokenPrice };
+  const deadline = Date.now() + SKILL_BUDGET_MS;
+  const budgeted = (tokenId: string, a: number, b: number) =>
+    Date.now() > deadline ? Promise.resolve(null) : fetchPriceWindow(tokenId, a, b);
+  for (let i = 0; i < toMeasure.length; i += SKILL_CONCURRENCY) {
+    await Promise.all(
+      toMeasure.slice(i, i + SKILL_CONCURRENCY).map(async (c) => {
+        try {
+          c.skill = await measureSkill(c.wallet, tradesByWallet.get(c.wallet) ?? [], band, cache, budgeted, nowSec);
+        } catch {
+          // leave unmeasured
+        }
+      }),
+    );
+  }
+  await saveSkillCache(cache).catch(() => undefined);
+  const measured = toMeasure.filter((c) => (c.skill?.n ?? 0) >= SKILL_MIN_SAMPLES);
+  // Rank on skill once enough candidates are measured; until then (first
+  // refreshes, or a price-history outage) keep the leaderboard ranking.
+  const useSkill = measured.length >= Math.max(5, Math.ceil(toMeasure.length * 0.4));
+  const ranked = useSkill
+    ? measured.filter((c) => (c.skill?.score ?? 0) > 0).sort((a, b) => (b.skill?.score ?? 0) - (a.skill?.score ?? 0))
+    : byOldScore;
+  lastRanking = { useSkill, measured: measured.length, candidates: toMeasure.length, positive: useSkill ? ranked.length : 0 };
   // Hysteresis: a currently followed wallet keeps its slot while it stays in the
   // top 2N, so the roster (and leader-exit tracking) doesn't churn every pass.
   const selected = new Map<string, Candidate>();
-  const followedAuto = new Set(existing.filter((t) => t.source !== "manual" && t.enabled && !t.exitOnly).map((t) => t.wallet.toLowerCase()));
   for (const c of ranked.slice(0, target * 2)) {
     if (selected.size >= target) break;
     if (followedAuto.has(c.wallet)) selected.set(c.wallet, c);
@@ -324,6 +370,8 @@ export async function discoverTraders(
       avgTradeUsd: Math.round(c.avgTradeUsd),
       monthlyPnlUsd: c.monthPnl ?? undefined,
       monthlyRoi: roiOf(c),
+      skill6hCents: c.skill && c.skill.n > 0 ? Math.round(c.skill.mean * 1000) / 10 : previous?.skill6hCents,
+      skillSamples: c.skill?.n ?? previous?.skillSamples,
     };
   };
   for (const c of selected.values()) if (!next.has(c.wallet)) next.set(c.wallet, toTrader(c, false));

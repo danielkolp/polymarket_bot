@@ -243,6 +243,10 @@ export interface FollowedTrader {
   monthlyRoi?: number;
   /** Discovery v2: composite ranking score (0..100) from the last refresh. */
   discoveryScore?: number;
+  /** Mean price move 6 hours after this trader's buys, in cents (skill ranking). */
+  skill6hCents?: number;
+  /** How many of their buys that average is based on. */
+  skillSamples?: number;
 }
 
 export interface BotPosition {

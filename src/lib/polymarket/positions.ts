@@ -179,6 +179,28 @@ interface RawPriceHistory {
 }
 
 /**
+ * A token's prices between two times (1-minute fidelity). null on failure so
+ * callers can tell "no data" from "request failed".
+ */
+export async function fetchPriceWindow(tokenId: string, startTs: number, endTs: number): Promise<PricePoint[] | null> {
+  try {
+    const res = await clobRequest<RawPriceHistory>("/prices-history", {
+      query: { market: tokenId, startTs: Math.floor(startTs), endTs: Math.floor(endTs), fidelity: 1 },
+    });
+    const list = Array.isArray(res?.history) ? res.history : [];
+    const out: PricePoint[] = [];
+    for (const point of list) {
+      const t = toNumOrNull(point.t);
+      const p = toNumOrNull(point.p);
+      if (t != null && p != null) out.push({ t, p });
+    }
+    return out.sort((a, b) => a.t - b.t);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch a token's recent price history. Returns [] on failure so callers can
  * degrade gracefully (history is enrichment, not load-bearing).
  */
