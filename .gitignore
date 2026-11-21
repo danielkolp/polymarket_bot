@@ -35,3 +35,6 @@ next-env.d.ts
 
 # local bot runtime state
 /data/
+
+# research outputs (large, regenerated)
+research/data/
