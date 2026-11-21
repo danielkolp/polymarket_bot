@@ -45,8 +45,14 @@ describe("exclusionReason", () => {
     const whale = profileTrades(Array.from({ length: 30 }, (_, i) => trade({ size: 40_000, timestamp: nowSec - i * 3600 })), settings, NOW);
     expect(exclusionReason({ ...goodBoard, ...whale }, settings, NOW)).toMatch(/whale/);
   });
-  it("rejects wallets losing this week", () => {
-    expect(exclusionReason({ ...goodBoard, weekPnl: -1, ...human }, settings, NOW)).toMatch(/losing/);
+  it("does not reject a wallet just for a losing week (leaderboard P&L didn't predict copy results)", () => {
+    expect(exclusionReason({ ...goodBoard, weekPnl: -1, ...human }, settings, NOW)).toBeNull();
+  });
+  it("rejects traders who rarely make copyable buys", () => {
+    // 10 in-band buys spread over ~20 days = 0.5/day
+    const rare = profileTrades(Array.from({ length: 30 }, (_, i) => trade({ price: i % 3 === 0 ? 0.5 : 0.95, timestamp: nowSec - i * 16 * 3600 })), settings, NOW);
+    expect(rare.copyableBuysPerDay).toBeLessThan(1);
+    expect(exclusionReason({ ...goodBoard, ...rare }, settings, NOW)).toMatch(/rarely/);
   });
   it("rejects long-shot traders the price band would filter anyway", () => {
     const longShots = profileTrades(Array.from({ length: 30 }, (_, i) => trade({ price: 0.04, size: 3000, timestamp: nowSec - i * 3600 })), settings, NOW);

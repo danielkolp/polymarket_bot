@@ -792,7 +792,8 @@ export class CopyBotEngine {
         }
       }
     }
-    const built = buildMetrics(settings, state, positions, trades, Date.now(), statusLiveBalance?.usdcBalance);
+    // Paper mode shows the paper account; the live wallet only anchors real mode.
+    const built = buildMetrics(settings, state, positions, trades, Date.now(), settings.mode === "real" ? statusLiveBalance?.usdcBalance : undefined);
     const statusMetrics = await buildStatusMetrics(settings, built.metrics, statusLiveBalance);
     // Display-only: daily/peak roll-overs are persisted by the poll loop, never
     // here (a status read racing a poll must not write stale state).
@@ -3106,23 +3107,22 @@ export class CopyBotEngine {
       }
     }
 
+    // Paper trading sizes from its own paper bankroll; only real mode uses the
+    // live wallet (a paper test must not shrink or grow with the real balance).
     let availableBalanceUsd = localAvailableBalanceUsd;
     let equityUsd = localAvailableBalanceUsd + exposureUsd;
     let liveBalance: LiveUsdcBalance | null = null;
-    if (config.livePrivateKey.trim() || config.liveFunderAddress.trim()) {
+    if (settings.mode === "real") {
+      if (!(config.livePrivateKey.trim() || config.liveFunderAddress.trim())) {
+        return fail("Real trade blocked: no live private key configured.");
+      }
       try {
-        // Force-refresh in real mode; use cached value in sim to avoid extra network hits.
-        liveBalance = await getLiveUsdcBalance({ forceRefresh: settings.mode === "real" });
+        liveBalance = await getLiveUsdcBalance({ forceRefresh: true });
         availableBalanceUsd = liveBalance.usdcBalance;
         equityUsd = liveBalance.usdcBalance + exposureUsd;
       } catch (err) {
-        if (settings.mode === "real") {
-          return fail("Real trade blocked: could not fetch live USDC balance: " + messageFromUnknown(err) + ".");
-        }
-        // Sim mode: non-fatal, fall back to accounting model balance.
+        return fail("Real trade blocked: could not fetch live USDC balance: " + messageFromUnknown(err) + ".");
       }
-    } else if (settings.mode === "real") {
-      return fail("Real trade blocked: no live private key configured.");
     }
 
     // Base sizing, then optional leader-conviction scaling for BUYs. Conviction

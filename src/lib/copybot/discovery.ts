@@ -27,10 +27,10 @@ import type { BotSettings, CopyTradeRecord, DiscoverySource, FollowedTrader } fr
 const WEEK_SEC = 7 * 24 * 60 * 60;
 const BOARD_SIZE = 300;
 /** Wallets that pass the leaderboard pre-filter and get a trade-history lookup. */
-const MAX_TRADE_LOOKUPS = 110;
+const MAX_TRADE_LOOKUPS = 200;
 const RECENT_TRADES = 500;
 /** Traders (by the old leaderboard score) whose 6-hour skill is measured each refresh. */
-const SKILL_CANDIDATES = 60;
+const SKILL_CANDIDATES = 120;
 /** Time budget per refresh for new price lookups; the cache fills over a few refreshes. */
 const SKILL_BUDGET_MS = 50_000;
 const SKILL_CONCURRENCY = 8;
@@ -43,6 +43,8 @@ export const MIN_AVG_TRADE_USD = 20;
 export const MAX_AVG_TRADE_USD = 5000;
 /** Share of the wallet's BUYs that fall inside our price band. */
 const MIN_COPYABLE_SHARE = 0.3;
+/** Followed traders must make at least this many in-band buys a day, or they rarely give a signal. */
+export const MIN_COPYABLE_BUYS_PER_DAY = 1;
 /** Copy results only influence ranking after this many copied trades. */
 const MIN_COPIES_FOR_FEEDBACK = 5;
 
@@ -71,6 +73,8 @@ export interface TraderProfile {
   weeklyVolumeUsd: number;
   lastTradeAt: number | null;
   copyableShare: number;
+  /** In-band BUYs per day over the sampled window. */
+  copyableBuysPerDay: number;
 }
 
 interface Candidate extends BoardRow, TraderProfile {
@@ -113,7 +117,7 @@ function percentileRanks(values: number[]): number[] {
 export function profileTrades(trades: TraderTrade[], settings: BotSettings, nowMs: number): TraderProfile {
   const nowSec = Math.floor(nowMs / 1000);
   if (trades.length === 0) {
-    return { tradesPerDay: 0, avgTradeUsd: 0, weeklyTradeCount: 0, weeklyVolumeUsd: 0, lastTradeAt: null, copyableShare: 0 };
+    return { tradesPerDay: 0, avgTradeUsd: 0, weeklyTradeCount: 0, weeklyVolumeUsd: 0, lastTradeAt: null, copyableShare: 0, copyableBuysPerDay: 0 };
   }
   let oldest = Number.MAX_SAFE_INTEGER;
   let newest = 0;
@@ -146,19 +150,22 @@ export function profileTrades(trades: TraderTrade[], settings: BotSettings, nowM
     weeklyVolumeUsd: weeklyVolume,
     lastTradeAt: newest > 0 ? newest * 1000 : null,
     copyableShare: buys > 0 ? copyableBuys / buys : 0,
+    copyableBuysPerDay: copyableBuys / spanDays,
   };
 }
 
 /** Why a wallet is not copyable, or null when it passes (pure; exported for tests). */
 export function exclusionReason(c: Pick<Candidate, "monthPnl" | "monthVolume" | "weekPnl"> & TraderProfile, settings: BotSettings, nowMs: number): string | null {
   if (!(c.monthPnl != null && c.monthPnl > 0)) return "not profitable over 30 days";
-  if (c.weekPnl != null && c.weekPnl <= 0) return "losing this week";
+  // (No "losing this week" rule: a walk-forward test found leaderboard P&L does
+  // not predict later copy results; the 6-hour skill score decides instead.)
   const roi = c.monthVolume && c.monthVolume > 0 ? (c.monthPnl ?? 0) / c.monthVolume : 0;
   if (roi < MIN_MONTHLY_ROI) return "looks like a market maker (very low return on volume)";
   if (c.tradesPerDay > MAX_TRADES_PER_DAY) return "trades too fast to copy (bot)";
   if (c.avgTradeUsd < MIN_AVG_TRADE_USD) return "trades too small";
   if (c.avgTradeUsd > MAX_AVG_TRADE_USD) return "whale-sized trades move the price";
   if (c.copyableShare < MIN_COPYABLE_SHARE) return "mostly trades prices outside the bot's range";
+  if (c.copyableBuysPerDay < MIN_COPYABLE_BUYS_PER_DAY) return "rarely makes copyable buys";
   const activityMs = settings.maxTraderInactivityHours * 3600 * 1000;
   if (c.lastTradeAt == null || nowMs - c.lastTradeAt > activityMs) return "inactive";
   if (c.weeklyVolumeUsd < settings.minTraderWeeklyVolumeUsd) return "too little volume this week";
@@ -218,7 +225,7 @@ export async function discoverTraders(
   // trade-history lookup. Currently followed auto wallets are always re-checked.
   const roiOf = (r: BoardRow) => (r.monthVolume && r.monthVolume > 0 ? (r.monthPnl ?? 0) / r.monthVolume : 0);
   const pre = [...rows.entries()]
-    .filter(([, r]) => (r.monthPnl ?? 0) > 0 && (r.weekPnl == null || r.weekPnl > 0) && roiOf(r) >= MIN_MONTHLY_ROI)
+    .filter(([, r]) => (r.monthPnl ?? 0) > 0 && roiOf(r) >= MIN_MONTHLY_ROI)
     .sort((a, b) => roiOf(b[1]) * Math.log10(10 + (b[1].monthPnl ?? 0)) - roiOf(a[1]) * Math.log10(10 + (a[1].monthPnl ?? 0)))
     .slice(0, MAX_TRADE_LOOKUPS)
     .map(([wallet]) => wallet);

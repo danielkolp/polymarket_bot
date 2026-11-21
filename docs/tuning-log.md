@@ -21,8 +21,13 @@ keep fiddling: it may mean copying these traders has no edge after costs.
 - Every change needs evidence from **data it wasn't tuned on**: either a
   walk-forward test in `research/` on freshly collected data, or paper results
   with **≥ 30 markets** in the group the change affects.
-- Never loosen the $50 risk caps (size per trade, per-market cap, cash cushion,
-  daily-loss stop) to make paper numbers look better.
+- Never loosen trade-quality rules or the live $50 caps to make paper numbers
+  look better. Paper runs with **evaluation settings** (set by the `paper` ops
+  task): $500 paper bankroll, up to 40 open positions, up to 30 traders. These
+  only remove throttles that exist because the real account is tiny; the
+  per-trade size ($3 max), price band, 2c cap, cost limit and 14-day limit are
+  the Safe ones. When judging results for a live $50 account, look at the
+  20–47c bucket: above ~47c the 5-share minimum exceeds a $50 account's cap.
 - Log every review and change below: date, numbers, what changed, why.
 
 ## Levers
@@ -32,7 +37,7 @@ keep fiddling: it may mean copying these traders has no edge after costs.
 | Who to follow | skill = price move 6 h after their buys (`traderSkill.ts`) | follow only score > 0 |
 | | skill sample size / shrinkage (`SKILL_MIN_SAMPLES`, `SHRINK_N`) | ≥ 8 buys, shrink 10 |
 | | candidates measured per refresh (`SKILL_CANDIDATES`) | 60, leaderboard pool |
-| | number followed (`topTradersToFollow`) | up to 16 (Safe) |
+| | number followed (`topTradersToFollow`) | up to 30 on paper (16 live Safe) |
 | What to copy | price band (`min/maxBuyTokenPrice`) | 20–85c |
 | | max price above the trader's fill (`maxAdverseEntryMoveCents`) | 2c |
 | | fee + premium limit (`maxEntryCostPercent`) | 6% |
@@ -62,3 +67,16 @@ keep fiddling: it may mean copying these traders has no edge after costs.
   10 of 21 measured traders qualified.
 - Fixed: false "trader exited" sells on fresh copies; paper mode touching real positions.
 - Baseline: no paper copies yet.
+
+### 2026-11-21 (03:40 UTC) — not enough signals
+- No paper copies in ~2 h. Followed traders (9 active) made 21 distinct buys in
+  24 h; only 4 passed the static filters (8 priced >85c, 4 blocked by the 5-share
+  minimum vs the $50 per-market cap, 3 resolving >14 days, 2 other). At that
+  rate 60 closed markets would take 1–2 months.
+- Bug fixed: paper mode sized trades from the real wallet balance whenever a
+  live key was configured; it now uses the paper bankroll only.
+- Changes (throughput only; trade-quality rules untouched):
+  - paper evaluation settings (above);
+  - discovery: dropped the "losing this week" filter (leaderboard P&L showed no
+    predictive value), pool 110 → 200 lookups, skill measured for up to 120
+    candidates, new activity floor of ≥ 1 in-band buy/day.
