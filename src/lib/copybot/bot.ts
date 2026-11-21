@@ -21,6 +21,7 @@ import {
 import { effectiveMaxCopyAgeSec, evaluateAdverseEntry, type AdverseEntry } from "./entryGuards";
 import { planEntry, proportionalSellShares, type EntryPlan } from "./entryPlan";
 import { getTokenMarketMeta, roundToTick, takerFeeFraction, tryGetOutcomeBook, type TokenMarketMeta } from "@/lib/polymarket/clobMeta";
+import { ChainTradeFeed, type MarketLabel } from "@/lib/polymarket/chainFeed";
 import {
   buildLeaderHoldings,
   reconcileLeaderHoldings,
@@ -143,7 +144,12 @@ function sourceTradeId(trade: TraderTrade): string {
 
 /** Compact key for the seen-trade book (16 hex chars instead of ~200). */
 function seenKey(trade: TraderTrade): string {
-  return createHash("sha1").update(sourceTradeId(trade)).digest("hex").slice(0, 16);
+  // One key per (tx, trader, token, side) so a fill seen first on-chain and
+  // again ~4 minutes later in the Data API feed is acted on only once.
+  const basis = trade.txHash
+    ? [trade.txHash.toLowerCase(), trade.wallet.toLowerCase(), trade.tokenId, trade.side].join("|")
+    : sourceTradeId(trade);
+  return createHash("sha1").update(basis).digest("hex").slice(0, 16);
 }
 
 function normalizeWallet(wallet: string): string {
@@ -305,8 +311,18 @@ function marketSpreadForFilter(market: Market | null): number | null {
   return market.spread > 0 ? market.spread : null;
 }
 
+/**
+ * A leader fill smaller than this is dust (a sliver of a resting order), not a
+ * decision worth copying with a full-size order.
+ */
+const MIN_LEADER_BUY_USD = 2;
+
 function buyMarketFilterReason(settings: BotSettings, trade: TraderTrade, market: Market | null): string | null {
   if (trade.side !== "BUY") return null;
+  const leaderUsd = trade.size * trade.price;
+  if (Number.isFinite(leaderUsd) && leaderUsd < MIN_LEADER_BUY_USD) {
+    return "Skipped BUY: the trader's fill was only $" + leaderUsd.toFixed(2) + " — too small to count as a signal.";
+  }
   if (trade.price < settings.minBuyTokenPrice) {
     return "Skipped BUY: token price " + (trade.price * 100).toFixed(1) + "c is below the minimum " + (settings.minBuyTokenPrice * 100).toFixed(1) + "c.";
   }
@@ -680,6 +696,20 @@ async function liveExitPricing(
   return { referencePrice: ref, limitPrice: roundToTick(ref - 3 * tick, tick, "up") };
 }
 
+/** Market title / outcome label / condition id for a token (on-chain fills carry only the token id). */
+async function labelForToken(tokenId: string): Promise<MarketLabel | null> {
+  const [market, meta] = await Promise.all([
+    fetchMarketById(tokenId).catch(() => null),
+    getTokenMarketMeta(tokenId).catch(() => null),
+  ]);
+  if (!market && !meta) return null;
+  return {
+    conditionId: meta?.conditionId ?? market?.conditionId ?? "",
+    title: market?.question ?? "(market)",
+    outcome: market?.outcomes.find((o) => o.tokenId === tokenId)?.label ?? "",
+  };
+}
+
 /** A poll running longer than this is considered hung and is abandoned. */
 const MIN_STUCK_TICK_MS = 120_000;
 const WATCHDOG_INTERVAL_MS = 30_000;
@@ -718,6 +748,9 @@ export class CopyBotEngine {
   private resumeChecked = false;
   /** tokenId -> (wallet -> last BUY seen ms) for the consensus sizing boost. */
   private recentLeaderBuys = new Map<string, Map<string, number>>();
+  /** Real-time copy signal from Polygon (seconds behind, vs ~4 min for the Data API feed). */
+  private chainFeed = new ChainTradeFeed(labelForToken);
+  private chainFeedHealthy: boolean | null = null;
   private lastHeartbeatLogAt = 0;
   private buyExposurePaused = false;
   // Analytics-only cadence guards (observational; never gate trading).
@@ -877,6 +910,8 @@ export class CopyBotEngine {
     }
     try {
       await this.bootstrapSeenTrades();
+      // Real-time feed starts at the current block: no replay of older fills.
+      await this.chainFeed.reset();
     } catch (err) {
       await appendLog("warning", `Could not pre-mark recent trades as seen: ${messageFromUnknown(err)}.`);
     }
@@ -2046,7 +2081,15 @@ export class CopyBotEngine {
         return;
       }
 
-      const traderTrades = (await fetchTradesForWallets(wallets, 30)).sort((a, b) => a.timestamp - b.timestamp);
+      const names = new Map(traders.map((t) => [t.wallet.toLowerCase(), t.name]));
+      const [apiTrades, chainTrades] = await Promise.all([
+        fetchTradesForWallets(wallets, 30),
+        this.chainFeed.poll(wallets, names),
+      ]);
+      await this.noteChainFeedHealth();
+      // On-chain fills first: they arrive within seconds; the Data API copy of
+      // the same fill shows up minutes later and is deduped by seenKey.
+      const traderTrades = [...chainTrades, ...apiTrades].sort((a, b) => a.timestamp - b.timestamp);
       state = {
         ...state,
         sessionWalletsChecked: state.sessionWalletsChecked + wallets.length,
@@ -2380,6 +2423,19 @@ export class CopyBotEngine {
    * enforced upstream. Any failure is recorded as a "failed" trade instead of
    * throwing, so the poll loop keeps running.
    */
+  /** Log when the real-time feed goes up or down (once per change, not every poll). */
+  private async noteChainFeedHealth(): Promise<void> {
+    const healthy = this.chainFeed.status.lastError == null;
+    if (healthy === this.chainFeedHealthy) return;
+    this.chainFeedHealthy = healthy;
+    await appendLog(
+      healthy ? "info" : "warning",
+      healthy
+        ? `Real-time trade feed connected (Polygon via ${this.chainFeed.status.rpc ?? "RPC"}); trades are seen within seconds.`
+        : `Real-time trade feed unavailable (${this.chainFeed.status.lastError}); falling back to Polymarket's delayed feed.`,
+    );
+  }
+
   /** Remember which followed wallets bought which outcome (consensus boost). */
   private rememberLeaderBuy(trade: TraderTrade): void {
     const at = trade.timestamp * 1000;

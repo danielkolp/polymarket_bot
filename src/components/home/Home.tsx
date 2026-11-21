@@ -199,7 +199,8 @@ function skipBucket(reason: string): string {
   if (/price already moved/.test(r)) return "Price moved before the bot could copy";
   if (/resolves in .*days|tied up/.test(r)) return "Market resolves too far in the future";
   if (/resolves within/.test(r)) return "Market resolves too soon";
-  if (/token price/.test(r)) return "Price outside the 20–80¢ range";
+  if (/too small to count as a signal/.test(r)) return "Trader's fill too small to copy";
+  if (/token price/.test(r)) return "Price outside your price range";
   if (/spread/.test(r)) return "Spread too wide (hard to sell later)";
   if (/liquidity/.test(r)) return "Market too thin";
   if (/needs at least|minimum/.test(r)) return "Too small for your balance";
