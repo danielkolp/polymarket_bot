@@ -15,7 +15,7 @@ on:
         description: Task to run on the VPS
         required: true
         type: choice
-        options: [diagnose, status, logs, restart, cleanup, migrate, go-live, pause]
+        options: [diagnose, status, logs, restart, cleanup, migrate, go-live, pause, paper]
   push:
     branches: [main, claude/affectionate-keller-63b6b2]
     paths: [ops/task]
@@ -42,7 +42,7 @@ jobs:
           T="${INPUT_TASK:-}"
           if [ -z "$T" ]; then T="$(head -n1 ops/task | awk '{print $1}')"; fi
           case "$T" in
-            diagnose|status|logs|restart|cleanup|migrate|go-live|pause) ;;
+            diagnose|status|logs|restart|cleanup|migrate|go-live|pause|paper) ;;
             *) echo "Unknown task: $T"; exit 1 ;;
           esac
           echo "task=$T" >> "$GITHUB_OUTPUT"
