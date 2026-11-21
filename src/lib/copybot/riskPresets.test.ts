@@ -78,7 +78,7 @@ describe("applyRiskPreset", () => {
     expect(settings.maxTotalExposurePercent).toBe(60);
     expect(settings.maxExposurePerMarketPercent).toBe(10);
     expect(settings.maxOpenPositions).toBe(8);
-    expect(settings.maxBuyTokenPrice).toBeCloseTo(0.9, 10);
+    expect(settings.maxBuyTokenPrice).toBeCloseTo(0.85, 10);
     expect(settings.minBuyTokenPrice).toBeCloseTo(0.2, 10);
     expect(settings.topTradersToFollow).toBe(16);
     expect(settings.cashReservePercent).toBe(25);

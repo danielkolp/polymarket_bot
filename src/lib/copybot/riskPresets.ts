@@ -90,9 +90,12 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     perMarketExposurePercent: 10,
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.2,
-    // Up to 90c: favorites carry the lowest taker fees (~r*(1-p)) and are a
-    // large share of the followed traders' buys.
-    maxBuyTokenPrice: 0.9,
+    // Capped at 85c from data, not taste: replaying ~15k resolved buys by
+    // profitable leaderboard traders (Nov 2026, held to resolution, after fees
+    // and 0.5c slippage), buys at 85-93c returned -2% to 0% per dollar for the
+    // whole leaderboard and -4% to -8% for the followed traders. Their edge is
+    // in the 20-80c range. Higher-priced buys add risk without adding profit.
+    maxBuyTokenPrice: 0.85,
     extraSettings: {
       ...SMALL_ACCOUNT_BASE,
       topTradersToFollow: 16,
@@ -112,7 +115,7 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     perMarketExposurePercent: 12,
     minTimeToResolutionMinutes: 60,
     minBuyTokenPrice: 0.15,
-    maxBuyTokenPrice: 0.9,
+    maxBuyTokenPrice: 0.85,
     extraSettings: {
       ...SMALL_ACCOUNT_BASE,
       percentageCopySize: 8,
@@ -133,7 +136,7 @@ export const RISK_PRESETS: Record<RiskPresetId, RiskPreset> = {
     perMarketExposurePercent: 15,
     minTimeToResolutionMinutes: 30,
     minBuyTokenPrice: 0.1,
-    maxBuyTokenPrice: 0.93,
+    maxBuyTokenPrice: 0.85,
     extraSettings: {
       ...SMALL_ACCOUNT_BASE,
       percentageCopySize: 10,

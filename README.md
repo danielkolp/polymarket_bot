@@ -21,7 +21,7 @@ The bot restarts itself after crashes, deploys and reboots, and resumes if it wa
   - the price hasn't run more than 2¢ past the trader's;
   - entry cost (half the spread plus Polymarket's taker fee) is ≤4%;
   - the market resolves in 1 hour to 14 days;
-  - the price is 20–90¢;
+  - the price is 20–85¢ (above that, past data shows no profit after fees);
   - liquidity is enough.
 - **How much:** Safe = ~6% of account value per trade (max $4), always at least the market's minimum of 5 shares so it can be sold. Up to 60% invested, 10% per market, 8 positions, 25% cash kept.
 - **Orders:** price-capped fill-and-kill orders on Polymarket CLOB V2. A buy never pays more than the cap, and fills are read back from the exchange.
