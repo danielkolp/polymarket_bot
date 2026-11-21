@@ -284,7 +284,7 @@ export class ChainTradeFeed {
         const label = await this.labelFor(agg.tokenId).catch(() => null);
         out.push({
           wallet: agg.maker,
-          traderName: names.get(agg.maker) ?? `${agg.maker.slice(0, 6)}…${agg.maker.slice(-4)}`,
+          traderName: names.get(agg.maker) || `${agg.maker.slice(0, 6)}…${agg.maker.slice(-4)}`,
           side: agg.side,
           tokenId: agg.tokenId,
           conditionId: label?.conditionId ?? "",
